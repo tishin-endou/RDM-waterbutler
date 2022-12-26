@@ -21,6 +21,48 @@ from waterbutler.providers.weko.metadata import WEKOItemMetadata
 from waterbutler.providers.weko.metadata import WEKOIndexMetadata
 
 
+fake_weko_host = 'https://test.sample.nii.ac.jp/sword'
+fake_weko_indices = [
+    {
+        'id': 100,
+        'name': 'Sample Index',
+        'children': [
+            {
+                'id': 101,
+                'name': 'Sub Index',
+                'children': [],
+            },
+        ],
+    },
+]
+fake_weko_item = {
+    'id': 1000,
+    'metadata': {
+        'title': 'Sample Item',
+        '_item_metadata': {
+            'title': 'Sample Item',
+            'item_dummy_content': {
+            },
+            'item_dummy_files': {
+                'attribute_type': 'file',
+                'attribute_value_mlt': [
+                    {
+                        'filename': 'file.txt',
+                    },
+                ],
+            },
+        },
+    },
+}
+fake_weko_items = {
+    'hits': {
+        'hits': [
+            fake_weko_item,
+        ]
+    },
+}
+
+
 @pytest.fixture
 def auth():
     return {
@@ -29,7 +71,7 @@ def auth():
     }
 
 
-@pytest.fixture(scope='module', params=['token', 'password'])
+@pytest.fixture(scope='module', params=['token'])
 def credentials(request):
     return {
         request.param: 'open inside',
@@ -40,8 +82,8 @@ def credentials(request):
 @pytest.fixture
 def settings():
     return {
-        'url': 'http://localhost/test',
-        'index_id': 'that kerning',
+        'url': fake_weko_host,
+        'index_id': '100',
         'index_title': 'sample archive',
         'nid': 'project_id'
     }
@@ -76,28 +118,44 @@ def file_stream(file_like):
 class TestValidatePath:
 
     @pytest.mark.asyncio
-    async def test_normal_name(self, provider, mock_time):
-        path = await provider.validate_path('/this/is/a/path.txt')
-        assert path.name == 'path.txt'
-        assert path.parent.name == 'a'
+    @pytest.mark.aiohttpretty
+    async def test_item_file(self, provider, mock_time):
+        aiohttpretty.register_json_uri(
+            'GET',
+            'https://test.sample.nii.ac.jp/api/tree',
+            body=fake_weko_indices,
+        )
+        aiohttpretty.register_json_uri(
+            'GET',
+            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            body=fake_weko_items,
+        )
+        path = await provider.validate_path('/Sample Item/file.txt')
+        assert path.name == 'file.txt'
+        assert path.identifier == ('item_file', 'file.txt', 'file.txt')
+        assert path.parent.name == 'Sample Item'
+        assert path.parent.identifier == ('item', 1000, 'Sample Item')
         assert path.is_file
         assert not path.is_dir
         assert not path.is_root
 
     @pytest.mark.asyncio
-    async def test_folder(self, provider, mock_time):
-        path = await provider.validate_path('/this/is/a/folder/')
-        assert path.name == 'folder'
-        assert path.parent.name == 'a'
-        assert not path.is_file
-        assert path.is_dir
-        assert not path.is_root
-
-    @pytest.mark.asyncio
-    async def test_root(self, provider, mock_time):
-        path = await provider.validate_path('/this/is/a/folder/')
-        assert path.name == 'folder'
-        assert path.parent.name == 'a'
+    @pytest.mark.aiohttpretty
+    async def test_sub_index(self, provider, mock_time):
+        aiohttpretty.register_json_uri(
+            'GET',
+            'https://test.sample.nii.ac.jp/api/tree',
+            body=fake_weko_indices,
+        )
+        aiohttpretty.register_json_uri(
+            'GET',
+            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            body=fake_weko_items,
+        )
+        path = await provider.validate_path('/Sub Index/')
+        assert path.name == 'Sub Index'
+        assert path.identifier == ('index', 101, 'Sub Index')
+        assert path.parent.name == ''
         assert not path.is_file
         assert path.is_dir
         assert not path.is_root
