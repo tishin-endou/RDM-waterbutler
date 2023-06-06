@@ -315,7 +315,8 @@ def _to_item_metadata(key, item, prefix='grdm-file:'):
 
 
 def to_metadata(schema_id, item):
-    weko_metadata = item.raw['metadata']['_item_metadata']
+    metadata = item['metadata'] if isinstance(item, dict) and 'metadata' in item else item.raw['metadata']
+    weko_metadata = metadata['_item_metadata']
     logger.info(f'to_metadata: {weko_metadata} as {schema_id}')
     toplevel_keys = set()
     r = {}

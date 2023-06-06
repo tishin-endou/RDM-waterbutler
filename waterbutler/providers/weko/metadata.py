@@ -67,37 +67,47 @@ class BaseWEKOMetadata(metadata.BaseMetadata):
 
 
 class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
-    index = None
-    item = None
+    index_identifier = None
+    index_path = None
+    index_materialized_path = None
+    item_file_id = None
+    item_title = None
 
     def __init__(self, file, item, index):
-        super().__init__(file)
-        self.index = index
-        self.item = item
+        super().__init__({
+            'filename': file.filename,
+            'format': file.format,
+            'version_id': file.version_id
+        })
+        self.index_identifier = index.identifier
+        self.index_path = _index_to_path(index)
+        self.index_materialized_path = _index_to_materialized_path(index)
+        self.item_file_id = _get_item_file_id(item)
+        self.item_title = item.primary_title
 
     @property
     def file_id(self):
-        return self.raw.filename
+        return self.raw['filename']
 
     @property
     def name(self):
-        return self.raw.filename
+        return self.raw['filename']
 
     @property
     def content_type(self):
-        return self.raw.format
+        return self.raw['format']
 
     @property
     def identifier(self):
-        return self.raw.filename
+        return self.raw['filename']
 
     @property
     def path(self):
-        return '/' + _index_to_path(self.index) + ITEM_PREFIX + _get_item_file_id(self.item) + '/' + self.identifier
+        return '/' + self.index_path + ITEM_PREFIX + self.item_file_id + '/' + self.identifier
 
     @property
     def materialized_path(self):
-        return '/' + _index_to_materialized_path(self.index) + self.item.primary_title + '/' + self.identifier
+        return '/' + self.index_materialized_path + self.item_title + '/' + self.identifier
 
     @property
     def size(self):
@@ -109,34 +119,43 @@ class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
 
     @property
     def etag(self):
-        return self.raw.version_id
+        return self.raw['version_id']
 
     @property
     def extra(self):
         return {
             'weko': 'file',
-            'itemId': _get_item_file_id(self.item),
+            'itemId': self.item_file_id,
             'metadata': None,
         }
 
 
 class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
-    index = None
+    file_id = None
+    provider_name = None
+    metadata_schema_id = None
+    index_identifier = None
+    index_path = None
+    index_materialized_path = None
+    item_file_id = None
+    weko_web_url = None
 
     def __init__(self, client, raw, index, provider_name, metadata_schema_id):
-        super().__init__(raw)
-        self.client = client
-        self.index = index
+        super().__init__({
+            'primary_title': raw.primary_title,
+            'metadata': raw.raw['metadata'],
+        })
+        self.file_id = _get_item_file_id(raw)
+        self.index_identifier = index.identifier
+        self.index_path = _index_to_path(index)
+        self.index_materialized_path = _index_to_materialized_path(index)
         self.provider_name = provider_name
         self.metadata_schema_id = metadata_schema_id
-
-    @property
-    def file_id(self):
-        return _get_item_file_id(self.raw)
+        self.weko_web_url = client.get_item_records_url(str(raw.identifier))
 
     @property
     def name(self):
-        return self.raw.primary_title
+        return self.raw['primary_title']
 
     @property
     def content_type(self):
@@ -148,11 +167,11 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
 
     @property
     def materialized_path(self):
-        return '/' + _index_to_materialized_path(self.index) + self.name + '/'
+        return '/' + self.index_materialized_path + self.name + '/'
 
     @property
     def path(self):
-        return '/' + _index_to_path(self.index) + self.identifier + '/'
+        return '/' + self.index_path + self.identifier + '/'
 
     @property
     def size(self):
@@ -170,7 +189,7 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
     def extra(self):
         return {
             'weko': 'item',
-            'weko_web_url': self.client.get_item_records_url(str(self.raw.identifier)),
+            'weko_web_url': self.weko_web_url,
             'fileId': self.file_id,
             'metadata': self._to_metadata(),
         }
@@ -194,44 +213,97 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
 
 
 class WEKOIndexMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
+    index_identifier = None
+    index_path = None
+    index_materialized_path = None
+    weko_web_url = None
+
     def __init__(self, client, raw):
-        super().__init__(raw)
-        self.client = client
+        super().__init__({
+            'title': raw.title,
+        })
+        self.index_identifier = raw.identifier
+        self.index_path = _index_to_path(raw)
+        self.index_materialized_path = _index_to_materialized_path(raw)
+        self.weko_web_url = client.get_index_items_url(raw.identifier)
 
     @property
     def name(self):
-        return self.raw.title
+        return self.raw['title']
 
     @property
     def identifier(self):
-        return ITEM_PREFIX + self.raw.identifier
+        return ITEM_PREFIX + self.index_identifier
 
     @property
     def materialized_path(self):
-        return '/' + _index_to_materialized_path(self.raw)
+        return '/' + self.index_materialized_path
 
     @property
     def path(self):
-        return '/' + _index_to_path(self.raw)
+        return '/' + self.index_path
 
     @property
     def extra(self):
         return {
             'weko': 'index',
-            'weko_web_url': self.client.get_index_items_url(self.raw.identifier),
-            'indexId': self.raw.identifier,
+            'weko_web_url': self.weko_web_url,
+            'indexId': self.index_identifier,
             'metadata': None,
         }
 
 
-class WEKODraftFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
-    index = None
-    file = None
+class BaseWEKODraftMetadata(BaseWEKOMetadata):
+    index_identifier = None
+    index_path = None
+    index_materialized_path = None
+    index_folder = None
 
-    def __init__(self, file, index):
+    def __init__(self, file, index_folder, index):
         super().__init__(file)
-        self.index = index
+        self.index_identifier = index.identifier
+        self.index_path = _index_to_path(index)
+        self.index_materialized_path = _index_to_materialized_path(index)
+        self.index_folder = index_folder
 
+    @property
+    def extra(self):
+        r = {
+            'weko': 'draft',
+            'index': self.index_identifier,
+            'source': {
+                'provider': self.raw.provider,
+                'path': self.raw.path,
+                'materialized_path': self.raw.materialized_path,
+            },
+        }
+        r.update(self.raw.extra)
+        return r
+
+    @property
+    def path(self):
+        return '/' + self.index_path + self._relative_path
+
+    @property
+    def materialized_path(self):
+        return '/' + self.index_materialized_path + self._relative_path
+
+    @property
+    def _relative_path(self):
+        base_path = self.index_folder.materialized_path
+        item_path = self.raw.materialized_path
+        if not item_path.startswith(base_path):
+            raise ValueError(f'Unexpected path: base_path={base_path}, item_path={item_path}')
+        return item_path[len(base_path):]
+
+
+class WEKODraftFolderMetadata(BaseWEKODraftMetadata, metadata.BaseFolderMetadata):
+    @property
+    def name(self):
+        return self.raw.name
+
+
+class WEKODraftFileMetadata(BaseWEKODraftMetadata, metadata.BaseFileMetadata):
     @property
     def name(self):
         return self.raw.name
@@ -245,14 +317,6 @@ class WEKODraftFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
         return self.raw.name
 
     @property
-    def path(self):
-        return '/' + _index_to_path(self.index) + self.raw.name
-
-    @property
-    def materialized_path(self):
-        return '/' + _index_to_materialized_path(self.index) + self.raw.name
-
-    @property
     def size(self):
         return self.raw.size
 
@@ -263,17 +327,3 @@ class WEKODraftFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
     @property
     def etag(self):
         return self.raw.etag
-
-    @property
-    def extra(self):
-        r = {
-            'weko': 'draft',
-            'index': self.index.identifier,
-            'source': {
-                'provider': self.raw.provider,
-                'path': self.raw.path,
-                'materialized_path': self.raw.materialized_path,
-            },
-        }
-        r.update(self.raw.extra)
-        return r

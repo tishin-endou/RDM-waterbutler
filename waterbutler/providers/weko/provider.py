@@ -13,6 +13,7 @@ from waterbutler.providers.weko.metadata import (
     WEKOFileMetadata,
     WEKOItemMetadata,
     WEKOIndexMetadata,
+    WEKODraftFolderMetadata,
     WEKODraftFileMetadata,
 )
 from waterbutler.providers.weko.client import Client
@@ -81,6 +82,53 @@ class WEKOPath(WaterButlerPath):
     def materialized_path(self):
         return '/'.join([x.materialized for x in self.parts]) + ('/' if self.is_dir else '')
 
+    @property
+    def is_index(self):
+        return self.parts[-1].is_index
+
+    @property
+    def is_item(self):
+        return self.parts[-1].is_item
+
+    @property
+    def is_item_file(self):
+        return self.parts[-1].is_item_file
+
+    @property
+    def is_draft_file(self):
+        return self.parts[-1].is_draft_file
+
+    @property
+    def as_file(self):
+        parts = self.parts
+        path = '/'.join([x.materialized for x in parts])
+        return WEKOPath(path, _ids=[p._id for p in parts])
+
+    def split_draft_file_path(self):
+        pos_ = [i for i, part in enumerate(self.parts) if i > 0 and part.is_draft_file]
+        if len(pos_) == 0:
+            return self, None
+        pos = pos_[0]
+        parent_parts = self.parts[:pos]
+        parent_path = '/'.join([x.materialized for x in parent_parts]) + '/'
+        child_parts = [self.parts[0]] + self.parts[pos:]
+        child_path = '/'.join([x.materialized for x in child_parts]) + ('/' if self.is_dir else '')
+        logger.debug(f'Split {parent_path}({parent_parts}) -> {child_path}({child_parts})')
+        return (
+            WEKOPath(parent_path, _ids=[p._id for p in parent_parts]),
+            WEKOPath(child_path, _ids=[p._id for p in child_parts]),
+        )
+
+    def split_path(self):
+        if len(self.parts) == 1:
+            return self, None
+        parent_parts = self.parts[:-1]
+        parent_path = '/'.join([x.materialized for x in parent_parts]) + '/'
+        return (
+            WEKOPath(parent_path, _ids=[p._id for p in parent_parts]),
+            self.parts[-1],
+        )
+
 
 class WEKOProvider(provider.BaseProvider):
     """Provider for WEKO"""
@@ -147,23 +195,24 @@ class WEKOProvider(provider.BaseProvider):
         item = None
         file = None
         for part in parts:
+            # Specialized Path?
             if part.startswith(ITEM_PREFIX):
                 item_id = parse_item_file_id(part)
                 if item_id is None:
                     if item is not None:
-                        raise exceptions.MetadataError('Invalid path', code=400)
+                        raise exceptions.MetadataError('Invalid path: No indexes under item', code=400)
                     index = await self.client.get_index_by_id(part[len(ITEM_PREFIX):])
                     ids.append(('index', index.identifier, index.title))
                 else:
                     if item is not None:
-                        raise exceptions.MetadataError('Invalid path', code=400)
+                        raise exceptions.MetadataError('Invalid path: No item under item', code=400)
                     if index is None:
                         index = await self.client.get_index_by_id(str(self.index_id))
                     item = await index.get_item_by_id(item_id)
                     ids.append(('item', item.identifier, item.primary_title))
                 continue
             if file is not None:
-                raise exceptions.MetadataError('Invalid path', code=400)
+                raise exceptions.MetadataError('Invalid path: No path segment below the item file', code=400)
             # File?
             if item is not None:
                 file_cands = [f for f in item.files if f.filename == part]
@@ -186,7 +235,7 @@ class WEKOProvider(provider.BaseProvider):
                 item = item_cands[0]
                 ids.append(('item', item.identifier, item.primary_title))
                 continue
-            # Draft files
+            # Draft files or root path segment
             ids.append(('draft_file', part, part))
         logger.debug(f'WEKOPath {path} -> {ids}')
         return WEKOPath(path, _ids=ids)
@@ -200,22 +249,60 @@ class WEKOProvider(provider.BaseProvider):
             return ('item_file', metadata.name, metadata.name)
         if isinstance(metadata, WEKODraftFileMetadata):
             return ('draft_file', metadata.name, metadata.name)
+        if isinstance(metadata, WEKODraftFolderMetadata):
+            return ('draft_file', metadata.name, metadata.name)
         raise exceptions.MetadataError('Unexpected metadata', code=400)
 
-    async def upload(self, stream, path, **kwargs):
-        last_part = path.parts[-1]
-        if not last_part.is_draft_file:
-            raise exceptions.MetadataError('Cannot upload files to the item', code=404)
-        index_parts = [p for p in path.parts if p.is_index]
-        if len(index_parts) > 0:
-            index = await self.client.get_index_by_id(index_parts[-1].identifier_value)
-        else:
-            index = await self.client.get_index_by_id(str(self.index_id))
+    async def create_folder(self, path, **kwargs):
+        if not path.is_draft_file:
+            raise exceptions.MetadataError('Cannot create folders to the item', code=400)
+        index = await self._get_last_index_for(path)
         default_provider, index_folder = await self.get_index_folder(index.identifier, creates=True)
 
         logger.debug(f'Draft folder: {index_folder}')
+        _, draft_path = path.split_draft_file_path()
+        draft_parent_path, last_part = draft_path.split_path()
+        if len(draft_parent_path.parts) == 1:
+            parent_folder_metadata = index_folder
+        else:
+            draft_parent_path = draft_parent_path.as_file
+            logger.debug(f'Target path: {draft_parent_path}')
+            parent_folder_metadata = await self.get_draft_file_metadata(
+                default_provider,
+                index_folder,
+                draft_parent_path,
+            )
+        logger.debug(f'Target folder: {parent_folder_metadata.path}')
         draft_path = await default_provider.validate_path(
-            index_folder.path + last_part.value
+            parent_folder_metadata.path + last_part.value
+        )
+        metadata = await default_provider.create_folder(
+            draft_path, **kwargs
+        )
+        return WEKODraftFolderMetadata(metadata, index_folder, index)
+
+    async def upload(self, stream, path, **kwargs):
+        if not path.is_draft_file:
+            raise exceptions.MetadataError('Cannot upload files to the item', code=404)
+        index = await self._get_last_index_for(path)
+        default_provider, index_folder = await self.get_index_folder(index.identifier, creates=True)
+
+        logger.debug(f'Draft folder: {index_folder}')
+        _, draft_path = path.split_draft_file_path()
+        draft_parent_path, last_part = draft_path.split_path()
+        if len(draft_parent_path.parts) == 1:
+            parent_folder_metadata = index_folder
+        else:
+            draft_parent_path = draft_parent_path.as_file
+            logger.debug(f'Target path: {draft_parent_path}')
+            parent_folder_metadata = await self.get_draft_file_metadata(
+                default_provider,
+                index_folder,
+                draft_parent_path,
+            )
+        logger.debug(f'Target folder: {parent_folder_metadata.path}')
+        draft_path = await default_provider.validate_path(
+            parent_folder_metadata.path + last_part.value
         )
 
         stream.add_writer('md5', streams.HashStreamWriter(hashlib.md5))
@@ -226,47 +313,43 @@ class WEKOProvider(provider.BaseProvider):
         metadata, created = await default_provider.upload(
             stream, draft_path, **kwargs
         )
-        return WEKODraftFileMetadata(metadata, index), created
+        return WEKODraftFileMetadata(metadata, index_folder, index), created
 
     async def delete(self, path, confirm_delete=0, **kwargs):
-        last_part = path.parts[-1]
-        if not last_part.is_draft_file:
+        if not path.is_draft_file:
             raise exceptions.MetadataError('Unsupported operation', code=400)
-        index_parts = [p for p in path.parts if p.is_index]
-        if len(index_parts) > 0:
-            index = await self.client.get_index_by_id(index_parts[-1].identifier_value)
-        else:
-            index = await self.client.get_index_by_id(str(self.index_id))
+        index = await self._get_last_index_for(path)
         default_provider, index_folder = await self.get_index_folder(index.identifier)
         if index_folder is None:
             raise exceptions.MetadataError('Unexpected path', code=404)
-        file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_part.identifier_value)
+        _, last_path = path.split_draft_file_path()
+        file_metadata = await self.get_draft_file_metadata(
+            default_provider,
+            index_folder,
+            last_path.as_file,
+        )
         file_path = await default_provider.validate_path(file_metadata.path)
         metadata = await default_provider.delete(file_path, confirm_delete=confirm_delete, **kwargs)
-        return WEKODraftFileMetadata(metadata, index)
+        if metadata is None:
+            return None
+        return self._wrap_draft_metadata(metadata, index_folder, index)
 
     async def download(self, path, revision=None, range=None, **kwargs):
-        index_parts = [p for p in path.parts if p.is_index]
-        if len(index_parts) > 0:
-            index = await self.client.get_index_by_id(index_parts[-1].identifier_value)
-        else:
-            index = await self.client.get_index_by_id(str(self.index_id))
-        last_part = path.parts[-1]
-        if last_part.is_draft_file:
+        index = await self._get_last_index_for(path)
+        if path.is_draft_file:
             # Draft file or item file
             default_provider, index_folder = await self.get_index_folder(index.identifier)
             if index_folder is None:
                 raise exceptions.MetadataError('Unexpected path', code=404)
-            file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_part.identifier_value)
+            _, last_path = path.split_draft_file_path()
+            file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_path)
             file_path = await default_provider.validate_path(file_metadata.path)
             return await default_provider.download(file_path, range=range, **kwargs)
-        if not last_part.is_item_file:
+        if not path.is_item_file:
             raise exceptions.MetadataError('Illegal parts', code=400)
         # File of Item
-        item_parts = [p for p in path.parts if p.is_item]
-        if len(item_parts) == 0:
-            raise exceptions.MetadataError('Illegal parts', code=400)
-        item = await index.get_item_by_id(item_parts[-1].identifier_value)
+        item = await self._get_last_item_for(index, path)
+        last_part = path.parts[-1]
         files = [f for f in item.files if f.filename == last_part.identifier_value]
         if len(files) == 0:
             raise exceptions.MetadataError('File not found', code=404)
@@ -293,38 +376,31 @@ class WEKOProvider(provider.BaseProvider):
             # Root Index
             index = await self.client.get_index_by_id(str(self.index_id))
             return await self.get_index_metadata(index)
-        last_part = path.parts[-1]
-        if last_part.is_index:
+        if path.is_index:
             # Sub Index
-            index = await self.client.get_index_by_id(last_part.identifier_value)
+            index = await self.client.get_index_by_id(path.parts[-1].identifier_value)
             return await self.get_index_metadata(index)
-        index_parts = [p for p in path.parts if p.is_index]
-        if len(index_parts) > 0:
-            index = await self.client.get_index_by_id(index_parts[-1].identifier_value)
-        else:
-            index = await self.client.get_index_by_id(str(self.index_id))
-        if last_part.is_item:
+        index = await self._get_last_index_for(path)
+        if path.is_item:
             # Item
-            item = await index.get_item_by_id(last_part.identifier_value)
+            item = await index.get_item_by_id(path.parts[-1].identifier_value)
             return self.get_item_metadata(index, item)
-        if last_part.is_item_file:
+        if path.is_item_file:
             # File of Item
-            item_parts = [p for p in path.parts if p.is_item]
-            if len(item_parts) == 0:
-                raise exceptions.MetadataError('Illegal parts', code=400)
-            item = await index.get_item_by_id(item_parts[-1].identifier_value)
-            files = [f for f in item.files if f.filename == last_part.identifier_value]
+            item = await self._get_last_item_for(index, path)
+            files = [f for f in item.files if f.filename == path.parts[-1].identifier_value]
             if len(files) == 0:
                 raise exceptions.MetadataError('Illegal parts', code=400)
             return WEKOFileMetadata(files[0], item, index)
-        if not last_part.is_draft_file:
+        if not path.is_draft_file:
             raise exceptions.MetadataError('unsupported', code=400)
         # Draft of Index
         default_provider, index_folder = await self.get_index_folder(index.identifier)
         if index_folder is None:
             raise exceptions.MetadataError('Unexpected path', code=404)
-        file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_part.identifier_value)
-        return WEKODraftFileMetadata(file_metadata, index)
+        _, last_path = path.split_draft_file_path()
+        file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_path)
+        return self._wrap_draft_metadata(file_metadata, index_folder, index)
 
     async def revisions(self, path, **kwargs):
         """Get past versions of the request file.
@@ -346,7 +422,7 @@ class WEKOProvider(provider.BaseProvider):
             index_folder_path = await default_provider.validate_path(index_folder.path)
             index_folder_metadata = await default_provider.metadata(index_folder_path)
             for f in index_folder_metadata:
-                rdrafts.append(WEKODraftFileMetadata(f, index))
+                rdrafts.append(self._wrap_draft_metadata(f, index_folder, index))
         return rindices + ritems + rdrafts
 
     def get_item_metadata(self, index, item):
@@ -391,11 +467,43 @@ class WEKOProvider(provider.BaseProvider):
         return default_provider, index_folder
 
     async def get_draft_file_metadata(self, default_provider, index_folder, draft_path):
-        index_folder_path = await default_provider.validate_path(index_folder.path)
-        index_folder_metadata = await default_provider.metadata(index_folder_path)
-        index_folders = [child
-                         for child in index_folder_metadata
-                         if child.name == draft_path]
-        if len(index_folders) == 0:
+        logger.debug(f'Draft File: index_folder={index_folder.materialized_path}, draft_path={draft_path.path}')
+        draft_parent_path, last_part = draft_path.split_path()
+        if last_part is None:
+            # root
+            index_folder_path = await default_provider.validate_path(index_folder.path)
+            return await default_provider.metadata(index_folder_path)
+        draft_parent_metadata = await self.get_draft_file_metadata(
+            default_provider,
+            index_folder,
+            draft_parent_path,
+        )
+        draft_files = [child
+                       for child in draft_parent_metadata
+                       if child.name == last_part.materialized]
+        if len(draft_files) == 0:
             raise exceptions.MetadataError('File not found', code=404)
-        return index_folders[0]
+        if not draft_path.is_dir:
+            return draft_files[0]
+        draft_folder_path = await default_provider.validate_path(draft_files[0].path)
+        return await default_provider.metadata(draft_folder_path)
+
+    async def _get_last_index_for(self, path):
+        index_parts = [p for p in path.parts if p.is_index]
+        if len(index_parts) > 0:
+            # Sub index
+            return await self.client.get_index_by_id(index_parts[-1].identifier_value)
+        return await self.client.get_index_by_id(str(self.index_id))
+
+    async def _get_last_item_for(self, index, path):
+        item_parts = [p for p in path.parts if p.is_item]
+        if len(item_parts) == 0:
+            raise exceptions.MetadataError('Illegal parts', code=400)
+        return await index.get_item_by_id(item_parts[-1].identifier_value)
+
+    def _wrap_draft_metadata(self, file_metadata, index_folder, index):
+        if isinstance(file_metadata, (list, tuple)):
+            return [self._wrap_draft_metadata(f, index_folder, index) for f in file_metadata]
+        if file_metadata.kind == 'folder':
+            return WEKODraftFolderMetadata(file_metadata, index_folder, index)
+        return WEKODraftFileMetadata(file_metadata, index_folder, index)
