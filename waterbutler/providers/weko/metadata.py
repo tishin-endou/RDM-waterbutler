@@ -302,6 +302,14 @@ class WEKODraftFolderMetadata(BaseWEKODraftMetadata, metadata.BaseFolderMetadata
     def name(self):
         return self.raw.name
 
+    @property
+    def _relative_path(self):
+        r = super(WEKODraftFolderMetadata, self)._relative_path
+        if r.endswith('/'):
+            return r
+        # Ensure that the return value of create_folder is also interpreted as a folder
+        return r + '/'
+
 
 class WEKODraftFileMetadata(BaseWEKODraftMetadata, metadata.BaseFileMetadata):
     @property

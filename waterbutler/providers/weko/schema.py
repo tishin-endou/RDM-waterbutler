@@ -18,27 +18,14 @@ columns_default = [
 ]
 
 
-def _generate_file_columns(index, download_file_name):
+def _generate_file_columns(index, download_file_name, download_file_type):
     columns = []
     columns.append((f'.file_path[{index}]', f'.ファイルパス[{index}]', '', 'Allow Multiple', download_file_name))
     base_item = f'.metadata.item_1617605131499[{index}]'
     base_file = f'File[{index}]'
     columns.append((f'{base_item}.filename', f'{base_file}.表示名', '', 'Allow Multiple', download_file_name))
-    columns.append((f'{base_item}.accessrole', f'{base_file}.アクセス', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.date[0].dateType', f'{base_file}.オープンアクセスの日付[0].日付タイプ', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.date[0].dateValue', f'{base_file}.オープンアクセスの日付[0].日付', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.displaytype', f'{base_file}.表示形式', '', 'Allow Multiple', 'simple'))
-    columns.append((f'{base_item}.fileDate[0].fileDateType', f'{base_file}.日付[0].日付タイプ', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.fileDate[0].fileDateValue', f'{base_file}.日付[0].日付', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.filesize[0].value', f'{base_file}.サイズ[0].サイズ', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.format', f'{base_file}.フォーマット', '', 'Allow Multiple', 'text/plain'))
-    columns.append((f'{base_item}.groups', f'{base_file}.グループ', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.licensefree', f'{base_file}.自由ライセンス', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.licensetype', f'{base_file}.ライセンス', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.url.label', f'{base_file}.本文URL.ラベル', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.url.objectType', f'{base_file}.本文URL.オブジェクトタイプ', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.url.url', f'{base_file}.本文URL.本文URL', '', 'Allow Multiple', ''))
-    columns.append((f'{base_item}.version', f'{base_file}.バージョン情報', '', 'Allow Multiple', ''))
+    if download_file_type is not None:
+        columns.append((f'{base_item}.format', f'{base_file}.フォーマット', '', 'Allow Multiple', download_file_type))
     return columns
 
 
@@ -50,16 +37,48 @@ mapping_table = {'pubdate': 'pubdate',
     'item_1617186385884[].subitem_1551255721061': {'type': 'language',
     'keys': ['Alternative Title']},
     'item_1617186419668[]': {
-        'type': 'file-creators',
+        'type': 'jsonarray',
         'key': 'Creator',
         'items': {
-            'nameIdentifiers[0].nameIdentifierScheme': {'type': 'const', 'value': ''},
+            'nameIdentifiers[0].nameIdentifierScheme': {
+                'type': 'const',
+                'depends': {
+                    'type': 'jsonproperty',
+                    'key': 'Creator',
+                    'value': 'number',
+                },
+                'value': 'e-Rad',
+            },
             'nameIdentifiers[0].nameIdentifierURI': {'type': 'const', 'value': ''},
-            'nameIdentifiers[0].nameIdentifier': {'type': 'const', 'value': ''},
-            'creatorNames[0].creatorName': {'type': 'jsonproperty', 'key': 'Creator', 'value': 'name_ja'},
-            'creatorNames[0].creatorNameLang': {'type': 'const', 'value': 'ja'},
-            'creatorNames[1].creatorName': {'type': 'jsonproperty', 'key': 'Creator', 'value': 'name_en'},
-            'creatorNames[1].creatorNameLang': {'type': 'const', 'value': 'en'},
+            'nameIdentifiers[0].nameIdentifier': {
+                'type': 'jsonproperty',
+                'key': 'Creator',
+                'value': 'number',
+            },
+            'creatorNames[0].creatorName': {
+                'type': 'jsonproperty', 'key': 'Creator', 'value': 'name_ja',
+            },
+            'creatorNames[0].creatorNameLang': {
+                'type': 'const',
+                'depends': {
+                    'type': 'jsonproperty',
+                    'key': 'Creator',
+                    'value': 'name_ja',
+                },
+                'value': 'ja',
+            },
+            'creatorNames[1].creatorName': {
+                'type': 'jsonproperty', 'key': 'Creator', 'value': 'name_en',
+            },
+            'creatorNames[1].creatorNameLang': {
+                'type': 'const',
+                'depends': {
+                    'type': 'jsonproperty',
+                    'key': 'Creator',
+                    'value': 'name_en',
+                },
+                'value': 'en',
+            },
             'familyNames[0].familyName': {'type': 'const', 'value': ''},
             'familyNames[0].familyNameLang': {'type': 'const', 'value': ''},
             'givenNames[0].givenName': {'type': 'const', 'value': ''},
@@ -81,17 +100,49 @@ mapping_table = {'pubdate': 'pubdate',
         }
     },
     'item_1617349709064[]': {
-        'type': 'file-creators',
+        'type': 'jsonarray',
         'key': 'Contributor',
         'items': {
             'contributorType': {'type': 'const', 'value': ''},
-            'nameIdentifiers[0].nameIdentifierScheme': {'type': 'const', 'value': ''},
+            'nameIdentifiers[0].nameIdentifierScheme': {
+                'type': 'const',
+                'depends': {
+                    'type': 'jsonproperty',
+                    'key': 'Contributor',
+                    'value': 'number',
+                },
+                'value': 'e-Rad',
+            },
             'nameIdentifiers[0].nameIdentifierURI': {'type': 'const', 'value': ''},
-            'nameIdentifiers[0].nameIdentifier': {'type': 'const', 'value': ''},
-            'contributorNames[0].contributorName': {'type': 'jsonproperty', 'key': 'Contributor', 'value': 'name_ja'},
-            'contributorNames[0].lang': {'type': 'const', 'value': 'ja'},
-            'contributorNames[1].contributorName': {'type': 'jsonproperty', 'key': 'Contributor', 'value': 'name_en'},
-            'contributorNames[1].lang': {'type': 'const', 'value': 'en'},
+            'nameIdentifiers[0].nameIdentifier': {
+                'type': 'jsonproperty',
+                'key': 'Contributor',
+                'value': 'number',
+            },
+            'contributorNames[0].contributorName': {
+                'type': 'jsonproperty', 'key': 'Contributor', 'value': 'name_ja',
+            },
+            'contributorNames[0].lang': {
+                'type': 'const',
+                'depends': {
+                    'type': 'jsonproperty',
+                    'key': 'Contributor',
+                    'value': 'name_ja',
+                },
+                'value': 'ja',
+            },
+            'contributorNames[1].contributorName': {
+                'type': 'jsonproperty', 'key': 'Contributor', 'value': 'name_en',
+            },
+            'contributorNames[1].lang': {
+                'type': 'const',
+                'depends': {
+                    'type': 'jsonproperty',
+                    'key': 'Contributor',
+                    'value': 'name_en',
+                },
+                'value': 'en',
+            },
             'familyNames[0].familyName': {'type': 'const', 'value': ''},
             'familyNames[0].familyNameLang': {'type': 'const', 'value': ''},
             'givenNames[0].givenName': {'type': 'const', 'value': ''},
@@ -118,10 +169,16 @@ mapping_table = {'pubdate': 'pubdate',
     },
     'item_1617186476635.subitem_1522299639480': 'アクセス権',
     'item_1617351524846.subitem_1523260933860': 'APC',
-    'item_1617186499011[].subitem_1522650727486': 'Rights.権利情報Resource',
-    'item_1617186499011[].subitem_1522651041219': 'Rights.権利情報',
-    'item_1617186499011[].subitem_1522650717957': {'type': 'language',
-    'keys': ['Rights.権利情報Resource', 'Rights.権利情報']},
+    'item_1617186499011[0].subitem_1522650727486': 'Rights Resource',
+    'item_1617186499011[0].subitem_1522651041219': 'Rights Description',
+    'item_1617186499011[0].subitem_1522650717957': {
+        'type': 'const',
+        'depends': {
+            'type': 'property',
+            'key': 'Rights Description',
+        },
+        'value': 'en',
+    },
     'item_1617610673286[].nameIdentifiers[0].nameIdentifierScheme': 'Rights Holder.nameIdentifiers.nameIdentifierScheme',
     'item_1617610673286[].nameIdentifiers[0].nameIdentifierURI': 'Rights Holder.nameIdentifiers.nameIdentifierURI',
     'item_1617610673286[].nameIdentifiers[0].nameIdentifier': 'Rights Holder.nameIdentifiers.nameIdentifier',
@@ -132,11 +189,19 @@ mapping_table = {'pubdate': 'pubdate',
     'item_1617186609386[].subitem_1523261968819': 'Subject.主題',
     'item_1617186609386[].subitem_1522299896455': {'type': 'language',
     'keys': ['Subject.主題Scheme', 'Subject.主題URI', 'Subject.主題']},
-    'item_1617186626617[].subitem_description_type': 'Description.subitem_description_type',
-    'item_1617186626617[].subitem_description': 'Description.subitem_description',
-    'item_1617186626617[].subitem_description_language': {'type': 'language',
-    'keys': ['Description.subitem_description_type',
-    'Description.subitem_description']},
+    'item_1617186626617[].subitem_description_type': {
+        'type': 'const',
+        'depends': {
+            'type': 'property',
+            'key': 'Description Abstract',
+        },
+        'value': 'Abstract',
+    },
+    'item_1617186626617[].subitem_description': 'Description Abstract',
+    'item_1617186626617[].subitem_description_language': {
+        'type': 'language',
+        'keys': ['Description.subitem_description_type', 'Description.subitem_description']
+    },
     'item_1617186643794[].subitem_1522300316516': '出版者',
     'item_1617186643794[].subitem_1522300295150': {'type': 'language',
     'keys': ['出版者']},
@@ -233,19 +298,24 @@ mapping_table = {'pubdate': 'pubdate',
     'parentkey.subitem_systemfile_version': 'system_file.subitem_systemfile_version'
 }
 
-
 def _get_metadata_value(file_metadata_data, item, lang, index):
     assert 'type' in item, item
     if item['type'] == 'const':
+        if 'depends' in item:
+            value = _get_metadata_value(file_metadata_data, item['depends'], lang, index)
+            if not value:
+                return ''
         return item['value']
     key = f'grdm-file:{item["key"]}'
     if lang is not None:
         key += f'.{lang}'
+    if key not in file_metadata_data:
+        return ''
     value = file_metadata_data[key]['value']
     if item['type'] == 'property':
         return value
     if item['type'] == 'jsonproperty':
-        logger.info(f'jsonproperty: {value}')
+        logger.debug(f'jsonproperty: {value}')
         return json.loads(value)[index][item['value']]
     raise KeyError(item['type'])
 
@@ -261,35 +331,128 @@ def _get_item_indices(file_metadata_data, item):
         return len(json.loads(value))
     return 1
 
-
 def _get_item_metadata_key(key):
-    if key.endswith('[]'):
-        return _get_item_metadata_key(key[:-2])
+    m = re.match(r'^(.+)\[[0-9]*\]$', key)
+    if m:
+        return _get_item_metadata_key(m.group(1))
     return key
 
-
 def _to_item_metadata_keys(key, keys, item, prefix):
-    if len(keys) != 2 or any(['.' in k for k in keys]):
-        return None
+    logger.debug(f'_to_item_metadata_keys {key}, {keys}, {item}, {prefix}')
     value_keys = [k for k in keys if isinstance(mapping_table[f'{key}.{k}'], str)]
-    lang_keys = [k for k in keys if not isinstance(mapping_table[f'{key}.{k}'], str)]
-    if len(value_keys) == 0 or len(lang_keys) == 0:
+    if len(value_keys) == 0:
         return None
-    values = item['attribute_value_mlt']
-    value_key = value_keys[0]
-    lang_key = lang_keys[0]
-    item_name = mapping_table[f'{key}.{value_key}']
+    # filter by constants
+    patterns = [
+        (k, mapping_table[f'{key}.{k}']['value'])
+        for k in keys
+        if isinstance(mapping_table[f'{key}.{k}'], dict) and mapping_table[f'{key}.{k}']['type'] == 'const'
+        and mapping_table[f'{key}.{k}']['value']
+    ]
+    values_ = item['attribute_value_mlt']
+    values = [
+        elem
+        for elem in values_
+        if len(patterns) == 0 or all([k in elem and elem[k] == v for k, v in patterns])
+    ]
+    logger.info(f'filter values: {values_} => {values} (patterns={patterns})')
+    if len(values) == 0:
+        return None
+    lang_keys = [
+        k for k in keys
+        if isinstance(mapping_table[f'{key}.{k}'], dict) and mapping_table[f'{key}.{k}']['type'] == 'language'
+    ]
+    if len(lang_keys) > 0:
+        # Language mapping
+        if len(value_keys) != 1:
+            raise ValueError(f'Language set must be one value: {value_keys}')
+        if len(lang_keys) != 1:
+            raise ValueError(f'Language set must be one language: {lang_keys}')
+        value_key = value_keys[0]
+        lang_key = lang_keys[0]
+        item_name = mapping_table[f'{key}.{value_key}']
+        return dict([
+            (f'{prefix}{item_name}.{v[lang_key]}', _to_metadata_entity(v[value_key]))
+            for v in values
+            if value_key in v and lang_key in v
+        ])
+    # Simple mapping
+    v = values[0]
     return dict([
-        (f'{prefix}{item_name}.{v[lang_key]}', _to_metadata_entity(v[value_key]))
-        for v in values
+        (f'{prefix}{mapping_table[f"{key}.{value_key}"]}', _to_metadata_entity(v[value_key]))
+        for value_key in value_keys
         if value_key in v
     ])
 
+def _to_item_metadata_jsonarray_element_for_key(key, items, value):
+    logger.debug(f'Metadata element: key={key}, items={items}, v={value}')
+    m = re.match(r'^(.+)\[[0-9]+\]$', key)
+    if not m:
+        raise ValueError(f'Key must be array-style key: {key}')
+    patterns = [
+        (k, v['value'])
+        for k, v in items.items()
+        if isinstance(v, dict) and 'type' in v and v['type'] == 'const' and v['value']
+    ]
+    jsonprops = [
+        (k, v['value'])
+        for k, v in items.items()
+        if isinstance(v, dict) and 'type' in v and v['type'] == 'jsonproperty'
+    ]
+    if len(jsonprops) == 0:
+        return None
+    key_ = m.group(1)
+    if key_ not in value:
+        return None
+    for elem in value[key_]:
+        logger.debug(f'Metadata element: key={key}, target={elem}, patterns={patterns}, jsonprops={jsonprops}')
+        if len(patterns) > 0 and not all([k in elem and elem[k] == v for k, v in patterns]):
+            continue
+        return dict([(v, elem[k]) for k, v in jsonprops if k in elem])
+    return None
 
-def _to_item_metadata_json(metadata_def, values):
-    logger.info(f'Metadata: {metadata_def} = {values}')
+def _to_item_metadata_jsonarray_element(items, value):
+    toplevel_keys = set()
+    r = {}
+    for key in items.keys():
+        toplevel_key = key.split('.')[0]
+        if toplevel_key in toplevel_keys:
+            continue
+        toplevel_keys.add(toplevel_key)
+        e = _to_item_metadata_jsonarray_element_for_key(
+            toplevel_key,
+            dict([
+                (k[len(toplevel_key) + 1:], v)
+                for k, v in items.items()
+                if k.startswith(toplevel_key)
+            ]),
+            value,
+        )
+        if not e:
+            continue
+        r.update(e)
+    return r
+
+def _to_item_metadata_jsonarray(items, values):
+    return [
+        _to_item_metadata_jsonarray_element(items, v)
+        for v in values
+    ]
+
+def _to_item_metadata_json(metadata_def, values, prefix='grdm-file:'):
+    if metadata_def['type'] == 'jsonarray':
+        key = metadata_def['key']
+        return {
+            f'{prefix}{key}': _to_metadata_entity(json.dumps(
+                _to_item_metadata_jsonarray(
+                    metadata_def['items'],
+                    values,
+                ),
+                ensure_ascii=False,
+            ))
+        }
+    logger.warning(f'Unknown type: {metadata_def}')
     return {}
-
 
 def _to_metadata_entity(value):
     return {
@@ -298,14 +461,17 @@ def _to_metadata_entity(value):
         'value': value,
     }
 
-
 def _to_item_metadata(key, item, prefix='grdm-file:'):
     if key in mapping_table and isinstance(mapping_table[key], str):
         return {
             f'{prefix}{mapping_table[key]}': _to_metadata_entity(item['attribute_value']),
         }
     if key in mapping_table and isinstance(mapping_table[key], dict):
-        return _to_item_metadata_json(mapping_table[key], item['attribute_value_mlt'])
+        return _to_item_metadata_json(
+            mapping_table[key],
+            item['attribute_value_mlt'],
+            prefix=prefix,
+        )
     keys = [k[len(key) + 1:] for k in mapping_table.keys() if k.startswith(f'{key}.')]
     r = _to_item_metadata_keys(key, keys, item, prefix)
     if r is not None:
@@ -317,7 +483,7 @@ def _to_item_metadata(key, item, prefix='grdm-file:'):
 def to_metadata(schema_id, item):
     metadata = item['metadata'] if isinstance(item, dict) and 'metadata' in item else item.raw['metadata']
     weko_metadata = metadata['_item_metadata']
-    logger.info(f'to_metadata: {weko_metadata} as {schema_id}')
+    logger.debug(f'to_metadata: {weko_metadata} as {schema_id}')
     toplevel_keys = set()
     r = {}
     for key in mapping_table.keys():
@@ -335,11 +501,11 @@ def to_metadata(schema_id, item):
 def write_csv(f, target_index, download_file_names, schema_id, file_metadata):
     header = ['#ItemType', 'デフォルトアイテムタイプ（フル）(15)', 'https://localhost:8443/items/jsonschema/15']
 
-    columns = [('.publish_status', '.PUBLISH_STATUS', '', 'Required', 'public')]
+    columns = [('.publish_status', '.PUBLISH_STATUS', '', 'Required', 'private')]
     columns.append(('.metadata.path[0]', '.IndexID[0]', '', 'Allow Multiple', target_index.identifier))
     columns.append(('.pos_index[0]', '.POS_INDEX[0]', '', 'Allow Multiple', target_index.title))
-    for i, download_file_name in enumerate(download_file_names):
-        columns += _generate_file_columns(i, download_file_name)
+    for i, (download_file_name, download_file_type) in enumerate(download_file_names):
+        columns += _generate_file_columns(i, download_file_name, download_file_type)
 
     file_metadata_item = [item for item in file_metadata['items'] if item['schema'] == schema_id][0]
     file_metadata_data = file_metadata_item['data']
@@ -364,7 +530,7 @@ def write_csv(f, target_index, download_file_names, schema_id, file_metadata):
             empty = False
             for key, item in titem['items']:
                 if any([c[0].startswith('.metadata.' + tkey) for c in columns_default]):
-                    logger.info(f'Key: {key} = {item}')
+                    logger.debug(f'Key: {key} = {item}')
                 m = re.match(r'^([a-zA-Z_0-9]+)\[\]\.(.+)$', key)
                 assert m, key
                 value = _get_metadata_value(file_metadata_data, item, lang, None)
@@ -403,9 +569,11 @@ def _get_toplevel_items(mapping_table):
             if mapping_item['type'] == 'language':
                 items[toplevel_key]['languages'] = ['ja', 'en']
                 items[toplevel_key]['language_key'] = key
-            elif mapping_item['type'] == 'file-creators':
+            elif mapping_item['type'] == 'jsonarray':
                 items[toplevel_key]['jsonarray_key'] = mapping_item['key']
                 items[toplevel_key]['items'] += [(f'{key}.{k}', v) for k, v in mapping_item['items'].items()]
+            elif mapping_item['type'] == 'const':
+                items[toplevel_key]['items'].append((key, mapping_item))
             else:
                 logger.warn(f'Unexpected type: {mapping_item["type"]}')
                 del items[toplevel_key]

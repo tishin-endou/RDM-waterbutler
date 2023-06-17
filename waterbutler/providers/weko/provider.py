@@ -478,6 +478,8 @@ class WEKOProvider(provider.BaseProvider):
             index_folder,
             draft_parent_path,
         )
+        if hasattr(draft_parent_metadata, 'kind') and draft_parent_metadata.kind == 'file':
+            raise exceptions.MetadataError('invalid', code=400)
         draft_files = [child
                        for child in draft_parent_metadata
                        if child.name == last_part.materialized]
