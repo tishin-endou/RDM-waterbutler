@@ -298,6 +298,7 @@ mapping_table = {'pubdate': 'pubdate',
     'parentkey.subitem_systemfile_version': 'system_file.subitem_systemfile_version'
 }
 
+
 def _get_metadata_value(file_metadata_data, item, lang, index):
     assert 'type' in item, item
     if item['type'] == 'const':
@@ -331,11 +332,13 @@ def _get_item_indices(file_metadata_data, item):
         return len(json.loads(value))
     return 1
 
+
 def _get_item_metadata_key(key):
     m = re.match(r'^(.+)\[[0-9]*\]$', key)
     if m:
         return _get_item_metadata_key(m.group(1))
     return key
+
 
 def _to_item_metadata_keys(key, keys, item, prefix):
     logger.debug(f'_to_item_metadata_keys {key}, {keys}, {item}, {prefix}')
@@ -346,8 +349,8 @@ def _to_item_metadata_keys(key, keys, item, prefix):
     patterns = [
         (k, mapping_table[f'{key}.{k}']['value'])
         for k in keys
-        if isinstance(mapping_table[f'{key}.{k}'], dict) and mapping_table[f'{key}.{k}']['type'] == 'const'
-        and mapping_table[f'{key}.{k}']['value']
+        if isinstance(mapping_table[f'{key}.{k}'], dict) and mapping_table[f'{key}.{k}']['type'] == 'const' and
+        mapping_table[f'{key}.{k}']['value']
     ]
     values_ = item['attribute_value_mlt']
     values = [
@@ -384,6 +387,7 @@ def _to_item_metadata_keys(key, keys, item, prefix):
         if value_key in v
     ])
 
+
 def _to_item_metadata_jsonarray_element_for_key(key, items, value):
     logger.debug(f'Metadata element: key={key}, items={items}, v={value}')
     m = re.match(r'^(.+)\[[0-9]+\]$', key)
@@ -411,6 +415,7 @@ def _to_item_metadata_jsonarray_element_for_key(key, items, value):
         return dict([(v, elem[k]) for k, v in jsonprops if k in elem])
     return None
 
+
 def _to_item_metadata_jsonarray_element(items, value):
     toplevel_keys = set()
     r = {}
@@ -433,11 +438,13 @@ def _to_item_metadata_jsonarray_element(items, value):
         r.update(e)
     return r
 
+
 def _to_item_metadata_jsonarray(items, values):
     return [
         _to_item_metadata_jsonarray_element(items, v)
         for v in values
     ]
+
 
 def _to_item_metadata_json(metadata_def, values, prefix='grdm-file:'):
     if metadata_def['type'] == 'jsonarray':
@@ -454,12 +461,14 @@ def _to_item_metadata_json(metadata_def, values, prefix='grdm-file:'):
     logger.warning(f'Unknown type: {metadata_def}')
     return {}
 
+
 def _to_metadata_entity(value):
     return {
         'extra': [],
         'comments': [],
         'value': value,
     }
+
 
 def _to_item_metadata(key, item, prefix='grdm-file:'):
     if key in mapping_table and isinstance(mapping_table[key], str):
