@@ -106,6 +106,7 @@ class S3CompatProvider(provider.BaseProvider):
         self.bucket = self.connection.get_bucket(settings['bucket'], validate=False)
         self.encrypt_uploads = self.settings.get('encrypt_uploads', False)
         self.prefix = settings.get('prefix', '')
+        self.nid = settings['nid']
 
     async def validate_v1_path(self, path, **kwargs):
         wbpath = WaterButlerPath(path, prepend=self.prefix)
