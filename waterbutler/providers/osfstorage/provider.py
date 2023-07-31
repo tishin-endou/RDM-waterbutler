@@ -38,7 +38,6 @@ class OSFStorageProvider(provider.BaseProvider):
 
     def __init__(self, auth, credentials, settings, **kwargs):
         super().__init__(auth, credentials, settings, **kwargs)
-        self.nid = settings['nid']
         self.root_id = settings['rootId']
         self.BASE_URL = settings['baseUrl']
         self.provider_name = settings['storage'].get('provider')
@@ -118,6 +117,7 @@ class OSFStorageProvider(provider.BaseProvider):
 
         :param dict settings: Overridden settings
         """
+        self.settings['storage'].update({'nid': self.nid})
         if not getattr(self, '_inner_provider', None):
             self._inner_provider = utils.make_provider(
                 self.provider_name,
