@@ -2,8 +2,6 @@ import os
 import re
 from waterbutler.core import metadata
 
-from .schema import to_metadata
-
 
 ITEM_PREFIX = 'weko:'
 
@@ -133,14 +131,13 @@ class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
 class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
     file_id = None
     provider_name = None
-    metadata_schema_id = None
     index_identifier = None
     index_path = None
     index_materialized_path = None
     item_file_id = None
     weko_web_url = None
 
-    def __init__(self, client, raw, index, provider_name, metadata_schema_id):
+    def __init__(self, client, raw, index, provider_name):
         super().__init__({
             'primary_title': raw.primary_title,
             'metadata': raw.raw['metadata'],
@@ -150,7 +147,6 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
         self.index_path = _index_to_path(index)
         self.index_materialized_path = _index_to_materialized_path(index)
         self.provider_name = provider_name
-        self.metadata_schema_id = metadata_schema_id
         self.weko_web_url = client.get_item_records_url(str(raw.identifier))
 
     @property
@@ -191,24 +187,6 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
             'weko': 'item',
             'weko_web_url': self.weko_web_url,
             'fileId': self.file_id,
-            'metadata': self._to_metadata(),
-        }
-
-    def _to_metadata(self):
-        if self.metadata_schema_id is None:
-            return None
-        return {
-            'folder': False,
-            'generated': False,
-            'path': self.provider_name + self.path,
-            'items': [
-                {
-                    'active': True,
-                    'data': to_metadata(self.metadata_schema_id, self.raw),
-                    'schema': self.metadata_schema_id,
-                    'readonly': True,
-                }
-            ],
         }
 
 
