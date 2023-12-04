@@ -225,6 +225,20 @@ def celery_dest_copy_params_root():
 
 
 @pytest.fixture
+def celery_dest_copy_params_location():
+    return {
+            'nid': 'export_location',
+            'path': WaterButlerPath('/test_path/', prepend=None),
+            'provider': {
+                'credentials': {},
+                'name': 'MockProvider',
+                'settings': {},
+                'auth': {}
+            }
+    }
+
+
+@pytest.fixture
 def handler_auth():
     with open(os.path.join(os.path.dirname(__file__), 'fixtures/fixtures.json'), 'r') as fp:
         return json.load(fp)['hander_auth']

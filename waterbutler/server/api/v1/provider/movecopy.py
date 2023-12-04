@@ -11,6 +11,7 @@ from waterbutler.server.auth import AuthHandler
 from waterbutler.core.utils import make_provider
 from waterbutler.constants import DEFAULT_CONFLICT
 from waterbutler.auth.osf.handler import EXPORT_DATA_FAKE_NODE_ID
+from waterbutler.tasks.settings import SYNCHRONOUS_TIMEOUT
 
 auth_handler = AuthHandler(settings.AUTH_HANDLERS)
 
@@ -147,14 +148,25 @@ class MoveCopyMixin:
         if not getattr(self.provider, 'can_intra_' + provider_action)(self.dest_provider, self.path):
             # this weird signature syntax courtesy of py3.4 not liking trailing commas on kwargs
             conflict = self.json.get('conflict', DEFAULT_CONFLICT)
+            task_kwargs = {}
+            if provider_action == 'copy':
+                # Only copy API has additional 'version' argument
+                task_kwargs = {'version': self.requested_version}
             result = await getattr(tasks, provider_action).adelay(
                 rename=self.json.get('rename'),
                 conflict=conflict,
-                version=self.requested_version,
                 request=remote_logging._serialize_request(self.request),
-                *self.build_args()
+                *self.build_args(),
+                **task_kwargs,
             )
-            metadata, created = await tasks.wait_on_celery(result)
+            synchronous = self.json.get('synchronous', 'false')
+            synchronous = True if isinstance(synchronous, bool) and synchronous is True else False
+            if synchronous:
+                # Use SYNCHRONOUS_TIMEOUT value for synchronous processes
+                metadata, created = await tasks.wait_on_celery(result, timeout=SYNCHRONOUS_TIMEOUT)
+            else:
+                # Use default timeout value for asynchronous processes
+                metadata, created = await tasks.wait_on_celery(result)
         else:
             metadata, created = (
                 await tasks.backgrounded(

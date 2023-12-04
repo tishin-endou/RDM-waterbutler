@@ -16,10 +16,10 @@ BROKER_URL = config.get(
     )
 )
 
-WAIT_TIMEOUT = int(config.get('WAIT_TIMEOUT', 2000))
+WAIT_TIMEOUT = int(config.get('WAIT_TIMEOUT', 20))
 WAIT_INTERVAL = float(config.get('WAIT_INTERVAL', 0.5))
 ADHOC_BACKEND_PATH = config.get('ADHOC_BACKEND_PATH', '/tmp')
-EMAIL_WAIT_TIMEOUT = int(config.get('EMAIL_WAIT_TIMEOUT', 20))
+SYNCHRONOUS_TIMEOUT = int(config.get('SYNCHRONOUS_TIMEOUT', 1800))
 
 CELERY_CREATE_MISSING_QUEUES = config.get_bool('CELERY_CREATE_MISSING_QUEUES', False)
 CELERY_DEFAULT_QUEUE = config.get('CELERY_DEFAULT_QUEUE', 'waterbutler')

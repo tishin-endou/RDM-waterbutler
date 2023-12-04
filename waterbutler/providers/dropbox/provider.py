@@ -60,6 +60,7 @@ class DropboxProvider(provider.BaseProvider):
     BASE_URL = pd_settings.BASE_URL
     CONTIGUOUS_UPLOAD_SIZE_LIMIT = pd_settings.CONTIGUOUS_UPLOAD_SIZE_LIMIT
     CHUNK_SIZE = pd_settings.CHUNK_SIZE
+    FORCE_RETRY_ON = {404, 409, 429}
 
     def __init__(self, auth, credentials, settings, **kwargs):
         super().__init__(auth, credentials, settings, **kwargs)
@@ -90,6 +91,8 @@ class DropboxProvider(provider.BaseProvider):
         :param tuple \*args: passed through to BaseProvider.make_request()
         :param dict \*\*kwargs: passed through to BaseProvider.make_request()
         """
+        kwargs['retry'] = kwargs.get('retry', pd_settings.RETRY)
+        kwargs['force_retry_on'] = kwargs.get('force_retry_on', self.FORCE_RETRY_ON)
         resp = await self.make_request(
             'POST',
             url,
@@ -571,6 +574,7 @@ class DropboxProvider(provider.BaseProvider):
             self.build_url('files', 'create_folder_v2'),
             {'path': path.full_path.rstrip('/')},
             throws=core_exceptions.CreateFolderError,
+            force_retry_on={409, 429},
         )
         return DropboxFolderMetadata(data['metadata'], self.folder, self.NAME)
 

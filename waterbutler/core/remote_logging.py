@@ -47,7 +47,7 @@ async def log_to_callback(action, source=None, destination=None, start_time=None
             ref_url_domain = '{}://{}{}'.format(ref_url.scheme, ref_url.host, ref_url_port)
 
     if start_time:
-        log_payload['email'] = time.time() - start_time > task_settings.EMAIL_WAIT_TIMEOUT
+        log_payload['email'] = time.time() - start_time > task_settings.WAIT_TIMEOUT
 
     if action in ('move', 'copy'):
         log_payload['source'] = source.serialize()
