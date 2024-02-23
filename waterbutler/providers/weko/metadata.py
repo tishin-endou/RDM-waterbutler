@@ -124,7 +124,10 @@ class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
         return {
             'weko': 'file',
             'itemId': self.item_file_id,
-            'metadata': None,
+            'metadata': {
+                'can_edit': False,
+                'can_register': False,
+            },
         }
 
 
@@ -187,6 +190,10 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
             'weko': 'item',
             'weko_web_url': self.weko_web_url,
             'fileId': self.file_id,
+            'metadata': {
+                'can_edit': False,
+                'can_register': False,
+            },
         }
 
 
@@ -227,7 +234,10 @@ class WEKOIndexMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
             'weko': 'index',
             'weko_web_url': self.weko_web_url,
             'indexId': self.index_identifier,
-            'metadata': None,
+            'metadata': {
+                'can_edit': False,
+                'can_register': False,
+            },
         }
 
 
@@ -249,6 +259,10 @@ class BaseWEKODraftMetadata(BaseWEKOMetadata):
         r = {
             'weko': 'draft',
             'index': self.index_identifier,
+            'metadata': {
+                'can_edit': True,
+                'can_register': False,
+            },
             'source': {
                 'provider': self.raw.provider,
                 'path': self.raw.path,
