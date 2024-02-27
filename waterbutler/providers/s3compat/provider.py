@@ -319,7 +319,7 @@ class S3CompatProvider(provider.BaseProvider):
             upload_url,
             headers=headers,
             skip_auto_headers={'CONTENT-TYPE'},
-            params=params,
+            # params=params,
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
@@ -369,7 +369,7 @@ class S3CompatProvider(provider.BaseProvider):
             data=cutoff_stream,
             skip_auto_headers={'CONTENT-TYPE'},
             headers=headers,
-            params=params,
+            # params=params,
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
@@ -515,7 +515,7 @@ class S3CompatProvider(provider.BaseProvider):
             complete_url,
             data=payload,
             headers=headers,
-            params=params,
+            # params=params,
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
