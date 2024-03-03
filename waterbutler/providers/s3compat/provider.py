@@ -190,6 +190,23 @@ class S3CompatProvider(provider.BaseProvider):
         if not path.is_file:
             raise exceptions.DownloadError('No file specified for download', code=400)
 
+        # MEMO: This is a workaround for the bug on some callers.
+        if revision is None and 'version' in kwargs:
+            revision = kwargs['version']
+
+        try:
+            pre_size, pre_etag = await self._get_content_whole_size(path, revision)
+            if range is not None:
+                # MEMO: range type is (int, int)
+                # see: core/provider.py _build_range_header()
+                s, e = range
+                if s < 0 or s >= pre_size or e < 0 or e >= pre_size or e < s:
+                    pre_size = None
+                else:
+                    pre_size = e - s + 1
+        except exceptions.MetadataError:
+            pre_size = None
+
         if not revision or revision.lower() == 'latest':
             query_parameters = None
         else:
@@ -219,7 +236,32 @@ class S3CompatProvider(provider.BaseProvider):
             throws=exceptions.DownloadError,
         )
 
-        return streams.ResponseStreamReader(resp)
+        try:
+            get_etag = resp.headers['ETag'].replace('"', '')
+            if get_etag != pre_etag:
+                pre_size = None
+        except KeyError:
+            pre_size = None
+
+        download_stream = streams.ResponseStreamReader(resp)
+
+        if hasattr(download_stream, '_size') and download_stream._size is None:
+            # if the GetObject API doesn't return Content-Length header,
+            # use metadata content-size or range size instead of it.
+            download_stream._size = pre_size
+
+        return download_stream
+
+    async def _get_content_whole_size(self, path: WaterButlerPath, revision=None):
+        """ get content whole size from path.
+        """
+        metadata = await self.metadata(path, revision)
+        try:
+            size = metadata.size_as_int
+            etag = metadata.etag
+        except KeyError:
+            raise exceptions.MetadataError('Cannot get content size and ETag')
+        return size, etag
 
     async def upload(self, stream, path, conflict='replace', **kwargs):
         """Uploads the given stream to S3 Compatible Storage

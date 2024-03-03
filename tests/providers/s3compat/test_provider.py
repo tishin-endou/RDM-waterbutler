@@ -730,41 +730,63 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_download(self, provider, mock_time):
+    async def test_download(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
+
         response_headers = {'response-content-disposition': 'attachment'}
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'delicious', auto_length=True)
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', headers=file_header_metadata, auto_length=True)
 
         result = await provider.download(path)
         content = await result.read()
 
         assert content == b'delicious'
+        assert result._size == 9
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_download_range(self, provider, mock_time):
+    async def test_download_range(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
+
         response_headers = {'response-content-disposition': 'attachment;'}
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'de', auto_length=True, status=206)
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'de', auto_length=True, status=206)
 
         result = await provider.download(path, range=(0, 1))
         assert result.partial
         content = await result.read()
+        content_size = result._size
         assert content == b'de'
-        assert aiohttpretty.has_call(method='GET', uri=url[:url.index('?')])
+        assert content_size == 2
+        assert aiohttpretty.has_call(method='GET', uri=get_url[:get_url.index('?')])
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_download_version(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
-        url = provider.bucket.new_key(path.full_path).generate_url(
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+        versionid_parameter = {'versionId': 'someversion'}
+
+        head_url = generate_url(100, 'HEAD', query_parameters=versionid_parameter)
+        aiohttpretty.register_uri('HEAD', head_url, headers={'Content-Length': '9'})
+
+        get_url = generate_url(
             100,
-            query_parameters={'versionId': 'someversion'},
+            query_parameters=versionid_parameter,
             response_headers={'response-content-disposition': 'attachment'},
         )
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'delicious', auto_length=True)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', auto_length=True)
 
         result = await provider.download(path, version='someversion')
         content = await result.read()
@@ -780,12 +802,18 @@ class TestCRUD:
     ])
     async def test_download_with_display_name(self, provider, mock_time, display_name_arg, expected_name):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers={'Content-Length': '9'})
+
         response_headers = {
             'response-content-disposition':
             'attachment; filename="{}"; filename*=UTF-8''{}'.format(expected_name, expected_name)
         }
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'delicious', auto_length=True)
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', auto_length=True)
 
         result = await provider.download(path, display_name=display_name_arg)
         content = await result.read()
@@ -796,12 +824,67 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_not_found(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, status=404)
+
         response_headers = {'response-content-disposition': 'attachment'}
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
+        url = generate_url(100, response_headers=response_headers)
         aiohttpretty.register_uri('GET', url[:url.index('?')], status=404)
 
         with pytest.raises(exceptions.DownloadError):
             await provider.download(path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_download_no_content_length(self, provider, file_header_metadata, mock_time):
+        path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
+
+        # aiohttpretty.register_uri uses shallow copy for headers.
+        # Therefore, we need to use a deep copied dictionary for GET.
+        no_content_length_metadata = file_header_metadata.copy()
+        del no_content_length_metadata['Content-Length']
+
+        response_headers = {'response-content-disposition': 'attachment'}
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', headers=no_content_length_metadata)
+
+        result = await provider.download(path)
+        content = await result.read()
+
+        assert content == b'delicious'
+        assert result._size == int(file_header_metadata['Content-Length'])
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_download_content_replaced(self, provider, file_header_metadata, mock_time):
+        path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_header_metadata = file_header_metadata.copy()
+        file_header_metadata['ETag'] = '"1accb31fcf202eba0c0f41fa2f09b4d7"'
+        file_header_metadata['Content-Length'] = 300
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=head_header_metadata)
+
+        response_headers = {'response-content-disposition': 'attachment'}
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', headers=file_header_metadata, auto_length=True)
+
+        result = await provider.download(path)
+        content = await result.read()
+
+        assert content == b'delicious'
+        assert result._size == 9
+        assert aiohttpretty.has_call(method='HEAD', uri=head_url)
+        assert aiohttpretty.has_call(method='GET', uri=get_url[:get_url.index('?')])
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
