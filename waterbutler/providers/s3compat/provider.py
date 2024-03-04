@@ -234,6 +234,7 @@ class S3CompatProvider(provider.BaseProvider):
                     pre_size = e - s + 1
         except exceptions.MetadataError:
             pre_size = None
+            pre_etag = None
 
         if not revision or revision.lower() == 'latest':
             query_parameters = None
