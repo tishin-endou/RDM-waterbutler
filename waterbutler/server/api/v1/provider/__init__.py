@@ -22,6 +22,9 @@ from waterbutler.auth.osf.handler import EXPORT_DATA_FAKE_NODE_ID
 from waterbutler.server.api.v1.provider.metadata import MetadataMixin
 from waterbutler.server.api.v1.provider.movecopy import MoveCopyMixin
 
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core.models import http
+
 logger = logging.getLogger(__name__)
 auth_handler = AuthHandler(settings.AUTH_HANDLERS)
 
@@ -44,6 +47,9 @@ class ProviderHandler(core.BaseHandler, CreateMixin, MetadataMixin, MoveCopyMixi
     callback_log = True
 
     async def prepare(self, *args, **kwargs):
+        self.segment = xray_recorder.begin_segment('files.perfin.rdm.nii.ac.jp')
+        self.segment.put_http_meta(http.URL, self.request.full_url())
+        self.segment.put_http_meta(http.METHOD, self.request.method)
         method = self.request.method.lower()
 
         # TODO Find a nicer way to handle this
@@ -164,6 +170,12 @@ class ProviderHandler(core.BaseHandler, CreateMixin, MetadataMixin, MoveCopyMixi
         self.uploader = asyncio.ensure_future(self.provider.upload(self.stream, self.target_path))
 
     def on_finish(self):
+        if hasattr(self, 'segment'):
+            try:
+                self.segment.put_http_meta(http.STATUS, self.get_status())
+                xray_recorder.end_segment()
+            except Exception as e:
+                logger.warning("Could not add metadata to X-Ray segment: {0}".format(e))
         status, method = self.get_status(), self.request.method.upper()
 
         # If the response code is not within the 200-302 range, the request was a HEAD or OPTIONS,

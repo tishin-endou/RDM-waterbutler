@@ -18,6 +18,9 @@ from waterbutler.server import handlers
 from waterbutler.version import __version__
 from waterbutler.server import settings as server_settings
 
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +54,16 @@ def make_app(debug):
         release=__version__,
         integrations=[TornadoIntegration(), sentry_logging, ],
     )
+
+    xray_recorder.configure(
+        service='files.perfin.rdm.nii.ac.jp',
+        daemon_address='192.168.168.167:2000',
+        sampling=False,
+        context_missing='LOG_ERROR',
+        plugins=('EC2Plugin',),
+        dynamic_naming='*.perfin.rdm.nii.ac.jp',
+    )
+    patch_all()
 
     app = tornado.web.Application(
         api_to_handlers(v0) +

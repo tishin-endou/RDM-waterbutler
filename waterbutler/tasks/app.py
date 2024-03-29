@@ -11,7 +11,20 @@ from waterbutler.settings import config
 from waterbutler.version import __version__
 from waterbutler.tasks import settings as tasks_settings
 
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+
 logger = logging.getLogger(__name__)
+
+xray_recorder.configure(
+    service='wb_worker',
+    daemon_address='192.168.168.167:2000',
+    sampling=False,
+    context_missing='LOG_ERROR',
+    plugins=('EC2Plugin',),
+    dynamic_naming='*.perfin.rdm.nii.ac.jp',
+)
+patch_all()
 
 app = Celery()
 app.config_from_object(tasks_settings)

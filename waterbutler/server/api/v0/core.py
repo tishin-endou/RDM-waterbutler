@@ -17,6 +17,9 @@ from waterbutler.server.auth import AuthHandler
 from waterbutler.core.log_payload import LogPayload
 from waterbutler.server import utils as server_utils
 
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core.models import http
+
 
 def list_or_value(value):
     assert isinstance(value, list)
@@ -72,6 +75,9 @@ class BaseHandler(server_utils.CORsMixin, server_utils.UtilMixin, tornado.web.Re
 class BaseProviderHandler(BaseHandler):
 
     async def prepare(self):
+        self.segment = xray_recorder.begin_segment('files.perfin.rdm.nii.ac.jp')
+        self.segment.put_http_meta(http.URL, self.request.full_url())
+        self.segment.put_http_meta(http.METHOD, self.request.method)
         self.arguments = {
             key: list_or_value(value)
             for key, value in self.request.query_arguments.items()
@@ -100,11 +106,19 @@ class BaseProviderHandler(BaseHandler):
                                        bytes_downloaded=self.bytes_downloaded,
                                        bytes_uploaded=self.bytes_uploaded)
 
+    def on_finish(self):
+        if hasattr(self, 'segment'):
+            self.segment.put_http_meta(http.STATUS, self.get_status())
+            xray_recorder.end_segment()
+        super().on_finish()
 
 class BaseCrossProviderHandler(BaseHandler):
     JSON_REQUIRED = False
 
     async def prepare(self):
+        self.segment = xray_recorder.begin_segment('files.perfin.rdm.nii.ac.jp')
+        self.segment.put_http_meta(http.URL, self.request.full_url())
+        self.segment.put_http_meta(http.METHOD, self.request.method)
         try:
             self.action = self.ACTION_MAP[self.request.method]
         except KeyError:
@@ -148,3 +162,9 @@ class BaseCrossProviderHandler(BaseHandler):
                                        request=remote_logging._serialize_request(self.request),
                                        bytes_downloaded=self.bytes_downloaded,
                                        bytes_uploaded=self.bytes_uploaded)
+
+    def on_finish(self):
+        if hasattr(self, 'segment'):
+            self.segment.put_http_meta(http.STATUS, self.get_status())
+            xray_recorder.end_segment()
+        super().on_finish()
