@@ -175,8 +175,36 @@ class S3CompatProvider(provider.BaseProvider):
             expects=(200, ),
             throws=exceptions.IntraCopyError,
         )
+
+        response_body = await resp.read()
+        self._check_for_200_error(response_body, "CopyObject", exceptions.IntraCopyError)
+
         await resp.release()
         return (await dest_provider.metadata(dest_path)), not exists
+
+    @staticmethod
+    def _check_for_200_error(response_body,
+                             s3_api_name="S3 API",
+                             exception_type=exceptions.UnhandledProviderError):
+        """ check an S3 API result with http status is 200 OK.
+
+        try to parse response body as a xml.
+        if the xml has an 'Error' element then raise an exception.
+
+        :param str response_body: API response body.
+        :param str s3_api_name: S3 API name for logging.
+        :param type exception_type: raise Exception type
+        """
+        try:
+            # memo: If no element, the parser will raise an ExpatError.
+            result = xmltodict.parse(response_body)
+        except Exception:
+            logger.warning(f'Couldn\'t parse {s3_api_name} result "{response_body}"')
+            raise
+
+        if 'Error' in result:
+            logger.warning(f'{s3_api_name} returned with an error "{response_body}"')
+            raise exception_type(f"{s3_api_name} returned with an error.", code=500)
 
     async def download(self, path, accept_url=False, revision=None, range=None, **kwargs):
         r"""Returns a ResponseWrapper (Stream) for the specified path
@@ -189,6 +217,24 @@ class S3CompatProvider(provider.BaseProvider):
         """
         if not path.is_file:
             raise exceptions.DownloadError('No file specified for download', code=400)
+
+        # MEMO: This is a workaround for the bug on some callers.
+        if revision is None and 'version' in kwargs:
+            revision = kwargs['version']
+
+        try:
+            pre_size, pre_etag = await self._get_content_whole_size(path, revision)
+            if range is not None:
+                # MEMO: range type is (int, int)
+                # see: core/provider.py _build_range_header()
+                s, e = range
+                if s < 0 or s >= pre_size or e < 0 or e >= pre_size or e < s:
+                    pre_size = None
+                else:
+                    pre_size = e - s + 1
+        except exceptions.MetadataError:
+            pre_size = None
+            pre_etag = None
 
         if not revision or revision.lower() == 'latest':
             query_parameters = None
@@ -219,7 +265,32 @@ class S3CompatProvider(provider.BaseProvider):
             throws=exceptions.DownloadError,
         )
 
-        return streams.ResponseStreamReader(resp)
+        try:
+            get_etag = resp.headers['ETag'].replace('"', '')
+            if get_etag != pre_etag:
+                pre_size = None
+        except KeyError:
+            pre_size = None
+
+        download_stream = streams.ResponseStreamReader(resp)
+
+        if hasattr(download_stream, '_size') and download_stream._size is None:
+            # if the GetObject API doesn't return Content-Length header,
+            # use metadata content-size or range size instead of it.
+            download_stream._size = pre_size
+
+        return download_stream
+
+    async def _get_content_whole_size(self, path: WaterButlerPath, revision=None):
+        """ get content whole size from path.
+        """
+        metadata = await self.metadata(path, revision)
+        try:
+            size = metadata.size_as_int
+            etag = metadata.etag
+        except KeyError:
+            raise exceptions.MetadataError('Cannot get content size and ETag')
+        return size, etag
 
     async def upload(self, stream, path, conflict='replace', **kwargs):
         """Uploads the given stream to S3 Compatible Storage
@@ -319,7 +390,7 @@ class S3CompatProvider(provider.BaseProvider):
             upload_url,
             headers=headers,
             skip_auto_headers={'CONTENT-TYPE'},
-            params=params,
+            # params=params,
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
@@ -369,7 +440,7 @@ class S3CompatProvider(provider.BaseProvider):
             data=cutoff_stream,
             skip_auto_headers={'CONTENT-TYPE'},
             headers=headers,
-            params=params,
+            # params=params,
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
@@ -515,10 +586,14 @@ class S3CompatProvider(provider.BaseProvider):
             complete_url,
             data=payload,
             headers=headers,
-            params=params,
+            # params=params,
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
+
+        response_body = await resp.read()
+        self._check_for_200_error(response_body, "CompleteMultipartUpload", exceptions.UploadError)
+
         await resp.release()
 
     async def delete(self, path, confirm_delete=0, **kwargs):

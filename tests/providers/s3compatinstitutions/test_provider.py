@@ -22,6 +22,8 @@ from tests.providers.s3compat.test_provider import (
     folder_key_metadata_object,
     folder_metadata_object,
     revision_metadata_object,
+    copy_object_resp,
+    api_error_resp,
     single_version_metadata,
     version_metadata,
     folder_and_contents,

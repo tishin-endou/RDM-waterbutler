@@ -150,6 +150,30 @@ def revision_metadata_object():
 
 
 @pytest.fixture
+def copy_object_resp():
+    return '''<?xml version="1.0" encoding="UTF-8"?>
+    <CopyObjectResult>
+        <ETag>string</ETag>
+        <LastModified>timestamp</LastModified>
+        <ChecksumCRC32>string</ChecksumCRC32>
+        <ChecksumCRC32C>string</ChecksumCRC32C>
+        <ChecksumSHA1>string</ChecksumSHA1>
+        <ChecksumSHA256>string</ChecksumSHA256>
+    </CopyObjectResult>'''
+
+
+@pytest.fixture
+def api_error_resp():
+    return '''<?xml version="1.0" encoding="UTF-8"?>
+    <Error>
+        <Code>Internal Error</Code>
+        <Message>Internal Error</Message>
+        <Resource>/object/path</Resource>
+        <RequestId>1234567890</RequestId>
+    </Error>'''
+
+
+@pytest.fixture
 def single_version_metadata():
     return '''<?xml version="1.0" encoding="UTF-8"?>
     <ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01">
@@ -730,41 +754,63 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_download(self, provider, mock_time):
+    async def test_download(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
+
         response_headers = {'response-content-disposition': 'attachment'}
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'delicious', auto_length=True)
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', headers=file_header_metadata, auto_length=True)
 
         result = await provider.download(path)
         content = await result.read()
 
         assert content == b'delicious'
+        assert result._size == 9
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_download_range(self, provider, mock_time):
+    async def test_download_range(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
+
         response_headers = {'response-content-disposition': 'attachment;'}
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'de', auto_length=True, status=206)
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'de', auto_length=True, status=206)
 
         result = await provider.download(path, range=(0, 1))
         assert result.partial
         content = await result.read()
+        content_size = result._size
         assert content == b'de'
-        assert aiohttpretty.has_call(method='GET', uri=url[:url.index('?')])
+        assert content_size == 2
+        assert aiohttpretty.has_call(method='GET', uri=get_url[:get_url.index('?')])
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_download_version(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
-        url = provider.bucket.new_key(path.full_path).generate_url(
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+        versionid_parameter = {'versionId': 'someversion'}
+
+        head_url = generate_url(100, 'HEAD', query_parameters=versionid_parameter)
+        aiohttpretty.register_uri('HEAD', head_url, headers={'Content-Length': '9'})
+
+        get_url = generate_url(
             100,
-            query_parameters={'versionId': 'someversion'},
+            query_parameters=versionid_parameter,
             response_headers={'response-content-disposition': 'attachment'},
         )
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'delicious', auto_length=True)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', auto_length=True)
 
         result = await provider.download(path, version='someversion')
         content = await result.read()
@@ -780,12 +826,18 @@ class TestCRUD:
     ])
     async def test_download_with_display_name(self, provider, mock_time, display_name_arg, expected_name):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers={'Content-Length': '9'})
+
         response_headers = {
             'response-content-disposition':
             'attachment; filename="{}"; filename*=UTF-8''{}'.format(expected_name, expected_name)
         }
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url[:url.index('?')], body=b'delicious', auto_length=True)
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', auto_length=True)
 
         result = await provider.download(path, display_name=display_name_arg)
         content = await result.read()
@@ -796,12 +848,67 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_not_found(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, status=404)
+
         response_headers = {'response-content-disposition': 'attachment'}
-        url = provider.bucket.new_key(path.full_path).generate_url(100, response_headers=response_headers)
+        url = generate_url(100, response_headers=response_headers)
         aiohttpretty.register_uri('GET', url[:url.index('?')], status=404)
 
         with pytest.raises(exceptions.DownloadError):
             await provider.download(path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_download_no_content_length(self, provider, file_header_metadata, mock_time):
+        path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
+
+        # aiohttpretty.register_uri uses shallow copy for headers.
+        # Therefore, we need to use a deep copied dictionary for GET.
+        no_content_length_metadata = file_header_metadata.copy()
+        del no_content_length_metadata['Content-Length']
+
+        response_headers = {'response-content-disposition': 'attachment'}
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', headers=no_content_length_metadata)
+
+        result = await provider.download(path)
+        content = await result.read()
+
+        assert content == b'delicious'
+        assert result._size == int(file_header_metadata['Content-Length'])
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_download_content_replaced(self, provider, file_header_metadata, mock_time):
+        path = WaterButlerPath('/muhtriangle', prepend=provider.prefix)
+        generate_url = provider.bucket.new_key(path.full_path).generate_url
+
+        head_header_metadata = file_header_metadata.copy()
+        file_header_metadata['ETag'] = '"1accb31fcf202eba0c0f41fa2f09b4d7"'
+        file_header_metadata['Content-Length'] = 300
+        head_url = generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', head_url, headers=head_header_metadata)
+
+        response_headers = {'response-content-disposition': 'attachment'}
+        get_url = generate_url(100, response_headers=response_headers)
+        aiohttpretty.register_uri('GET', get_url[:get_url.index('?')],
+                                  body=b'delicious', headers=file_header_metadata, auto_length=True)
+
+        result = await provider.download(path)
+        content = await result.read()
+
+        assert content == b'delicious'
+        assert result._size == 9
+        assert aiohttpretty.has_call(method='HEAD', uri=head_url)
+        assert aiohttpretty.has_call(method='GET', uri=get_url[:get_url.index('?')])
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -1135,6 +1242,53 @@ class TestCRUD:
         )
 
         await provider._complete_multipart_upload(path, upload_id, headers_list)
+
+        assert aiohttpretty.has_call(method='POST', uri=complete_url, params=params)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_complete_multipart_upload_error(self, provider,
+                                                            upload_parts_headers_list,
+                                                            api_error_resp, mock_time):
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
+                    '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
+        params = {'uploadId': upload_id}
+        payload = '<?xml version="1.0" encoding="UTF-8"?>'
+        payload += '<CompleteMultipartUpload>'
+        # aiohttp resp headers are upper case
+        headers_list = json.loads(upload_parts_headers_list).get('headers_list')
+        headers_list = [{k.upper(): v for k, v in headers.items()} for headers in headers_list]
+        for i, part in enumerate(headers_list):
+            payload += '<Part>'
+            payload += '<PartNumber>{}</PartNumber>'.format(i+1)  # part number must be >= 1
+            payload += '<ETag>{}</ETag>'.format(xml.sax.saxutils.escape(part['ETAG']))
+            payload += '</Part>'
+        payload += '</CompleteMultipartUpload>'
+        payload = payload.encode('utf-8')
+
+        headers = {
+            'Content-Length': str(len(payload)),
+            'Content-MD5': compute_md5(BytesIO(payload))[1],
+            'Content-Type': 'text/xml',
+        }
+
+        complete_url = provider.bucket.new_key(path.full_path).generate_url(
+            100,
+            'POST',
+            headers=headers,
+            query_parameters=params
+        )
+
+        aiohttpretty.register_uri(
+            'POST',
+            complete_url,
+            status=200,
+            body=api_error_resp
+        )
+
+        with pytest.raises(exceptions.UploadError):
+            await provider._complete_multipart_upload(path, upload_id, headers_list)
 
         assert aiohttpretty.has_call(method='POST', uri=complete_url, params=params)
 
@@ -1713,7 +1867,7 @@ class TestOperations:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_intra_copy(self, provider, file_header_metadata, mock_time):
+    async def test_intra_copy(self, provider, file_header_metadata, copy_object_resp, mock_time):
         dest_path = WaterButlerPath('/dest', prepend=provider.prefix)
         source_path = WaterButlerPath('/source', prepend=provider.prefix)
 
@@ -1723,12 +1877,32 @@ class TestOperations:
         header_path = '/' + os.path.join(provider.settings['bucket'], source_path.full_path)
         headers = {'x-amz-copy-source': parse.quote(header_path)}
         url = provider.bucket.new_key(dest_path.full_path).generate_url(100, 'PUT', headers=headers)
-        aiohttpretty.register_uri('PUT', url, status=200)
+        aiohttpretty.register_uri('PUT', url, status=200, body=copy_object_resp, auto_length=True)
 
         metadata, exists = await provider.intra_copy(provider, source_path, dest_path)
 
         assert metadata.kind == 'file'
         assert not exists
+        assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
+        assert aiohttpretty.has_call(method='PUT', uri=url, headers=headers)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_intra_copy_error(self, provider, file_header_metadata, api_error_resp, mock_time):
+        dest_path = WaterButlerPath('/dest', prepend=provider.prefix)
+        source_path = WaterButlerPath('/source', prepend=provider.prefix)
+
+        metadata_url = provider.bucket.new_key(dest_path.full_path).generate_url(100, 'HEAD')
+        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata)
+
+        header_path = '/' + os.path.join(provider.settings['bucket'], source_path.full_path)
+        headers = {'x-amz-copy-source': parse.quote(header_path)}
+        url = provider.bucket.new_key(dest_path.full_path).generate_url(100, 'PUT', headers=headers)
+        aiohttpretty.register_uri('PUT', url, status=200, body=api_error_resp, auto_length=True)
+
+        with pytest.raises(exceptions.IntraCopyError):
+            metadata, exists = await provider.intra_copy(provider, source_path, dest_path)
+
         assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
         assert aiohttpretty.has_call(method='PUT', uri=url, headers=headers)
 
