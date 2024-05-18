@@ -1,4 +1,3 @@
-import os
 import re
 from waterbutler.core import metadata
 
@@ -15,19 +14,6 @@ def parse_item_file_id(part):
     if not m:
         return None
     return m.group(1)
-
-
-def get_files(directory, relative=''):
-    files = []
-    for f in os.listdir(directory):
-        if os.path.isfile(os.path.join(directory, f)):
-            files.append(os.path.join(relative, f) if len(relative) > 0 else f)
-        elif os.path.isdir(os.path.join(directory, f)):
-            for child in get_files(os.path.join(directory, f),
-                                   os.path.join(relative, f)
-                                   if len(relative) > 0 else f):
-                files.append(child)
-    return files
 
 
 def _index_to_path_parts(target):
@@ -146,6 +132,7 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
             'metadata': raw.raw['metadata'],
         })
         self.file_id = _get_item_file_id(raw)
+        self.item_identifier = raw.identifier
         self.index_identifier = index.identifier
         self.index_path = _index_to_path(index)
         self.index_materialized_path = _index_to_materialized_path(index)
