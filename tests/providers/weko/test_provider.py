@@ -67,6 +67,19 @@ fake_weko_item_1000 = {
                     },
                 ],
             },
+            'item_dummy_title': {
+                'attribute_name': 'title',
+                'attribute_value_mlt': [
+                    {
+                        'subitem_title': 'Sample Item',
+                        'subitem_title_language': 'en',
+                    },
+                    {
+                        'subitem_title': 'サンプルアイテム',
+                        'subitem_title_language': 'ja',
+                    },
+                ],
+            },
         },
     },
 }
@@ -245,12 +258,12 @@ class TestValidatePath:
     async def test_item_file(self, provider, mock_time):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         path = await provider.validate_path('/Sample Item/file.txt')
@@ -267,12 +280,12 @@ class TestValidatePath:
     async def test_sub_index(self, provider, mock_time):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         path = await provider.validate_path('/Sub Index/')
@@ -291,12 +304,12 @@ class TestMetadata:
     async def test_root_metadata(self, provider, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         mock_default_storage_metadata = MockCoroutine(return_value=[])
@@ -315,7 +328,7 @@ class TestMetadata:
         index_metadata = result[0]
         assert index_metadata.name == 'Sub Index'
         assert index_metadata.extra['weko'] == 'index'
-        assert index_metadata.extra['weko_web_url'] == 'https://test.sample.nii.ac.jp/search?search_type=2&q=101'
+        assert index_metadata.extra['weko_web_url'] == 'https://test.sample.nii.ac.jp/search?q=101'
         assert index_metadata.extra['indexId'] == '101'
         assert index_metadata.provider == 'weko'
         assert index_metadata.path == '/weko:101/'
@@ -326,6 +339,10 @@ class TestMetadata:
         assert item_metadata.extra['weko'] == 'item'
         assert item_metadata.extra['weko_web_url'] == 'https://test.sample.nii.ac.jp/records/1000'
         assert item_metadata.extra['fileId'] == 'item1000'
+        assert item_metadata.extra['item_title'] == [
+            {'subitem_title': 'Sample Item', 'subitem_title_language': 'en'},
+            {'subitem_title': 'サンプルアイテム', 'subitem_title_language': 'ja'},
+        ]
         assert item_metadata.provider == 'weko'
         assert item_metadata.path == '/weko:item1000/'
         assert item_metadata.materialized_path == '/Sample Item/'
@@ -335,12 +352,12 @@ class TestMetadata:
     async def test_item_metadata(self, provider, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
@@ -374,17 +391,17 @@ class TestMetadata:
     async def test_sub_item_metadata(self, provider, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=101',
+            'https://test.sample.nii.ac.jp/api/index/?q=101',
             body=fake_weko_sub_items,
         )
         mock_default_storage_metadata = MockCoroutine(return_value=[])
@@ -405,6 +422,7 @@ class TestMetadata:
         assert item_metadata.extra['weko'] == 'item'
         assert item_metadata.extra['weko_web_url'] == 'https://test.sample.nii.ac.jp/records/1001'
         assert item_metadata.extra['fileId'] == 'item1001'
+        assert item_metadata.extra['item_title'] == [{'subitem_title': 'Sub Item'}]
         assert item_metadata.provider == 'weko'
         assert item_metadata.path == '/weko:101/weko:item1001/'
         assert item_metadata.materialized_path == '/Sub Index/Sub Item/'
@@ -414,12 +432,12 @@ class TestMetadata:
     async def test_item_file_metadata(self, provider, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
@@ -449,12 +467,12 @@ class TestMetadata:
     async def test_draft_file_metadata(self, provider, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -490,12 +508,12 @@ class TestMetadata:
     async def test_draft_folder_metadata(self, provider, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -524,7 +542,7 @@ class TestMetadata:
         index_metadata = result[0]
         assert index_metadata.name == 'Sub Index'
         assert index_metadata.extra['weko'] == 'index'
-        assert index_metadata.extra['weko_web_url'] == 'https://test.sample.nii.ac.jp/search?search_type=2&q=101'
+        assert index_metadata.extra['weko_web_url'] == 'https://test.sample.nii.ac.jp/search?q=101'
         assert index_metadata.extra['indexId'] == '101'
         assert index_metadata.provider == 'weko'
         assert index_metadata.path == '/weko:101/'
@@ -560,12 +578,12 @@ class TestMetadata:
     async def test_sub_draft_file_metadata(self, provider, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -690,12 +708,12 @@ class TestUpload:
     async def test_upload_draft_file(self, provider, file_stream, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
 
@@ -739,12 +757,12 @@ class TestUpload:
     async def test_upload_sub_draft_file(self, provider, file_stream, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
 
@@ -791,12 +809,12 @@ class TestCreateFolder:
     async def test_create_draft_folder(self, provider, file_stream, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
 
@@ -841,12 +859,12 @@ class TestCreateFolder:
     async def test_create_sub_draft_folder(self, provider, file_stream, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
 
@@ -896,12 +914,12 @@ class TestDownload:
     async def test_download_draft_file(self, provider, file_stream, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -936,12 +954,12 @@ class TestDownload:
     async def test_download_sub_draft_file(self, provider, file_stream, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -979,12 +997,12 @@ class TestDownload:
     async def test_download_item_file(self, provider, file_stream, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
@@ -1021,12 +1039,12 @@ class TestDelete:
     async def test_delete_draft_file(self, provider, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -1061,12 +1079,12 @@ class TestDelete:
     async def test_delete_draft_folder(self, provider, file_metadata, monkeypatch):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']

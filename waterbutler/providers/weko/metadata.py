@@ -172,11 +172,33 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
         return self.file_id
 
     @property
+    def item_title(self):
+        if '_item_metadata' not in self.raw['metadata']:
+            return [
+                {
+                    'subitem_title': self.raw['primary_title'],
+                }
+            ]
+        _item_metadata = self.raw['metadata']['_item_metadata']
+        items = [i
+                 for i in _item_metadata.values()
+                 if isinstance(i, dict) and 'attribute_value_mlt' in i and
+                     all(['subitem_title' in v for v in i['attribute_value_mlt']])]
+        if len(items) == 0:
+            return [
+                {
+                    'subitem_title': self.raw['primary_title'],
+                }
+            ]
+        return items[0]['attribute_value_mlt']
+
+    @property
     def extra(self):
         return {
             'weko': 'item',
             'weko_web_url': self.weko_web_url,
             'fileId': self.file_id,
+            'item_title': self.item_title,
             'metadata': {
                 'can_edit': False,
                 'can_register': False,

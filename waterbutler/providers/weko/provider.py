@@ -185,7 +185,7 @@ class WEKOProvider(provider.BaseProvider):
         index = None
         item = None
         file = None
-        for part in parts:
+        for i, part in enumerate(parts):
             # Specialized Path?
             if part.startswith(ITEM_PREFIX):
                 item_id = parse_item_file_id(part)
@@ -204,6 +204,10 @@ class WEKOProvider(provider.BaseProvider):
                 continue
             if file is not None:
                 raise exceptions.MetadataError('Invalid path: No path segment below the item file', code=400)
+            # Root path segment
+            if part == '' and i == 0:
+                ids.append(('root', part, part))
+                continue
             # File?
             if item is not None:
                 file_cands = [f for f in item.files if f.filename == part]
@@ -226,7 +230,7 @@ class WEKOProvider(provider.BaseProvider):
                 item = item_cands[0]
                 ids.append(('item', item.identifier, item.primary_title))
                 continue
-            # Draft files or root path segment
+            # Draft files
             ids.append(('draft_file', part, part))
         logger.debug(f'WEKOPath {path} -> {ids}')
         return WEKOPath(path, _ids=ids)

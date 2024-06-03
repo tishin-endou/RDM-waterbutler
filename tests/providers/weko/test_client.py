@@ -71,7 +71,7 @@ class TestWEKOClient:
     async def test_weko_get_indices(self, client):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         indices = await client.get_indices()
@@ -84,7 +84,7 @@ class TestWEKOClient:
     async def test_weko_get_indices_404(self, client):
         aiohttpretty.register_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             status=404,
         )
         with pytest.raises(exceptions.MetadataError):
@@ -95,7 +95,7 @@ class TestWEKOClient:
     async def test_weko_get_index_by_id(self, client):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         index = await client.get_index_by_id(100)
@@ -110,12 +110,12 @@ class TestWEKOClient:
     async def test_weko_get_items(self, client):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?search_type=2&q=100',
+            'https://test.sample.nii.ac.jp/api/index/?q=100',
             body=fake_weko_items,
         )
 
@@ -131,7 +131,7 @@ class TestWEKOClient:
     async def test_weko_get_item_by_id(self, client):
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/tree',
+            'https://test.sample.nii.ac.jp/api/tree?action=browsing',
             body=fake_weko_indices,
         )
         aiohttpretty.register_json_uri(
