@@ -228,7 +228,9 @@ class S3CompatProvider(provider.BaseProvider):
                 # MEMO: range type is (int, int)
                 # see: core/provider.py _build_range_header()
                 s, e = range
-                if s < 0 or s >= pre_size or e < 0 or e >= pre_size or e < s:
+                if s is None or e is None:
+                    pre_size = None
+                elif s < 0 or s >= pre_size or e < 0 or e >= pre_size or e < s:
                     pre_size = None
                 else:
                     pre_size = e - s + 1
