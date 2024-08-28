@@ -263,7 +263,7 @@ class TestValidatePath:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         path = await provider.validate_path('/Sample Item/file.txt')
@@ -285,7 +285,7 @@ class TestValidatePath:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         path = await provider.validate_path('/Sub Index/')
@@ -309,7 +309,7 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         mock_default_storage_metadata = MockCoroutine(return_value=[])
@@ -357,7 +357,7 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
@@ -396,12 +396,12 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=101',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=101',
             body=fake_weko_sub_items,
         )
         mock_default_storage_metadata = MockCoroutine(return_value=[])
@@ -437,7 +437,7 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
@@ -472,7 +472,7 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -513,7 +513,7 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -583,7 +583,7 @@ class TestMetadata:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -627,13 +627,60 @@ class TestPathFromMetadata:
             'id': '100',
             'name': 'Test Index'
         })
-        index = WEKOIndexMetadata(mock_client, index)
+        index = WEKOIndexMetadata(index.identifier, mock_client, index)
+        assert index.materialized_path == '/'
 
         parent_path = WaterButlerPath('/')
         path = provider.path_from_metadata(parent_path, index)
 
         assert path.name == 'Test Index'
         assert path.identifier == ('index', '100', 'Test Index')
+
+    def test_path_from_sub_index_metadata(self, provider):
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        index = WEKOIndexMetadata(parent.identifier, mock_client, index)
+        assert index.materialized_path == '/Test Index/'
+
+        parent_path = WaterButlerPath('/')
+        path = provider.path_from_metadata(parent_path, index)
+
+        assert path.name == 'Test Index'
+        assert path.identifier == ('index', '101', 'Test Index')
+
+    def test_path_from_sub_index_metadata_as_root(self, provider):
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        index = WEKOIndexMetadata(index.identifier, mock_client, index)
+        assert index.materialized_path == '/'
+
+        parent_path = WaterButlerPath('/')
+        path = provider.path_from_metadata(parent_path, index)
+
+        assert path.name == 'Test Index'
+        assert path.identifier == ('index', '101', 'Test Index')
 
     def test_path_from_item_metadata(self, provider):
         mock_client = mock.MagicMock()
@@ -642,7 +689,56 @@ class TestPathFromMetadata:
             'name': 'Test Index'
         })
         item = Item(fake_weko_item_1000, index)
-        metadata = WEKOItemMetadata(mock_client, item, index, 'weko')
+        metadata = WEKOItemMetadata(index.identifier, mock_client, item, index, 'weko')
+        assert metadata.materialized_path == '/Sample Item/'
+
+        parent_path = WaterButlerPath('/')
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'Sample Item'
+        assert path.identifier == ('item', '1000', 'Sample Item')
+
+    def test_path_from_item_in_sub_index_metadata(self, provider):
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        item = Item(fake_weko_item_1000, index)
+        metadata = WEKOItemMetadata(parent.identifier, mock_client, item, index, 'weko')
+        assert metadata.materialized_path == '/Test Index/Sample Item/'
+
+        parent_path = WaterButlerPath('/')
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'Sample Item'
+        assert path.identifier == ('item', '1000', 'Sample Item')
+
+    def test_path_from_item_in_sub_index_metadata_as_root(self, provider):
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        item = Item(fake_weko_item_1000, index)
+        metadata = WEKOItemMetadata(index.identifier, mock_client, item, index, 'weko')
+        assert metadata.materialized_path == '/Sample Item/'
 
         parent_path = WaterButlerPath('/')
         path = provider.path_from_metadata(parent_path, metadata)
@@ -658,9 +754,60 @@ class TestPathFromMetadata:
         })
         item = Item(fake_weko_item_1000, index)
         file = File(fake_weko_item_1000['metadata']['_item_metadata']['item_dummy_files']['attribute_value_mlt'][0])
-        metadata = WEKOFileMetadata(file, item, index)
+        metadata = WEKOFileMetadata(index.identifier, file, item, index)
+        assert metadata.materialized_path == '/Sample Item/file.txt'
 
         parent_path = WaterButlerPath('/weko:1000/')
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'file.txt'
+        assert path.identifier == ('item_file', 'file.txt', 'file.txt')
+
+    def test_path_from_item_file_in_sub_index_metadata(self, provider):
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        item = Item(fake_weko_item_1000, index)
+        file = File(fake_weko_item_1000['metadata']['_item_metadata']['item_dummy_files']['attribute_value_mlt'][0])
+        metadata = WEKOFileMetadata(parent.identifier, file, item, index)
+        assert metadata.materialized_path == '/Test Index/Sample Item/file.txt'
+
+        parent_path = WaterButlerPath('/weko:101/')
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'file.txt'
+        assert path.identifier == ('item_file', 'file.txt', 'file.txt')
+
+    def test_path_from_item_file_in_sub_index_metadata_as_root(self, provider):
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        item = Item(fake_weko_item_1000, index)
+        file = File(fake_weko_item_1000['metadata']['_item_metadata']['item_dummy_files']['attribute_value_mlt'][0])
+        metadata = WEKOFileMetadata(index.identifier, file, item, index)
+        assert metadata.materialized_path == '/Sample Item/file.txt'
+
+        parent_path = WaterButlerPath('/weko:101/')
         path = provider.path_from_metadata(parent_path, metadata)
 
         assert path.name == 'file.txt'
@@ -676,7 +823,60 @@ class TestPathFromMetadata:
             'name': 'Test Index'
         })
         parent_path = WaterButlerPath('/0123456789abcdefg001/')
-        metadata = WEKODraftFileMetadata(metadata_draft_file, metadata_index_folder, index)
+        metadata = WEKODraftFileMetadata(index.identifier, metadata_draft_file, metadata_index_folder, index)
+        assert metadata.materialized_path == '/birdie.jpg'
+
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'birdie.jpg'
+        assert path.identifier == ('draft_file', 'birdie.jpg', 'birdie.jpg')
+
+    def test_path_from_draft_file_in_sub_index_metadata(self, provider, file_metadata):
+        metadata_index_folder = file_metadata['index_folder']
+        metadata_draft_file = file_metadata['draft_file']
+
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        parent_path = WaterButlerPath('/0123456789abcdefg001/')
+        metadata = WEKODraftFileMetadata(parent.identifier, metadata_draft_file, metadata_index_folder, index)
+        assert metadata.materialized_path == '/Test Index/birdie.jpg'
+
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'birdie.jpg'
+        assert path.identifier == ('draft_file', 'birdie.jpg', 'birdie.jpg')
+
+    def test_path_from_draft_file_in_sub_index_metadata_as_root(self, provider, file_metadata):
+        metadata_index_folder = file_metadata['index_folder']
+        metadata_draft_file = file_metadata['draft_file']
+
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        parent_path = WaterButlerPath('/0123456789abcdefg001/')
+        metadata = WEKODraftFileMetadata(index.identifier, metadata_draft_file, metadata_index_folder, index)
+        assert metadata.materialized_path == '/birdie.jpg'
 
         path = provider.path_from_metadata(parent_path, metadata)
 
@@ -693,7 +893,59 @@ class TestPathFromMetadata:
             'name': 'Test Index'
         })
         parent_path = WaterButlerPath('/0123456789abcdefg001/')
-        metadata = WEKODraftFolderMetadata(metadata_draft_folder, metadata_index_folder, index)
+        metadata = WEKODraftFolderMetadata(index.identifier, metadata_draft_folder, metadata_index_folder, index)
+
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'test_folder'
+        assert path.identifier == ('draft_file', 'test_folder', 'test_folder')
+
+    def test_path_from_draft_folder_in_sub_index_metadata(self, provider, file_metadata):
+        metadata_index_folder = file_metadata['index_folder']
+        metadata_draft_folder = file_metadata['draft_folder']
+
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        parent_path = WaterButlerPath('/0123456789abcdefg001/')
+        metadata = WEKODraftFolderMetadata(parent.identifier, metadata_draft_folder, metadata_index_folder, index)
+        assert metadata.materialized_path == '/Test Index/test_folder/'
+
+        path = provider.path_from_metadata(parent_path, metadata)
+
+        assert path.name == 'test_folder'
+        assert path.identifier == ('draft_file', 'test_folder', 'test_folder')
+
+    def test_path_from_draft_folder_in_sub_index_metadata_as_root(self, provider, file_metadata):
+        metadata_index_folder = file_metadata['index_folder']
+        metadata_draft_folder = file_metadata['draft_folder']
+
+        mock_client = mock.MagicMock()
+        parent = Index(mock_client, {
+            'id': '100',
+            'name': 'Parent Index'
+        })
+        index = Index(
+            mock_client,
+            {
+                'id': '101',
+                'name': 'Test Index',
+            },
+            parent=parent,
+        )
+        parent_path = WaterButlerPath('/0123456789abcdefg001/')
+        metadata = WEKODraftFolderMetadata(index.identifier, metadata_draft_folder, metadata_index_folder, index)
+        assert metadata.materialized_path == '/test_folder/'
 
         path = provider.path_from_metadata(parent_path, metadata)
 
@@ -713,7 +965,7 @@ class TestUpload:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
 
@@ -742,7 +994,7 @@ class TestUpload:
             'id': '100',
             'name': 'Test Index'
         })
-        expected = WEKODraftFileMetadata(metadata_draft_file, metadata_index_folder, index)
+        expected = WEKODraftFileMetadata(index.identifier, metadata_draft_file, metadata_index_folder, index)
 
         assert created is True
         assert result == expected
@@ -762,7 +1014,7 @@ class TestUpload:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
 
@@ -796,7 +1048,7 @@ class TestUpload:
             'id': '100',
             'name': 'Test Index'
         })
-        expected = WEKODraftFileMetadata(metadata_sub_draft_file, metadata_index_folder, index)
+        expected = WEKODraftFileMetadata(index.identifier, metadata_sub_draft_file, metadata_index_folder, index)
 
         assert created is True
         assert result == expected
@@ -814,7 +1066,7 @@ class TestCreateFolder:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
 
@@ -847,7 +1099,7 @@ class TestCreateFolder:
             'id': '100',
             'name': 'Test Index'
         })
-        expected = WEKODraftFolderMetadata(metadata_draft_folder, metadata_index_folder, index)
+        expected = WEKODraftFolderMetadata(index.identifier, metadata_draft_folder, metadata_index_folder, index)
         assert result == expected
         assert mock_default_storage_create_folder.call_count == 3
         assert str(mock_default_storage_create_folder.call_args_list[0][0][0]) == '/.weko/'
@@ -864,7 +1116,7 @@ class TestCreateFolder:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
 
@@ -902,7 +1154,7 @@ class TestCreateFolder:
             'id': '100',
             'name': 'Test Index'
         })
-        expected = WEKODraftFolderMetadata(metadata_draft_folder, metadata_index_folder, index)
+        expected = WEKODraftFolderMetadata(index.identifier, metadata_draft_folder, metadata_index_folder, index)
         assert result == expected
         assert mock_default_storage_create_folder.call_count == 1
         assert str(mock_default_storage_create_folder.call_args_list[0][0][0]) == '/0123456789abcdefg003/sub_folder'
@@ -919,7 +1171,7 @@ class TestDownload:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -959,7 +1211,7 @@ class TestDownload:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -1002,7 +1254,7 @@ class TestDownload:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         aiohttpretty.register_json_uri(
@@ -1044,7 +1296,7 @@ class TestDelete:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']
@@ -1084,7 +1336,7 @@ class TestDelete:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
         metadata_weko_folder = file_metadata['weko_folder']

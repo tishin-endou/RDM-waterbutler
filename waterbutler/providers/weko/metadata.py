@@ -1,11 +1,13 @@
 import re
+from typing import List, Union
 from waterbutler.core import metadata
+from .client import Index, Item
 
 
 ITEM_PREFIX = 'weko:'
 
 
-def _get_item_file_id(item):
+def _get_item_file_id(item: Item):
     return 'item{}'.format(item.identifier)
 
 
@@ -16,25 +18,42 @@ def parse_item_file_id(part):
     return m.group(1)
 
 
-def _index_to_path_parts(target):
-    if target.parent is None:
+def _get_parent_for_non_root_index(root_index_id: str, target: Index):
+    if target is None:
+        return None
+    if target.identifier == root_index_id:
+        return None
+    return target.parent
+
+
+def _index_to_path_parts(root_index_id: str, target: Index) -> List[Index]:
+    parent_index = _get_parent_for_non_root_index(root_index_id, target)
+    if parent_index is None:
         return []
     parts = [target]
-    while target.parent is not None and target.parent.parent is not None:
-        target = target.parent
+    target = parent_index
+    while target is not None \
+            and _get_parent_for_non_root_index(root_index_id, target) is not None:
         parts.insert(0, target)
+        target = _get_parent_for_non_root_index(root_index_id, target)
     return parts
 
 
-def _index_to_path(target):
-    r = '/'.join([ITEM_PREFIX + part.identifier for part in _index_to_path_parts(target)])
+def _index_to_path(root_index_id: str, target: Index) -> str:
+    r = '/'.join([
+        ITEM_PREFIX + part.identifier
+        for part in _index_to_path_parts(root_index_id, target)
+    ])
     if len(r) == 0:
         return r
     return r + '/'
 
 
-def _index_to_materialized_path(target):
-    r = '/'.join([part.title for part in _index_to_path_parts(target)])
+def _index_to_materialized_path(root_index_id: str, target: Index) -> str:
+    r = '/'.join([
+        part.title
+        for part in _index_to_path_parts(root_index_id, target)
+    ])
     if len(r) == 0:
         return r
     return r + '/'
@@ -51,21 +70,21 @@ class BaseWEKOMetadata(metadata.BaseMetadata):
 
 
 class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
-    index_identifier = None
-    index_path = None
-    index_materialized_path = None
-    item_file_id = None
-    item_title = None
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
+    item_file_id: str = None
+    item_title: str = None
 
-    def __init__(self, file, item, index):
+    def __init__(self, root_index_id: str, file, item: Item, index: Index):
         super().__init__({
             'filename': file.filename,
             'format': file.format,
             'version_id': file.version_id
         })
         self.index_identifier = index.identifier
-        self.index_path = _index_to_path(index)
-        self.index_materialized_path = _index_to_materialized_path(index)
+        self.index_path = _index_to_path(root_index_id, index)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, index)
         self.item_file_id = _get_item_file_id(item)
         self.item_title = item.primary_title
 
@@ -118,15 +137,15 @@ class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
 
 
 class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
-    file_id = None
-    provider_name = None
-    index_identifier = None
-    index_path = None
-    index_materialized_path = None
-    item_file_id = None
+    file_id: str = None
+    provider_name: str = None
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
+    item_identifier: Union[str, int] = None
     weko_web_url = None
 
-    def __init__(self, client, raw, index, provider_name):
+    def __init__(self, root_index_id: str, client, raw: Item, index: Index, provider_name: str):
         super().__init__({
             'primary_title': raw.primary_title,
             'metadata': raw.raw['metadata'],
@@ -134,8 +153,8 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
         self.file_id = _get_item_file_id(raw)
         self.item_identifier = raw.identifier
         self.index_identifier = index.identifier
-        self.index_path = _index_to_path(index)
-        self.index_materialized_path = _index_to_materialized_path(index)
+        self.index_path = _index_to_path(root_index_id, index)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, index)
         self.provider_name = provider_name
         self.weko_web_url = client.get_item_records_url(str(raw.identifier))
 
@@ -207,18 +226,18 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
 
 
 class WEKOIndexMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
-    index_identifier = None
-    index_path = None
-    index_materialized_path = None
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
     weko_web_url = None
 
-    def __init__(self, client, raw):
+    def __init__(self, root_index_id: str, client, raw: Index):
         super().__init__({
             'title': raw.title,
         })
         self.index_identifier = raw.identifier
-        self.index_path = _index_to_path(raw)
-        self.index_materialized_path = _index_to_materialized_path(raw)
+        self.index_path = _index_to_path(root_index_id, raw)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, raw)
         self.weko_web_url = client.get_index_items_url(raw.identifier)
 
     @property
@@ -251,16 +270,16 @@ class WEKOIndexMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
 
 
 class BaseWEKODraftMetadata(BaseWEKOMetadata):
-    index_identifier = None
-    index_path = None
-    index_materialized_path = None
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
     index_folder = None
 
-    def __init__(self, file, index_folder, index):
+    def __init__(self, root_index_id: str, file, index_folder, index: Index):
         super().__init__(file)
         self.index_identifier = index.identifier
-        self.index_path = _index_to_path(index)
-        self.index_materialized_path = _index_to_materialized_path(index)
+        self.index_path = _index_to_path(root_index_id, index)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, index)
         self.index_folder = index_folder
 
     @property

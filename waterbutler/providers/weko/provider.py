@@ -274,7 +274,7 @@ class WEKOProvider(provider.BaseProvider):
         metadata = await default_provider.create_folder(
             draft_path, **kwargs
         )
-        return WEKODraftFolderMetadata(metadata, index_folder, index)
+        return WEKODraftFolderMetadata(self.index_id, metadata, index_folder, index)
 
     async def upload(self, stream, path, **kwargs):
         if not path.is_draft_file:
@@ -308,7 +308,7 @@ class WEKOProvider(provider.BaseProvider):
         metadata, created = await default_provider.upload(
             stream, draft_path, **kwargs
         )
-        return WEKODraftFileMetadata(metadata, index_folder, index), created
+        return WEKODraftFileMetadata(self.index_id, metadata, index_folder, index), created
 
     async def delete(self, path, confirm_delete=0, **kwargs):
         if not path.is_draft_file:
@@ -386,7 +386,7 @@ class WEKOProvider(provider.BaseProvider):
             files = [f for f in item.files if f.filename == path.parts[-1].identifier_value]
             if len(files) == 0:
                 raise exceptions.MetadataError('Illegal parts', code=400)
-            return WEKOFileMetadata(files[0], item, index)
+            return WEKOFileMetadata(self.index_id, files[0], item, index)
         if not path.is_draft_file:
             raise exceptions.MetadataError('unsupported', code=400)
         # Draft of Index
@@ -407,10 +407,10 @@ class WEKOProvider(provider.BaseProvider):
 
     async def get_index_metadata(self, index):
         ritems = [
-            WEKOItemMetadata(self.client, item, index, self.NAME)
+            WEKOItemMetadata(self.index_id, self.client, item, index, self.NAME)
             for item in await index.get_items()
         ]
-        rindices = [WEKOIndexMetadata(self.client, i) for i in index.children]
+        rindices = [WEKOIndexMetadata(self.index_id, self.client, i) for i in index.children]
         default_provider, index_folder = await self.get_index_folder(index.identifier)
         rdrafts = []
         if index_folder is not None:
@@ -421,7 +421,7 @@ class WEKOProvider(provider.BaseProvider):
         return rindices + ritems + rdrafts
 
     def get_item_metadata(self, index, item):
-        return [WEKOFileMetadata(f, item, index) for f in item.files]
+        return [WEKOFileMetadata(self.index_id, f, item, index) for f in item.files]
 
     async def get_draft_folder(self, creates=False):
         default_provider = self.make_default_provider()
@@ -502,5 +502,5 @@ class WEKOProvider(provider.BaseProvider):
         if isinstance(file_metadata, (list, tuple)):
             return [self._wrap_draft_metadata(f, index_folder, index) for f in file_metadata]
         if file_metadata.kind == 'folder':
-            return WEKODraftFolderMetadata(file_metadata, index_folder, index)
-        return WEKODraftFileMetadata(file_metadata, index_folder, index)
+            return WEKODraftFolderMetadata(self.index_id, file_metadata, index_folder, index)
+        return WEKODraftFileMetadata(self.index_id, file_metadata, index_folder, index)

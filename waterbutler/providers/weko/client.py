@@ -1,4 +1,6 @@
 import logging
+from typing import Union
+from typing_extensions import Self
 from waterbutler.core import exceptions
 
 
@@ -106,9 +108,9 @@ class Index(object):
     """
     client = None
     raw = None
-    parent = None
+    parent: Self = None
 
-    def __init__(self, client, desc, parent=None):
+    def __init__(self, client, desc, parent: Self=None):
         self.client = client
         self.parent = parent
         self.raw = desc
@@ -118,15 +120,16 @@ class Index(object):
         return self.raw['name']
 
     @property
-    def identifier(self):
+    def identifier(self) -> str:
         return self.raw['id']
 
     @property
     def children(self):
         return [Index(self.client, i, parent=self) for i in self.raw['children']]
 
-    async def get_items(self):
-        root = await self.client._get(f'api/index/?q={self.identifier}')
+    async def get_items(self, page: int = 1, size: int = 1000):
+        queries = f'page={page}&size={size}&sort=-createdate'
+        root = await self.client._get(f'api/index/?{queries}&q={self.identifier}')
         logger.debug(f'get_items: {root}')
         items = []
         for entry in root['hits']['hits']:
@@ -152,18 +155,18 @@ class Item(object):
         self.index = index
 
     @property
-    def identifier(self):
+    def identifier(self) -> Union[str, int]:
         return self.raw['id']
 
     @property
-    def primary_title(self):
+    def primary_title(self) -> str:
         v = self._metadata['title']
         if isinstance(v, str):
             return v
         return v[0]
 
     @property
-    def title(self):
+    def title(self) -> str:
         return self._metadata['title']
 
     @property

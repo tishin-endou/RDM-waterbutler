@@ -115,7 +115,7 @@ class TestWEKOClient:
         )
         aiohttpretty.register_json_uri(
             'GET',
-            'https://test.sample.nii.ac.jp/api/index/?q=100',
+            'https://test.sample.nii.ac.jp/api/index/?page=1&size=1000&sort=-createdate&q=100',
             body=fake_weko_items,
         )
 
