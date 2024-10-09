@@ -1,5 +1,6 @@
 import abc
 import time
+import json
 import typing
 import asyncio
 import logging
@@ -13,6 +14,7 @@ import aiohttp
 from aiohttp.client import _RequestContextManager
 from yarl import URL
 
+from waterbutler.core import signing
 from waterbutler.core import streams
 from waterbutler.core import exceptions
 from waterbutler.core import path as wb_path
@@ -26,6 +28,7 @@ from waterbutler.core.utils import RequestHandlerContext
 logger = logging.getLogger(__name__)
 _THROTTLES = weakref.WeakKeyDictionary()  # type: weakref.WeakKeyDictionary
 NO_URL_ENCODED_PROVIDERS = ['nextcloud', 'owncloud', 'nextcloudinstitutions']
+QUERY_METHODS = ('GET', 'DELETE')
 
 
 def throttle(concurrency=10, interval=1):
@@ -120,6 +123,8 @@ class BaseProvider(metaclass=abc.ABCMeta):
         # The `.session_list` keeps track of all the sessions created for the provider instance so
         # that they can be properly closed upon instance destroy.
         self.session_list = []  # type: typing.List[aiohttp.ClientSession]
+
+        self.nid = settings.get('nid', None)
 
     def __del__(self):
         """
@@ -865,3 +870,47 @@ class BaseProvider(metaclass=abc.ABCMeta):
     def __repr__(self):
         # Note: credentials are not included on purpose.
         return '<{}({}, {})>'.format(self.__class__.__name__, self.auth, self.settings)
+
+    def build_signed_url(self, method, url, data=None, params=None, ttl=100, **kwargs):
+        from waterbutler.providers.osfstorage import settings
+        signer = signing.Signer(settings.HMAC_SECRET, settings.HMAC_ALGORITHM)
+        if method.upper() in QUERY_METHODS:
+            signed = signing.sign_data(signer, params or {}, ttl=ttl)
+            params = signed
+        else:
+            signed = signing.sign_data(signer, json.loads(data or {}), ttl=ttl)
+            data = json.dumps(signed)
+
+        # Ensure url ends with a /
+        if not url.endswith('/'):
+            if '?' not in url:
+                url += '/'
+            elif url[url.rfind('?') - 1] != '/':
+                url = url.replace('?', '/?')
+
+        return url, data, params
+
+    async def make_signed_request(self, method, url, data=None, params=None, ttl=100, **kwargs):
+        url, data, params = self.build_signed_url(
+            method,
+            url,
+            data=data,
+            params=params,
+            ttl=ttl,
+            **kwargs
+        )
+        return await self.make_request(method, url, data=data, params=params, **kwargs)
+
+    async def get_quota(self):
+        """Get the quota information
+
+        If the creator of the project doesn't have enough quota, we invalidate the upload request.
+        """
+        resp = await self.make_signed_request(
+            'GET',
+            '{}/api/v1/project/{}/creator_quota/'.format(wb_settings.OSF_URL, self.nid),
+            expects=(200, )
+        )
+        body = await resp.json()
+        await resp.release()
+        return body

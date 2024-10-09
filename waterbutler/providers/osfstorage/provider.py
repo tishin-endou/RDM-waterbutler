@@ -5,16 +5,13 @@ import typing
 import hashlib
 import logging
 
-from waterbutler import settings as wb_settings
 from waterbutler.core import utils
-from waterbutler.core import signing
 from waterbutler.core import streams
 from waterbutler.core import provider
 from waterbutler.core import exceptions
 from waterbutler.core.path import WaterButlerPath
 from waterbutler.core.metadata import BaseMetadata
 
-from waterbutler.providers.osfstorage import settings
 from waterbutler.providers.osfstorage.metadata import OsfStorageFileMetadata
 from waterbutler.providers.osfstorage.metadata import OsfStorageFolderMetadata
 from waterbutler.providers.osfstorage.metadata import OsfStorageRevisionMetadata
@@ -41,21 +38,9 @@ class OSFStorageProvider(provider.BaseProvider):
 
     def __init__(self, auth, credentials, settings, **kwargs):
         super().__init__(auth, credentials, settings, **kwargs)
-        self.nid = settings['nid']
         self.root_id = settings['rootId']
         self.BASE_URL = settings['baseUrl']
         self.provider_name = settings['storage'].get('provider')
-
-    async def make_signed_request(self, method, url, data=None, params=None, ttl=100, **kwargs):
-        url, data, params = self.build_signed_url(
-            method,
-            url,
-            data=data,
-            params=params,
-            ttl=ttl,
-            **kwargs
-        )
-        return await self.make_request(method, url, data=data, params=params, **kwargs)
 
     async def validate_v1_path(self, path, **kwargs):
         if path == '/' or path.strip('/') == self.root_id:
@@ -124,20 +109,6 @@ class OSFStorageProvider(provider.BaseProvider):
         except StopIteration:
             return base.child(path, folder=folder)
 
-    async def get_quota(self):
-        """Get the quota information
-
-        If the creator of the project doesn't have enough quota, we invalidate the upload request.
-        """
-        resp = await self.make_signed_request(
-            'GET',
-            '{}/api/v1/project/{}/creator_quota/'.format(wb_settings.OSF_URL, self.nid),
-            expects=(200, )
-        )
-        body = await resp.json()
-        await resp.release()
-        return body
-
     def make_provider(self, settings):
         """Requests on different files may need to use different providers,
         instances, e.g. when different files lives in different containers
@@ -146,6 +117,7 @@ class OSFStorageProvider(provider.BaseProvider):
 
         :param dict settings: Overridden settings
         """
+        self.settings['storage'].update({'nid': self.nid})
         if not getattr(self, '_inner_provider', None):
             self._inner_provider = utils.make_provider(
                 self.provider_name,
@@ -180,24 +152,6 @@ class OSFStorageProvider(provider.BaseProvider):
 
     async def intra_copy(self, dest_provider, src_path, dest_path):
         return await self._do_intra_move_or_copy('copy', dest_provider, src_path, dest_path)
-
-    def build_signed_url(self, method, url, data=None, params=None, ttl=100, **kwargs):
-        signer = signing.Signer(settings.HMAC_SECRET, settings.HMAC_ALGORITHM)
-        if method.upper() in QUERY_METHODS:
-            signed = signing.sign_data(signer, params or {}, ttl=ttl)
-            params = signed
-        else:
-            signed = signing.sign_data(signer, json.loads(data or {}), ttl=ttl)
-            data = json.dumps(signed)
-
-        # Ensure url ends with a /
-        if not url.endswith('/'):
-            if '?' not in url:
-                url += '/'
-            elif url[url.rfind('?') - 1] != '/':
-                url = url.replace('?', '/?')
-
-        return url, data, params
 
     async def download(self, path, version=None, revision=None, mode=None, **kwargs):
         if not path.identifier:

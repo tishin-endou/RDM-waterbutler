@@ -93,8 +93,8 @@ class CreateMixin:
                 )
             self.target_path = self.path
 
-        # verify quota if it is osfstorage
-        if self.provider.NAME == 'osfstorage':
+        # verify quota if it is osfstorage or addon method provider
+        if self.provider.NAME == 'osfstorage' or self.provider.NAME in settings.ADDON_METHOD_PROVIDER:
             file_size = int(self.request.headers.get('Content-Length'))
             quota = await self.provider.get_quota()
             if quota['used'] + file_size > quota['max']:
