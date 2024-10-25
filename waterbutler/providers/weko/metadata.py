@@ -1,40 +1,62 @@
-import os
-import hashlib
-import zipfile
-from datetime import datetime
+import re
+from typing import List, Union
 from waterbutler.core import metadata
+from .client import Index, Item
+
 
 ITEM_PREFIX = 'weko:'
 
 
-def split_path(path):
-    assert not path.startswith('/')
-    if len(path) == 0:
-        return (None, '')
-    components = path.split('/')
-    drafti = [i for i, c in enumerate(components)
-                if len(c) > 0 and not c.startswith(ITEM_PREFIX)]
-    if len(drafti) == 0:
-        return (path, '')
-    indices = components[:drafti[0]]
-    if len(indices) == 0:
-        return (None, path)
-    index_path = '{}/'.format('/'.join(indices))
-    assert path.startswith(index_path)
-    return (index_path, path[len(index_path):])
+def _get_item_file_id(item: Item):
+    return 'item{}'.format(item.identifier)
 
 
-def get_files(directory, relative=''):
-    files = []
-    for f in os.listdir(directory):
-        if os.path.isfile(os.path.join(directory, f)):
-            files.append(os.path.join(relative, f) if len(relative) > 0 else f)
-        elif os.path.isdir(os.path.join(directory, f)):
-            for child in get_files(os.path.join(directory, f),
-                                   os.path.join(relative, f)
-                                   if len(relative) > 0 else f):
-                files.append(child)
-    return files
+def parse_item_file_id(part):
+    m = re.match(r'^' + ITEM_PREFIX + r'item([0-9]+)$', part)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _get_parent_for_non_root_index(root_index_id: str, target: Index):
+    if target is None:
+        return None
+    if target.identifier == root_index_id:
+        return None
+    return target.parent
+
+
+def _index_to_path_parts(root_index_id: str, target: Index) -> List[Index]:
+    parent_index = _get_parent_for_non_root_index(root_index_id, target)
+    if parent_index is None:
+        return []
+    parts = [target]
+    target = parent_index
+    while target is not None \
+            and _get_parent_for_non_root_index(root_index_id, target) is not None:
+        parts.insert(0, target)
+        target = _get_parent_for_non_root_index(root_index_id, target)
+    return parts
+
+
+def _index_to_path(root_index_id: str, target: Index) -> str:
+    r = '/'.join([
+        ITEM_PREFIX + part.identifier
+        for part in _index_to_path_parts(root_index_id, target)
+    ])
+    if len(r) == 0:
+        return r
+    return r + '/'
+
+
+def _index_to_materialized_path(root_index_id: str, target: Index) -> str:
+    r = '/'.join([
+        part.title
+        for part in _index_to_path_parts(root_index_id, target)
+    ])
+    if len(r) == 0:
+        return r
+    return r + '/'
 
 
 class BaseWEKOMetadata(metadata.BaseMetadata):
@@ -47,40 +69,48 @@ class BaseWEKOMetadata(metadata.BaseMetadata):
         return None
 
 
-class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
-    index = None
-    all_indices = None
+class WEKOFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
+    item_file_id: str = None
+    item_title: str = None
 
-    def __init__(self, raw, index, all_indices):
-        super().__init__(raw)
-        self.index = index
-        self.all_indices = all_indices
+    def __init__(self, root_index_id: str, file, item: Item, index: Index):
+        super().__init__({
+            'filename': file.filename,
+            'format': file.format,
+            'version_id': file.version_id
+        })
+        self.index_identifier = index.identifier
+        self.index_path = _index_to_path(root_index_id, index)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, index)
+        self.item_file_id = _get_item_file_id(item)
+        self.item_title = item.primary_title
 
     @property
     def file_id(self):
-        return str(self.raw.file_id)
+        return self.raw['filename']
 
     @property
     def name(self):
-        return self.raw.title
+        return self.raw['filename']
 
     @property
     def content_type(self):
-        return None
+        return self.raw['format']
 
     @property
-    def materialized_name(self):
-        return ITEM_PREFIX + self.raw.file_id
+    def identifier(self):
+        return self.raw['filename']
 
     @property
     def path(self):
-        target = self.index
-        path = ITEM_PREFIX + target.identifier + '/'
-        while target.parentIdentifier is not None:
-            target = [i for i in self.all_indices
-                        if i.identifier == target.parentIdentifier][0]
-            path = ITEM_PREFIX + target.identifier + '/' + path
-        return '/' + path + ITEM_PREFIX + self.raw.file_id
+        return '/' + self.index_path + ITEM_PREFIX + self.item_file_id + '/' + self.identifier
+
+    @property
+    def materialized_path(self):
+        return '/' + self.index_materialized_path + self.item_title + '/' + self.identifier
 
     @property
     def size(self):
@@ -92,143 +122,236 @@ class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
 
     @property
     def etag(self):
-        return self.raw.file_id
+        return self.raw['version_id']
 
     @property
     def extra(self):
         return {
-            'fileId': self.raw.file_id,
+            'weko': 'file',
+            'itemId': self.item_file_id,
+            'metadata': {
+                'can_edit': False,
+                'can_register': False,
+            },
+        }
+
+
+class WEKOItemMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
+    file_id: str = None
+    provider_name: str = None
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
+    item_identifier: Union[str, int] = None
+    weko_web_url = None
+
+    def __init__(self, root_index_id: str, client, raw: Item, index: Index, provider_name: str):
+        super().__init__({
+            'primary_title': raw.primary_title,
+            'metadata': raw.raw['metadata'],
+        })
+        self.file_id = _get_item_file_id(raw)
+        self.item_identifier = raw.identifier
+        self.index_identifier = index.identifier
+        self.index_path = _index_to_path(root_index_id, index)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, index)
+        self.provider_name = provider_name
+        self.weko_web_url = client.get_item_records_url(str(raw.identifier))
+
+    @property
+    def name(self):
+        return self.raw['primary_title']
+
+    @property
+    def content_type(self):
+        return None
+
+    @property
+    def identifier(self):
+        return ITEM_PREFIX + self.file_id
+
+    @property
+    def materialized_path(self):
+        return '/' + self.index_materialized_path + self.name + '/'
+
+    @property
+    def path(self):
+        return '/' + self.index_path + self.identifier + '/'
+
+    @property
+    def size(self):
+        return None
+
+    @property
+    def modified(self):
+        return None
+
+    @property
+    def etag(self):
+        return self.file_id
+
+    @property
+    def item_title(self):
+        if '_item_metadata' not in self.raw['metadata']:
+            return [
+                {
+                    'subitem_title': self.raw['primary_title'],
+                }
+            ]
+        _item_metadata = self.raw['metadata']['_item_metadata']
+        items = [i
+                 for i in _item_metadata.values()
+                 if isinstance(i, dict) and 'attribute_value_mlt' in i and
+                     all(['subitem_title' in v for v in i['attribute_value_mlt']])]
+        if len(items) == 0:
+            return [
+                {
+                    'subitem_title': self.raw['primary_title'],
+                }
+            ]
+        return items[0]['attribute_value_mlt']
+
+    @property
+    def extra(self):
+        return {
+            'weko': 'item',
+            'weko_web_url': self.weko_web_url,
+            'fileId': self.file_id,
+            'item_title': self.item_title,
+            'metadata': {
+                'can_edit': False,
+                'can_register': False,
+            },
         }
 
 
 class WEKOIndexMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
-    all_indices = None
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
+    weko_web_url = None
 
-    def __init__(self, raw, all_indices):
-        super().__init__(raw)
-        self.all_indices = all_indices
+    def __init__(self, root_index_id: str, client, raw: Index):
+        super().__init__({
+            'title': raw.title,
+        })
+        self.index_identifier = raw.identifier
+        self.index_path = _index_to_path(root_index_id, raw)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, raw)
+        self.weko_web_url = client.get_index_items_url(raw.identifier)
 
     @property
     def name(self):
-        return self.raw.title
+        return self.raw['title']
 
     @property
-    def materialized_name(self):
-        return ITEM_PREFIX + self.raw.identifier
+    def identifier(self):
+        return ITEM_PREFIX + self.index_identifier
+
+    @property
+    def materialized_path(self):
+        return '/' + self.index_materialized_path
 
     @property
     def path(self):
-        target = self.raw
-        path = ITEM_PREFIX + target.identifier + '/'
-        while target.parentIdentifier is not None:
-            target = [i for i in self.all_indices
-                        if i.identifier == target.parentIdentifier][0]
-            path = ITEM_PREFIX + target.identifier + '/' + path
-        return '/' + path
+        return '/' + self.index_path
 
     @property
     def extra(self):
         return {
-            'indexId': self.raw.identifier,
+            'weko': 'index',
+            'weko_web_url': self.weko_web_url,
+            'indexId': self.index_identifier,
+            'metadata': {
+                'can_edit': False,
+                'can_register': False,
+            },
         }
 
 
-class WEKODraftFileMetadata(BaseWEKOMetadata, metadata.BaseFileMetadata):
-    parent_index = None
+class BaseWEKODraftMetadata(BaseWEKOMetadata):
+    index_identifier: str = None
+    index_path: str = None
+    index_materialized_path: str = None
+    index_folder = None
 
-    def __init__(self, raw, parent_index):
-        super().__init__(raw)
-        assert parent_index is None or parent_index == '' or parent_index.endswith('/')
-        self.modified_time = datetime.utcfromtimestamp(os.path.getmtime(self.raw['filepath']))
-        self.parent_index = parent_index
-        self.has_import_xml = False
-        path, fn = os.path.split(self.raw['filepath'])
-        if '/' not in self.raw['path'] and \
-           os.path.splitext(fn)[1].lower() == '.zip':
-            try:
-                with zipfile.ZipFile(self.raw['filepath'], 'r') as zf:
-                    self.has_import_xml = 'import.xml' in zf.namelist()
-            except Exception as e:
-                pass
+    def __init__(self, root_index_id: str, file, index_folder, index: Index):
+        super().__init__(file)
+        self.index_identifier = index.identifier
+        self.index_path = _index_to_path(root_index_id, index)
+        self.index_materialized_path = _index_to_materialized_path(root_index_id, index)
+        self.index_folder = index_folder
+
+    @property
+    def extra(self):
+        r = {
+            'weko': 'draft',
+            'index': self.index_identifier,
+            'metadata': {
+                'can_edit': True,
+                'can_register': False,
+            },
+            'source': {
+                'provider': self.raw.provider,
+                'path': self.raw.path,
+                'materialized_path': self.raw.materialized_path,
+            },
+        }
+        r.update(self.raw.extra)
+        return r
 
     @property
     def path(self):
-        if self.parent_index is None:
-            return '/' + self.raw['path']
-        else:
-            return '/' + self.parent_index + self.raw['path']
+        return '/' + self.index_path + self._relative_path
 
+    @property
+    def materialized_path(self):
+        return '/' + self.index_materialized_path + self._relative_path
+
+    @property
+    def _relative_path(self):
+        base_path = self.index_folder.materialized_path
+        item_path = self.raw.materialized_path
+        if not item_path.startswith(base_path):
+            raise ValueError(f'Unexpected path: base_path={base_path}, item_path={item_path}')
+        return item_path[len(base_path):]
+
+
+class WEKODraftFolderMetadata(BaseWEKODraftMetadata, metadata.BaseFolderMetadata):
     @property
     def name(self):
-        return self.raw['path'].split('/')[-1]
+        return self.raw.name
 
     @property
-    def materialized_name(self):
-        return self.name
+    def _relative_path(self):
+        r = super(WEKODraftFolderMetadata, self)._relative_path
+        if r.endswith('/'):
+            return r
+        # Ensure that the return value of create_folder is also interpreted as a folder
+        return r + '/'
+
+
+class WEKODraftFileMetadata(BaseWEKODraftMetadata, metadata.BaseFileMetadata):
+    @property
+    def name(self):
+        return self.raw.name
 
     @property
     def content_type(self):
-        return None
+        return self.raw.content_type
+
+    @property
+    def identifier(self):
+        return self.raw.name
 
     @property
     def size(self):
-        return int(self.raw['bytes'])
+        return self.raw.size
 
     @property
     def modified(self):
-        return self.modified_time.strftime('%Y-%m-%d %H:%M:%S')
+        return self.raw.modified
 
     @property
     def etag(self):
-        if self.parent_index is None:
-            code = self.raw['filepath']
-        else:
-            code = self.parent_index + '\t' + self.raw['filepath']
-        return hashlib.sha256(code.encode('utf-8')).hexdigest()
-
-    @property
-    def extra(self):
-        path, fn = os.path.split(self.raw['filepath'])
-        if ITEM_PREFIX in self.raw['path']:
-            _, draft_path = split_path(self.raw['path'])
-        else:
-            draft_path = self.raw['path']
-        return {'archivable': '/' not in draft_path,
-                'has_import_xml': self.has_import_xml,
-                'content_files': [fn]}
-
-
-class WEKODraftFolderMetadata(BaseWEKOMetadata, metadata.BaseFolderMetadata):
-    parent_index = None
-
-    def __init__(self, raw, parent_index):
-        super().__init__(raw)
-        assert parent_index is None or parent_index == '' or parent_index.endswith('/')
-        assert self.raw['path'].endswith('/')
-        self.parent_index = parent_index
-        self.content_files = get_files(self.raw['filepath'])
-
-    @property
-    def name(self):
-        return self.raw['path'].split('/')[-2]
-
-    @property
-    def materialized_name(self):
-        return self.name
-
-    @property
-    def path(self):
-        if self.parent_index is None:
-            return '/' + self.raw['path']
-        else:
-            return '/' + self.parent_index + self.raw['path']
-
-    @property
-    def extra(self):
-        if ITEM_PREFIX in self.raw['path']:
-            _, draft_path = split_path(self.raw['path'])
-        else:
-            draft_path = self.raw['path']
-        return {'archivable': '/' not in draft_path[:-1],
-                'has_import_xml': False,
-                'content_files': self.content_files}
+        return self.raw.etag

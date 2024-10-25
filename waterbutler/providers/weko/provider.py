@@ -1,32 +1,125 @@
-import os
-import tempfile
 import logging
 import hashlib
-import zipfile
-import shutil
-from urllib.parse import urlparse, urlunparse
-from lxml import etree
 
 from waterbutler.core import streams
 from waterbutler.core import provider
 from waterbutler.core import exceptions
-from waterbutler.core.path import WaterButlerPath
+from waterbutler.core import utils
+from waterbutler.core.path import WaterButlerPath, WaterButlerPathPart
 
 from waterbutler.providers.weko.metadata import (
     ITEM_PREFIX,
-    get_files,
-    split_path,
+    parse_item_file_id,
+    WEKOFileMetadata,
     WEKOItemMetadata,
     WEKOIndexMetadata,
+    WEKODraftFolderMetadata,
     WEKODraftFileMetadata,
-    WEKODraftFolderMetadata
 )
-from waterbutler.providers.weko import client
-from waterbutler.providers.weko import settings
+from waterbutler.providers.weko.client import Client
 
 logger = logging.getLogger(__name__)
-IMPORT_XML_SUFFIX = '-import.xml'
-IMPORT_ZIP_SUFFIX = '-import.zipimport'
+METADATA_JSON_SUFFIX = '-metadata.json'
+
+
+class WEKOPathPart(WaterButlerPathPart):
+
+    @property
+    def is_index(self):
+        if not self._id:
+            return False
+        t, _, _ = self._id
+        return t == 'index'
+
+    @property
+    def is_item(self):
+        if not self._id:
+            return False
+        t, _, _ = self._id
+        return t == 'item'
+
+    @property
+    def is_item_file(self):
+        if not self._id:
+            return False
+        t, _, _ = self._id
+        return t == 'item_file'
+
+    @property
+    def is_draft_file(self):
+        if not self._id:
+            return True
+        t, _, _ = self._id
+        return t == 'draft_file'
+
+    @property
+    def identifier_value(self):
+        if not self._id:
+            return None
+        _, i, _ = self._id
+        return i
+
+    @property
+    def materialized(self):
+        if not self._id:
+            return self.value
+        _, _, v = self._id
+        return v
+
+
+class WEKOPath(WaterButlerPath):
+    PART_CLASS = WEKOPathPart
+
+    @property
+    def materialized_path(self):
+        return '/'.join([x.materialized for x in self.parts]) + ('/' if self.is_dir else '')
+
+    @property
+    def is_index(self):
+        return self.parts[-1].is_index
+
+    @property
+    def is_item(self):
+        return self.parts[-1].is_item
+
+    @property
+    def is_item_file(self):
+        return self.parts[-1].is_item_file
+
+    @property
+    def is_draft_file(self):
+        return self.parts[-1].is_draft_file
+
+    @property
+    def as_file(self):
+        parts = self.parts
+        path = '/'.join([x.materialized for x in parts])
+        return WEKOPath(path, _ids=[p._id for p in parts])
+
+    def split_draft_file_path(self):
+        pos_ = [i for i, part in enumerate(self.parts) if i > 0 and part.is_draft_file]
+        if len(pos_) == 0:
+            return self, None
+        pos = pos_[0]
+        parent_parts = self.parts[:pos]
+        parent_path = '/'.join([x.materialized for x in parent_parts]) + '/'
+        child_parts = [self.parts[0]] + self.parts[pos:]
+        child_path = '/'.join([x.materialized for x in child_parts]) + ('/' if self.is_dir else '')
+        logger.debug(f'Split {parent_path}({parent_parts}) -> {child_path}({child_parts})')
+        return (
+            WEKOPath(parent_path, _ids=[p._id for p in parent_parts]),
+            WEKOPath(child_path, _ids=[p._id for p in child_parts]),
+        )
+
+    def split_path(self):
+        if len(self.parts) == 1:
+            return self, None
+        parent_parts = self.parts[:-1]
+        parent_path = '/'.join([x.materialized for x in parent_parts]) + '/'
+        return (
+            WEKOPath(parent_path, _ids=[p._id for p in parent_parts]),
+            self.parts[-1],
+        )
 
 
 class WEKOProvider(provider.BaseProvider):
@@ -48,95 +141,28 @@ class WEKOProvider(provider.BaseProvider):
         self.user_id = self.credentials['user_id']
         self.index_id = self.settings['index_id']
         self.index_title = self.settings['index_title']
-        if 'token' in self.credentials:
-            self.connection = client.connect_or_error(self.BASE_URL,
-                                                      token=self.credentials['token'])
-        else:
-            self.connection = client.connect_or_error(self.BASE_URL,
-                                                      username=self.user_id,
-                                                      password=self.credentials['password'])
+        self.default_storage_credentials = credentials.get('default_storage', None)
+        self.default_storage_settings = settings.get('default_storage', None)
+        self.client = Client(
+            self,
+            self.BASE_URL,
+            token=self.credentials['token'],
+        )
 
-        self._metadata_cache = {}
-
-    def _get_draft_dir(self):
-        d = hashlib.sha256(self.user_id.encode('utf-8')).hexdigest()
-        return os.path.join(settings.FILE_PATH_DRAFT, self.nid, d,
-                            str(self.index_id))
-
-    def _resolve_target_index(self, index_path):
-        if index_path is None:
-            return str(self.index_id)
-        else:
-            return index_path.split('/')[-2][len(ITEM_PREFIX):]
-
-    def _get_draft_metadata(self, draft_path, file_path, index_path):
-        fparent, fname = os.path.split(file_path)
-        if os.path.isdir(file_path):
-            return WEKODraftFolderMetadata({'path': draft_path + fname + '/',
-                                            'filepath': file_path},
-                                           index_path)
-        else:
-            stream_size = os.path.getsize(file_path)
-            return WEKODraftFileMetadata({'path': draft_path + fname,
-                                          'bytes': stream_size,
-                                          'filepath': file_path},
-                                         index_path)
-
-    def _import_xml(self, target_index_id, import_xml_path):
-        import_xml_dir, fname = os.path.split(import_xml_path)
-        target_file = os.path.join(import_xml_dir, fname[:-len(IMPORT_XML_SUFFIX)])
-        if not os.path.exists(target_file):
-            logger.info('Skipped: target file {} does not exist'.format(target_file))
-            return
-        content_files = []
-        with open(import_xml_path, 'rb') as f:
-            export_xml = etree.parse(f)
-            for repo_file in export_xml.xpath('//repository_file'):
-                cname = repo_file.attrib['file_name']
-                if os.path.isdir(target_file):
-                    if not os.path.exists(os.path.join(target_file, cname)):
-                        logger.info('Skipped: repo_file {} does not exist'.format(cname))
-                        return
-                    else:
-                        content_files.append((cname, os.path.join(target_file, cname)))
-                else:
-                    if os.path.split(target_file)[1] != cname:
-                        logger.info('Skipped: repo_file {} does not exist'.format(cname))
-                        return
-                    else:
-                        content_files.append((cname, target_file))
-        logger.info('Importing... {} to {}'.format(content_files, target_index_id))
-        with tempfile.NamedTemporaryFile(delete=False) as ziptf:
-            with zipfile.ZipFile(ziptf, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(import_xml_path, 'import.xml')
-                for cname, cpath in content_files:
-                    zipf.write(cpath, cname)
-            archived_file = ziptf.name
-        with open(archived_file, 'rb') as f:
-            client.post(self.connection, target_index_id, f,
-                        os.path.getsize(archived_file))
-        for cname, cpath in content_files:
-            os.remove(cpath)
-        if os.path.isdir(target_file) and len(get_files(target_file)) == 0:
-            shutil.rmtree(target_file)
-        os.remove(import_xml_path)
-
-    def _import_zip(self, target_index_id, import_xml_path):
-        import_xml_dir, fname = os.path.split(import_xml_path)
-        target_file = os.path.join(import_xml_dir, fname[:-len(IMPORT_ZIP_SUFFIX)])
-        if not os.path.exists(target_file):
-            logger.info('Skipped: target file {} does not exist'.format(target_file))
-            return
-        logger.info('Importing... {} to {}'.format(target_file, target_index_id))
-        with open(target_file, 'rb') as f:
-            client.post(self.connection, target_index_id, f,
-                        os.path.getsize(target_file))
-        os.remove(target_file)
-        os.remove(import_xml_path)
+    def make_default_provider(self):
+        if not getattr(self, '_default_provider', None):
+            self._default_provider = utils.make_provider(
+                'osfstorage',
+                self.auth,
+                self.default_storage_credentials,
+                self.default_storage_settings,
+                is_celery_task=self.is_celery_task,
+            )
+        return self._default_provider
 
     def path_from_metadata(self, parent_path, metadata):
-        return parent_path.child(metadata.materialized_name,
-                                 _id=metadata.path.strip('/'),
+        return parent_path.child(metadata.name,
+                                 _id=self._metadata_to_id(metadata),
                                  folder=metadata.is_folder)
 
     def build_url(self, path, *segments, **query):
@@ -154,112 +180,184 @@ class WEKOProvider(provider.BaseProvider):
         :param str path: The path to a file
         :param list metadata: List of file metadata from _get_data
         """
-        return WaterButlerPath(path)
+        parts = path.rstrip('/').split('/')
+        ids = []
+        index = None
+        item = None
+        file = None
+        for i, part in enumerate(parts):
+            # Specialized Path?
+            if part.startswith(ITEM_PREFIX):
+                item_id = parse_item_file_id(part)
+                if item_id is None:
+                    if item is not None:
+                        raise exceptions.MetadataError('Invalid path: No indexes under item', code=400)
+                    index = await self.client.get_index_by_id(part[len(ITEM_PREFIX):])
+                    ids.append(('index', index.identifier, index.title))
+                else:
+                    if item is not None:
+                        raise exceptions.MetadataError('Invalid path: No item under item', code=400)
+                    if index is None:
+                        index = await self.client.get_index_by_id(str(self.index_id))
+                    item = await index.get_item_by_id(item_id)
+                    ids.append(('item', item.identifier, item.primary_title))
+                continue
+            if file is not None:
+                raise exceptions.MetadataError('Invalid path: No path segment below the item file', code=400)
+            # Root path segment
+            if part == '' and i == 0:
+                ids.append(('root', part, part))
+                continue
+            # File?
+            if item is not None:
+                file_cands = [f for f in item.files if f.filename == part]
+                if len(file_cands) == 0:
+                    raise exceptions.MetadataError('File not found', code=404)
+                file = file_cands[0]
+                ids.append(('item_file', file.filename, file.filename))
+                continue
+            if index is None:
+                index = await self.client.get_index_by_id(str(self.index_id))
+            # Index?
+            index_cands = [i for i in index.children if i.title == part]
+            if len(index_cands) > 0:
+                index = index_cands[0]
+                ids.append(('index', index.identifier, index.title))
+                continue
+            # Item?
+            item_cands = [i for i in await index.get_items() if i.primary_title == part]
+            if len(item_cands) > 0:
+                item = item_cands[0]
+                ids.append(('item', item.identifier, item.primary_title))
+                continue
+            # Draft files
+            ids.append(('draft_file', part, part))
+        logger.debug(f'WEKOPath {path} -> {ids}')
+        return WEKOPath(path, _ids=ids)
 
-    async def download(self, path, revision=None, range=None, **kwargs):
-        index_path, draft_path = split_path(path.path)
-        if len(draft_path) > 0:
-            parent = self._resolve_target_index(index_path)
-            draft_root = os.path.join(self._get_draft_dir(), parent)
-            assert len([d for d in draft_path if d == '..']) == 0
-            file_path = os.path.join(draft_root, draft_path)
-            return streams.FileStreamReader(open(file_path, 'rb'))
+    def _metadata_to_id(self, metadata):
+        if isinstance(metadata, WEKOIndexMetadata):
+            return ('index', metadata.index_identifier, metadata.name)
+        if isinstance(metadata, WEKOItemMetadata):
+            return ('item', metadata.item_identifier, metadata.name)
+        if isinstance(metadata, WEKOFileMetadata):
+            return ('item_file', metadata.name, metadata.name)
+        if isinstance(metadata, WEKODraftFileMetadata):
+            return ('draft_file', metadata.name, metadata.name)
+        if isinstance(metadata, WEKODraftFolderMetadata):
+            return ('draft_file', metadata.name, metadata.name)
+        raise exceptions.MetadataError('Unexpected metadata', code=400)
+
+    async def create_folder(self, path, **kwargs):
+        if not path.is_draft_file:
+            raise exceptions.MetadataError('Cannot create folders to the item', code=400)
+        index = await self._get_last_index_for(path)
+        default_provider, index_folder = await self.get_index_folder(index.identifier, creates=True)
+
+        logger.debug(f'Draft folder: {index_folder}')
+        _, draft_path = path.split_draft_file_path()
+        draft_parent_path, last_part = draft_path.split_path()
+        if len(draft_parent_path.parts) == 1:
+            parent_folder_metadata = index_folder
         else:
-            # Dummy implementation for registration
-            return streams.StringStream('')
+            draft_parent_path = draft_parent_path.as_file
+            logger.debug(f'Target path: {draft_parent_path}')
+            parent_folder_metadata = await self.get_draft_file_metadata(
+                default_provider,
+                index_folder,
+                draft_parent_path,
+            )
+        logger.debug(f'Target folder: {parent_folder_metadata.path}')
+        draft_path = await default_provider.validate_path(
+            parent_folder_metadata.path + last_part.value
+        )
+        metadata = await default_provider.create_folder(
+            draft_path, **kwargs
+        )
+        return WEKODraftFolderMetadata(self.index_id, metadata, index_folder, index)
 
     async def upload(self, stream, path, **kwargs):
-        """uploads to WEKO.
+        if not path.is_draft_file:
+            raise exceptions.MetadataError('Cannot upload files to the item', code=404)
+        index = await self._get_last_index_for(path)
+        default_provider, index_folder = await self.get_index_folder(index.identifier, creates=True)
 
-        :param waterbutler.core.streams.RequestWrapper stream: The stream to put to WEKO
-        :param str path: The filename prepended with '/'
-
-        :rtype: dict, bool
-        """
-        target_path = path.path[:path.path.rindex('/') + 1] \
-                      if '/' in path.path else ''
-        index_path, draft_path = split_path(target_path)
-        parent_index = self._resolve_target_index(index_path)
-        draft_dir = self._get_draft_dir()
-        fname = path.path.split('/')[-1]
-        assert not fname.startswith(ITEM_PREFIX)
-        dest_file = os.path.join(draft_dir, parent_index, draft_path, fname)
-        if not os.path.exists(os.path.split(dest_file)[0]):
-            os.makedirs(os.path.split(dest_file)[0])
-        with open(dest_file, 'wb') as f:
-            stream_size = 0
-            chunk = await stream.read()
-            while chunk:
-                f.write(chunk)
-                stream_size += len(chunk)
-                chunk = await stream.read()
-
-        mt = WEKODraftFileMetadata({'path': draft_path + fname,
-                                    'bytes': stream_size,
-                                    'filepath': dest_file},
-                                    index_path), True
-        if fname.endswith(IMPORT_XML_SUFFIX):
-            self._import_xml(parent_index, dest_file)
-        elif fname.endswith(IMPORT_ZIP_SUFFIX):
-            self._import_zip(parent_index, dest_file)
-        return mt
-
-    async def create_folder(self, path, folder_precheck=True, **kwargs):
-        """
-        :param str path: The path to create a folder at
-        """
-
-        WaterButlerPath.validate_folder(path)
-        target_path = path.path[:path.path.rstrip('/').rindex('/') + 1] \
-                      if '/' in path.path.rstrip('/') else ''
-        index_path, draft_path = split_path(target_path)
-        parent_index = self._resolve_target_index(index_path)
-        draft_dir = self._get_draft_dir()
-        assert len([d for d in draft_path if d == '..']) == 0
-        dname = path.path.split('/')[-2]
-        dest_file = os.path.join(draft_dir, parent_index, draft_path, dname)
-        if not os.path.exists(dest_file):
-            os.makedirs(dest_file)
-
-        return WEKODraftFolderMetadata({'path': path.path,
-                                        'filepath': dest_file},
-                                       index_path)
-
-    async def delete(self, path, **kwargs):
-        """Deletes the key at the specified path
-
-        :param str path: The path of the key to delete
-        """
-        index_path, draft_path = split_path(path.path)
-        if len(draft_path) > 0:
-            parent = self._resolve_target_index(index_path)
-            draft_root = os.path.join(self._get_draft_dir(), parent)
-            if not os.path.exists(draft_root):
-                raise exceptions.DeleteError('Draft not found', code=404)
-            assert len([d for d in draft_path if d == '..']) == 0
-            file_path = os.path.join(draft_root, draft_path)
-            if not os.path.exists(file_path):
-                raise exceptions.DeleteError('Draft not found', code=404)
-            if os.path.isdir(file_path):
-                shutil.rmtree(file_path)
-            else:
-                os.remove(file_path)
+        logger.debug(f'Draft folder: {index_folder}')
+        _, draft_path = path.split_draft_file_path()
+        draft_parent_path, last_part = draft_path.split_path()
+        if len(draft_parent_path.parts) == 1:
+            parent_folder_metadata = index_folder
         else:
-            assert index_path.split('/')[-1][len(ITEM_PREFIX):].startswith('item')
-            parent = index_path.split('/')[-2][len(ITEM_PREFIX):]
-            item_id = index_path.split('/')[-1][len(ITEM_PREFIX) + 4:]
+            draft_parent_path = draft_parent_path.as_file
+            logger.debug(f'Target path: {draft_parent_path}')
+            parent_folder_metadata = await self.get_draft_file_metadata(
+                default_provider,
+                index_folder,
+                draft_parent_path,
+            )
+        logger.debug(f'Target folder: {parent_folder_metadata.path}')
+        draft_path = await default_provider.validate_path(
+            parent_folder_metadata.path + last_part.value
+        )
 
-            indices = client.get_all_indices(self.connection)
-            index = [index
-                     for index in indices if str(index.identifier) == parent][0]
-            delitem = [item
-                       for item in client.get_items(self.connection, index)
-                       if client.itemId(item.about) == item_id][0]
+        stream.add_writer('md5', streams.HashStreamWriter(hashlib.md5))
+        stream.add_writer('sha1', streams.HashStreamWriter(hashlib.sha1))
+        stream.add_writer('sha256', streams.HashStreamWriter(hashlib.sha256))
+        stream.add_writer('sha512', streams.HashStreamWriter(hashlib.sha512))
 
-            scheme, netloc, path, params, oai_query, fragment = urlparse(delitem.about)
-            sword_query = 'action=repository_uri&item_id={}'.format(item_id)
-            sword_url = urlunparse((scheme, netloc, path, params, sword_query, fragment))
-            client.delete(self.connection, sword_url)
+        metadata, created = await default_provider.upload(
+            stream, draft_path, **kwargs
+        )
+        return WEKODraftFileMetadata(self.index_id, metadata, index_folder, index), created
+
+    async def delete(self, path, confirm_delete=0, **kwargs):
+        if not path.is_draft_file:
+            raise exceptions.MetadataError('Unsupported operation', code=400)
+        index = await self._get_last_index_for(path)
+        default_provider, index_folder = await self.get_index_folder(index.identifier)
+        if index_folder is None:
+            raise exceptions.MetadataError('Unexpected path', code=404)
+        _, last_path = path.split_draft_file_path()
+        file_metadata = await self.get_draft_file_metadata(
+            default_provider,
+            index_folder,
+            last_path.as_file,
+        )
+        file_path = await default_provider.validate_path(file_metadata.path)
+        metadata = await default_provider.delete(file_path, confirm_delete=confirm_delete, **kwargs)
+        if metadata is None:
+            return None
+        return self._wrap_draft_metadata(metadata, index_folder, index)
+
+    async def download(self, path, revision=None, range=None, **kwargs):
+        index = await self._get_last_index_for(path)
+        if path.is_draft_file:
+            # Draft file or item file
+            default_provider, index_folder = await self.get_index_folder(index.identifier)
+            if index_folder is None:
+                raise exceptions.MetadataError('Unexpected path', code=404)
+            _, last_path = path.split_draft_file_path()
+            file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_path)
+            file_path = await default_provider.validate_path(file_metadata.path)
+            return await default_provider.download(file_path, range=range, **kwargs)
+        if not path.is_item_file:
+            raise exceptions.MetadataError('Illegal parts', code=400)
+        # File of Item
+        item = await self._get_last_item_for(index, path)
+        last_part = path.parts[-1]
+        files = [f for f in item.files if f.filename == last_part.identifier_value]
+        if len(files) == 0:
+            raise exceptions.MetadataError('File not found', code=404)
+        file = files[0]
+        resp = await self.make_request(
+            'GET',
+            file.download_url,
+            range=range,
+            headers=self.client.request_headers(),
+            expects=(200, 206),
+            throws=exceptions.DownloadError,
+        )
+        return streams.ResponseStreamReader(resp)
 
     async def metadata(self, path, version=None, **kwargs):
         """
@@ -269,98 +367,35 @@ class WEKOProvider(provider.BaseProvider):
             - 'latest-published' for published files
             - None for all data
         """
-        indices = client.get_all_indices(self.connection)
-
-        index_path, draft_path = split_path(path.path)
-
         if path.is_root:
-            parent = str(self.index_id)
-        elif path.is_dir:
-            parent = self._resolve_target_index(index_path)
-        elif len(draft_path) > 0:
-            parent = self._resolve_target_index(index_path)
-        else:
-            raise exceptions.MetadataError('unsupported', code=404)
-
-        pindices = [index
-                    for index in indices if str(index.identifier) == parent]
-        if len(pindices) == 0:
-            raise exceptions.MetadataError('Index not found', code=404)
-        index = pindices[0]
-        draft_root = os.path.join(self._get_draft_dir(), parent)
-
-        if len(draft_path) > 0:
-            if not os.path.exists(draft_root):
-                raise exceptions.MetadataError('Draft not found', code=404)
-            assert len([d for d in draft_path if d == '..']) == 0
-            file_path = os.path.join(draft_root, draft_path)
-            if not os.path.exists(file_path):
-                raise exceptions.MetadataError('Draft not found', code=404)
-            if os.path.isdir(file_path):
-                drafts = [self._get_draft_metadata(draft_path,
-                                                   os.path.join(file_path, d),
-                                                   index_path)
-                          for d in os.listdir(file_path)]
-                return drafts
-            else:
-                return self._get_draft_metadata(os.path.split(draft_path)[0],
-                                                file_path,
-                                                index_path)
-        else:
-            # WEKO index
-            index_urls = set([index.about for index in indices if str(index.parentIdentifier) == parent])
-            ritems = [WEKOItemMetadata(item, index, indices)
-                      for item in client.get_items(self.connection, index)
-                      if item.about not in index_urls]
-            rindices = [WEKOIndexMetadata(index, indices)
-                        for index in indices if str(index.parentIdentifier) == parent]
-            if os.path.exists(draft_root):
-                drafts = [self._get_draft_metadata(draft_path,
-                                                   os.path.join(draft_root, d),
-                                                   index_path)
-                          for d in os.listdir(draft_root)]
-            else:
-                drafts = []
-            return rindices + ritems + drafts
-
-    def can_intra_move(self, dest_provider, path=None):
-        logger.debug('can_intra_move: dest_provider={} path={}'.format(dest_provider.NAME, path))
-        index_path, draft_path = split_path(path.path)
-        if len(draft_path) > 0:
-            return False
-        return dest_provider.NAME == self.NAME and path.path.endswith('/')
-
-    async def intra_move(self, dest_provider, src_path, dest_path):
-        logger.debug('Moved: {}->{}'.format(src_path, dest_path))
-        indices = client.get_all_indices(self.connection)
-
-        if src_path.is_root:
-            src_path_id = str(self.index_id)
-        elif src_path.is_dir:
-            src_path_id = src_path.path.split('/')[-2][len(ITEM_PREFIX):]
-        else:
-            raise exceptions.MetadataError('unsupported', code=404)
-        if dest_path.is_root:
-            dest_path_id = str(self.index_id)
-        else:
-            dest_path_id = dest_path.path.split('/')[-2][len(ITEM_PREFIX):]
-
-        target_index = [index
-                        for index in indices
-                        if str(index.identifier) == src_path_id][0]
-        parent_index = [index
-                        for index in indices
-                        if str(index.identifier) == dest_path_id][0]
-        logger.info('Moving: Index {} to {}'.format(target_index.identifier,
-                                                    parent_index.identifier))
-        client.update_index(self.connection, target_index.identifier,
-                            relation=parent_index.identifier)
-
-        indices = client.get_all_indices(self.connection)
-        target_index = [index
-                        for index in indices
-                        if str(index.identifier) == src_path_id][0]
-        return WEKOIndexMetadata(target_index, indices), True
+            # Root Index
+            index = await self.client.get_index_by_id(str(self.index_id))
+            return await self.get_index_metadata(index)
+        if path.is_index:
+            # Sub Index
+            index = await self.client.get_index_by_id(path.parts[-1].identifier_value)
+            return await self.get_index_metadata(index)
+        index = await self._get_last_index_for(path)
+        if path.is_item:
+            # Item
+            item = await index.get_item_by_id(path.parts[-1].identifier_value)
+            return self.get_item_metadata(index, item)
+        if path.is_item_file:
+            # File of Item
+            item = await self._get_last_item_for(index, path)
+            files = [f for f in item.files if f.filename == path.parts[-1].identifier_value]
+            if len(files) == 0:
+                raise exceptions.MetadataError('Illegal parts', code=400)
+            return WEKOFileMetadata(self.index_id, files[0], item, index)
+        if not path.is_draft_file:
+            raise exceptions.MetadataError('unsupported', code=400)
+        # Draft of Index
+        default_provider, index_folder = await self.get_index_folder(index.identifier)
+        if index_folder is None:
+            raise exceptions.MetadataError('Unexpected path', code=404)
+        _, last_path = path.split_draft_file_path()
+        file_metadata = await self.get_draft_file_metadata(default_provider, index_folder, last_path)
+        return self._wrap_draft_metadata(file_metadata, index_folder, index)
 
     async def revisions(self, path, **kwargs):
         """Get past versions of the request file.
@@ -368,5 +403,104 @@ class WEKOProvider(provider.BaseProvider):
         :param str path: The path to a key
         :rtype list:
         """
-
         return []
+
+    async def get_index_metadata(self, index):
+        ritems = [
+            WEKOItemMetadata(self.index_id, self.client, item, index, self.NAME)
+            for item in await index.get_items()
+        ]
+        rindices = [WEKOIndexMetadata(self.index_id, self.client, i) for i in index.children]
+        default_provider, index_folder = await self.get_index_folder(index.identifier)
+        rdrafts = []
+        if index_folder is not None:
+            index_folder_path = await default_provider.validate_path(index_folder.path)
+            index_folder_metadata = await default_provider.metadata(index_folder_path)
+            for f in index_folder_metadata:
+                rdrafts.append(self._wrap_draft_metadata(f, index_folder, index))
+        return rindices + ritems + rdrafts
+
+    def get_item_metadata(self, index, item):
+        return [WEKOFileMetadata(self.index_id, f, item, index) for f in item.files]
+
+    async def get_draft_folder(self, creates=False):
+        default_provider = self.make_default_provider()
+        root_folder_path = await default_provider.validate_path('/')
+        root_folder_metadata = await default_provider.metadata(
+            root_folder_path
+        )
+        draft_folders = [child
+                         for child in root_folder_metadata
+                         if child.name == f'.{self.NAME}']
+        if len(draft_folders) > 0:
+            return default_provider, draft_folders[0]
+        if not creates:
+            return default_provider, None
+        # Create draft folder
+        draft_folder_path = await default_provider.validate_path(f'/.{self.NAME}/')
+        folder = await default_provider.create_folder(draft_folder_path)
+        return default_provider, folder
+
+    async def get_index_folder(self, index_id, creates=False):
+        default_provider, draft_folder = await self.get_draft_folder(creates=creates)
+        if draft_folder is None:
+            return default_provider, None
+        draft_folder_path = await default_provider.validate_path(draft_folder.path)
+        draft_folder_metadata = await default_provider.metadata(
+            draft_folder_path
+        )
+        index_folders = [child
+                         for child in draft_folder_metadata
+                         if child.name == index_id]
+        if len(index_folders) > 0:
+            return default_provider, index_folders[0]
+        if not creates:
+            return default_provider, None
+        # Create index folder
+        index_folder_path = await default_provider.validate_path(f'{draft_folder.path}{index_id}/')
+        index_folder = await default_provider.create_folder(index_folder_path)
+        return default_provider, index_folder
+
+    async def get_draft_file_metadata(self, default_provider, index_folder, draft_path):
+        logger.debug(f'Draft File: index_folder={index_folder.materialized_path}, draft_path={draft_path.path}')
+        draft_parent_path, last_part = draft_path.split_path()
+        if last_part is None:
+            # root
+            index_folder_path = await default_provider.validate_path(index_folder.path)
+            return await default_provider.metadata(index_folder_path)
+        draft_parent_metadata = await self.get_draft_file_metadata(
+            default_provider,
+            index_folder,
+            draft_parent_path,
+        )
+        if hasattr(draft_parent_metadata, 'kind') and draft_parent_metadata.kind == 'file':
+            raise exceptions.MetadataError('invalid', code=400)
+        draft_files = [child
+                       for child in draft_parent_metadata
+                       if child.name == last_part.materialized]
+        if len(draft_files) == 0:
+            raise exceptions.MetadataError('File not found', code=404)
+        if not draft_path.is_dir:
+            return draft_files[0]
+        draft_folder_path = await default_provider.validate_path(draft_files[0].path)
+        return await default_provider.metadata(draft_folder_path)
+
+    async def _get_last_index_for(self, path):
+        index_parts = [p for p in path.parts if p.is_index]
+        if len(index_parts) > 0:
+            # Sub index
+            return await self.client.get_index_by_id(index_parts[-1].identifier_value)
+        return await self.client.get_index_by_id(str(self.index_id))
+
+    async def _get_last_item_for(self, index, path):
+        item_parts = [p for p in path.parts if p.is_item]
+        if len(item_parts) == 0:
+            raise exceptions.MetadataError('Illegal parts', code=400)
+        return await index.get_item_by_id(item_parts[-1].identifier_value)
+
+    def _wrap_draft_metadata(self, file_metadata, index_folder, index):
+        if isinstance(file_metadata, (list, tuple)):
+            return [self._wrap_draft_metadata(f, index_folder, index) for f in file_metadata]
+        if file_metadata.kind == 'folder':
+            return WEKODraftFolderMetadata(self.index_id, file_metadata, index_folder, index)
+        return WEKODraftFileMetadata(self.index_id, file_metadata, index_folder, index)
