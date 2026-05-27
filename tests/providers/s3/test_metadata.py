@@ -135,4 +135,3 @@ class TestRevisionsMetadata:
         revision_metadata_object.raw['IsLatest'] = 'false'
 
         assert revision_metadata_object.version == '3/L4kqtJl40Nr8X8gdRQBpUMLUo'
-
