@@ -214,6 +214,23 @@ class TestRegionDetection:
         # assert provider.connection.host == host
 
 
+class TestInitialization:
+
+    @pytest.mark.parametrize(('provider_settings', 'expected_base_folder'), [
+        ({'id': 'that-kerning:/my-subfolder/'}, 'my-subfolder/'),
+        ({'id': 'that-kerning'}, ''),
+        ({'id': None}, ''),
+    ])
+    def test_base_folder_parsing(self, auth, credentials, settings, provider_settings, expected_base_folder):
+        provider_settings = dict(settings, **provider_settings)
+        if provider_settings['id'] is None:
+            del provider_settings['id']
+
+        provider = S3Provider(auth, credentials, provider_settings)
+
+        assert provider.base_folder == expected_base_folder
+
+
 class TestValidatePath:
 
     @pytest.mark.skip('TODO fix broken s3 provider tests')

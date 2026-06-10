@@ -57,14 +57,20 @@ class S3Provider(provider.BaseProvider):
         self.aws_secret_access_key = credentials['secret_key']
         self.aws_access_key_id = credentials['access_key']
         self.bucket_name = settings['bucket']
-        self.base_folder = self.settings.get('id', ':/').split(':/')[1]
+        self.base_folder = self._get_base_folder(self.settings)
         self.encrypt_uploads = self.settings.get('encrypt_uploads', False)
         self.region = None
+
+    @staticmethod
+    def _get_base_folder(provider_settings):
+        _, separator, base_folder = (provider_settings.get('id') or ':/').partition(':/')
+        return base_folder if separator else ''
 
     async def generate_generic_presigned_url(self, path, method='head_object', query_parameters=None, default_params=True):
         try:
             session = get_session()
             region_name = {'region_name': self.region} if self.region else {}
+            endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
             config = AioConfig(signature_version='s3v4')
 
             async with session.create_client(
@@ -72,7 +78,8 @@ class S3Provider(provider.BaseProvider):
                     aws_secret_access_key=self.aws_secret_access_key,
                     aws_access_key_id=self.aws_access_key_id,
                     config=config,
-                    **region_name
+                    **region_name,
+                    **endpoint_url
             ) as s3_client:
                 params = {'Bucket': self.bucket_name, 'Key': path} if default_params else {}
                 if query_parameters:
@@ -86,6 +93,7 @@ class S3Provider(provider.BaseProvider):
         try:
             session = get_session()
             region_name = {"region_name": self.region} if self.region else {}
+            endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
             config = AioConfig(signature_version='s3v4')
             query_parameters = query_parameters or {}
 
@@ -94,7 +102,8 @@ class S3Provider(provider.BaseProvider):
                     aws_secret_access_key=self.aws_secret_access_key,
                     aws_access_key_id=self.aws_access_key_id,
                     config=config,
-                    **region_name
+                    **region_name,
+                    **endpoint_url
             ) as s3_client:
                 params = {'Bucket': self.bucket_name, 'Key': path}
                 if query_parameters:
@@ -263,11 +272,13 @@ class S3Provider(provider.BaseProvider):
 
         session = get_session()
         region_name = {"region_name": self.region} if self.region else {}
+        endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
         async with session.create_client(
                 's3',
                 aws_secret_access_key=self.aws_secret_access_key,
                 aws_access_key_id=self.aws_access_key_id,
-                **region_name
+                **region_name,
+                **endpoint_url
         ) as s3_client:
             for index in range(0, len(delete_requests), 1000):
                 chunk = delete_requests[index:index + 1000]
@@ -430,13 +441,15 @@ class S3Provider(provider.BaseProvider):
         await self._check_region()
         exists = await dest_provider.exists(dest_path)
         region_name = {"region_name": self.region} if self.region else {}
+        endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
 
         session = get_session()
         async with session.create_client(
                 's3',
                 aws_secret_access_key=self.aws_secret_access_key,
                 aws_access_key_id=self.aws_access_key_id,
-                **region_name
+                **region_name,
+                **endpoint_url
         ) as s3_client:
             copy_source = {
                 'Bucket': self.bucket_name,
