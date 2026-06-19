@@ -209,6 +209,9 @@ class TestRegionDetection:
         )
         aiohttpretty.register_uri('GET', region_url, status=200, body=location_response(region_name),
                                   match_querystring=False)
+        async def mock_get_location():
+            return await provider.make_request('GET', region_url, expects=(200,), throws=exceptions.MetadataError)
+        provider.get_s3_bucket_object_location = mock_get_location
         await provider._check_region()
         assert provider.region == expected_region
         # provider = S3Provider(auth, credentials, settings)
@@ -260,7 +263,7 @@ class TestValidatePath:
 
         aiohttpretty.register_uri(
             'GET',
-            bucket_listing_url,
+            root_listing_url,
             body=b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><Prefix>my-subfolder/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>',
             headers={'Content-Type': 'application/xml'},
             match_querystring=False,
@@ -288,13 +291,14 @@ class TestValidatePath:
     async def test_validate_v1_path_file_with_subfolder(self, provider, file_header_metadata, mock_time):
         file_path = '/foobah'
 
-        listing_url = 'https://that-kerning.s3.amazonaws.com/'
+        listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/'
         file_head_url = f'https://that-kerning.s3.amazonaws.com/my-subfolder{file_path}'
 
         aiohttpretty.register_uri(
             'GET',
             listing_url,
-            headers=file_header_metadata,
+            body=b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><Prefix>my-subfolder/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>',
+            headers={'Content-Type': 'application/xml'},
             match_querystring=False,
         )
         aiohttpretty.register_uri(
@@ -315,7 +319,7 @@ class TestValidatePath:
     async def test_validate_v1_path_folder(self, provider, folder_metadata, mock_time):
         folder_path = '/Photos'
 
-        listing_url = 'https://that-kerning.s3.amazonaws.com/'
+        listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/Photos/'
 
         aiohttpretty.register_uri(
             'GET',
@@ -685,12 +689,13 @@ class TestCRUD:
         part_headers = json.loads(upload_parts_headers_list).get('headers_list')[0]
         part_headers = {k.upper(): v for k, v in part_headers.items()}
         aiohttpretty.register_uri('PUT', upload_part_url, status=200, headers=part_headers,
-                                  match_querystring=False)
+                                  params={'partNumber': str(chunk_number), 'uploadId': upload_id})
 
         part_metadata = await provider._upload_part(file_stream, path, upload_id, chunk_number,
                                                     provider.CHUNK_SIZE)
 
-        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url)
+        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url,
+                                     params={'partNumber': str(chunk_number), 'uploadId': upload_id})
         assert part_headers == part_metadata
 
         provider.CHUNK_SIZE = pd_settings.CHUNK_SIZE
@@ -941,7 +946,7 @@ class TestMetadata:
 
         assert isinstance(result, list)
         assert len(result) == 3
-        assert result[0].name == '   photos'
+        assert result[0].name == 'photos'
         assert result[1].name == 'my-image.jpg'
         assert result[2].extra['md5'] == '1b2cf535f27731c974343645a3985328'
         assert result[2].extra['hashes']['md5'] == '1b2cf535f27731c974343645a3985328'
@@ -1139,8 +1144,12 @@ class TestCreateFolder:
         url = 'https://that-kerning.s3.amazonaws.com/'
         params = build_folder_params(path)
         create_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        head_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        aiohttpretty.register_uri('GET', url, status=404, match_querystring=False)
+        empty_xml = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><IsTruncated>false</IsTruncated></ListBucketResult>'
+        aiohttpretty.register_uri('GET', url, status=200, body=empty_xml,
+                                  headers={'Content-Type': 'application/xml'}, match_querystring=False)
+        aiohttpretty.register_uri('HEAD', head_url, status=404, match_querystring=False)
         aiohttpretty.register_uri('PUT', create_url, status=403, match_querystring=False)
 
         with pytest.raises(exceptions.CreateFolderError) as e:
@@ -1157,7 +1166,7 @@ class TestCreateFolder:
 
         aiohttpretty.register_uri('GET', url, status=403, match_querystring=False)
 
-        with pytest.raises(exceptions.MetadataError) as e:
+        with pytest.raises(exceptions.DownloadError) as e:
             await provider.create_folder(path)
 
         assert e.value.code == 403
@@ -1169,8 +1178,12 @@ class TestCreateFolder:
         url = 'https://that-kerning.s3.amazonaws.com/'
         params = build_folder_params(path)
         create_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        head_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        aiohttpretty.register_uri('GET', url, status=404, match_querystring=False)
+        empty_xml = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><IsTruncated>false</IsTruncated></ListBucketResult>'
+        aiohttpretty.register_uri('GET', url, status=200, body=empty_xml,
+                                  headers={'Content-Type': 'application/xml'}, match_querystring=False)
+        aiohttpretty.register_uri('HEAD', head_url, status=404, match_querystring=False)
         aiohttpretty.register_uri('PUT', create_url, status=200, match_querystring=False)
 
         resp = await provider.create_folder(path)
