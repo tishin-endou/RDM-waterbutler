@@ -1200,9 +1200,10 @@ class TestOperations:
         source_path = WaterButlerPath('/source')
         dest_path = WaterButlerPath('/dest')
 
-        # Mock dest_provider (exists=False → file is new, metadata returns file object)
+        # Mock dest_provider (exists=True → file already at dest, intra_copy returns not True=False)
+        # Original test registered HEAD 200 for dest → exists=True; assert not exists checks False
         dest_provider = mock.Mock()
-        dest_provider.exists = MockCoroutine(return_value=False)
+        dest_provider.exists = MockCoroutine(return_value=True)
         dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
         dest_provider.bucket_name = provider.bucket_name
 
