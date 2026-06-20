@@ -1207,15 +1207,18 @@ class TestOperations:
         dest_provider.bucket_name = provider.bucket_name
 
         # Mock aiobotocore session → client (intra_copy uses copy_object directly)
-        mock_s3_client = mock.AsyncMock()
-        mock_s3_client.copy_object = mock.AsyncMock(return_value={})
+        # mock.AsyncMock requires Python 3.8+; use MockCoroutine + inline async ctx manager
+        mock_s3_client = mock.Mock()
+        mock_s3_client.copy_object = MockCoroutine(return_value={})
 
-        mock_context_manager = mock.MagicMock()
-        mock_context_manager.__aenter__ = mock.AsyncMock(return_value=mock_s3_client)
-        mock_context_manager.__aexit__ = mock.AsyncMock(return_value=False)
+        class _AsyncClientCtx:
+            async def __aenter__(self_):
+                return mock_s3_client
+            async def __aexit__(self_, *args):
+                return False
 
         mock_session = mock.Mock()
-        mock_session.create_client = mock.Mock(return_value=mock_context_manager)
+        mock_session.create_client = mock.Mock(return_value=_AsyncClientCtx())
 
         with mock.patch('waterbutler.providers.s3.provider.get_session', return_value=mock_session):
             metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
