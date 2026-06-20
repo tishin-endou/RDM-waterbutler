@@ -1196,29 +1196,38 @@ class TestCreateFolder:
 class TestOperations:
 
     @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    @pytest.mark.skip('Mocking too complicated')
-    async def test_intra_copy(self, provider, file_header_metadata, mock_time):
+    async def test_intra_copy(self, provider, file_metadata_object, mock_time):
         source_path = WaterButlerPath('/source')
         dest_path = WaterButlerPath('/dest')
-        metadata_url = provider.bucket.new_key('/my-subfolder/' + dest_path.path).generate_url(100, 'HEAD')
-        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata)
 
-        header_path = '/' + os.path.join(provider.settings['bucket'], source_path.path)
-        headers = {'x-amz-copy-source': parse.quote(header_path)}
+        # Mock dest_provider (exists=False → file is new, metadata returns file object)
+        dest_provider = mock.Mock()
+        dest_provider.exists = MockCoroutine(return_value=False)
+        dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
+        dest_provider.bucket_name = provider.bucket_name
 
-        url = provider.bucket.new_key('/my-subfolder/' + dest_path.path).generate_url(100, 'PUT', headers=headers)
-        aiohttpretty.register_uri('PUT', url, status=200)
+        # Mock aiobotocore session → client (intra_copy uses copy_object directly)
+        mock_s3_client = mock.AsyncMock()
+        mock_s3_client.copy_object = mock.AsyncMock(return_value={})
 
-        metadata, exists = await provider.intra_copy(provider, source_path, dest_path)
+        mock_context_manager = mock.MagicMock()
+        mock_context_manager.__aenter__ = mock.AsyncMock(return_value=mock_s3_client)
+        mock_context_manager.__aexit__ = mock.AsyncMock(return_value=False)
 
+        mock_session = mock.Mock()
+        mock_session.create_client = mock.Mock(return_value=mock_context_manager)
 
-        provider._check_region.assert_called()
+        with mock.patch('waterbutler.providers.s3.provider.get_session', return_value=mock_session):
+            metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
 
         assert metadata.kind == 'file'
         assert not exists
-        assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
-        assert aiohttpretty.has_call(method='PUT', uri=url, headers=headers)
+        provider._check_region.assert_called()
+        mock_s3_client.copy_object.assert_called_once_with(
+            Bucket=provider.bucket_name,
+            Key=dest_path.path,
+            CopySource={'Bucket': provider.bucket_name, 'Key': source_path.path},
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
