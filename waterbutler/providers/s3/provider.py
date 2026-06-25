@@ -329,6 +329,8 @@ class S3Provider(provider.BaseProvider):
     async def get_object_versions(self, query_parameters):
 
         continuation_token = None
+        query_parameters = dict(query_parameters)
+        query_parameters.setdefault('Bucket', self.bucket_name)
 
         versions_result = []
         while True:

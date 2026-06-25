@@ -132,6 +132,15 @@ def bulk_delete_body(keys):
     return (payload, headers)
 
 
+class MockS3Response:
+
+    text = MockCoroutine(return_value='''<?xml version="1.0" encoding="UTF-8"?>
+        <ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <IsTruncated>false</IsTruncated>
+        </ListVersionsResult>
+    ''')
+
+
 def list_upload_chunks_body(parts_metadata):
     payload = b'''<?xml version="1.0" encoding="UTF-8"?>
         <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1194,6 +1203,18 @@ class TestCreateFolder:
 
 
 class TestOperations:
+
+    @pytest.mark.asyncio
+    async def test_get_object_versions_adds_bucket_to_presigned_params(self, provider):
+        provider.generate_generic_presigned_url = MockCoroutine(return_value='http://example.com')
+        provider.make_request = MockCoroutine(return_value=MockS3Response())
+
+        await provider.get_object_versions({'Prefix': 'my-image.jpg', 'Delimiter': '/'})
+
+        _, kwargs = provider.generate_generic_presigned_url.call_args
+        assert kwargs['query_parameters']['Bucket'] == provider.bucket_name
+        assert kwargs['query_parameters']['Prefix'] == 'my-image.jpg'
+        assert kwargs['default_params'] is False
 
     @pytest.mark.asyncio
     async def test_intra_copy(self, provider, file_metadata_object, mock_time):
