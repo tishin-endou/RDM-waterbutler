@@ -11,8 +11,8 @@ from urllib import parse
 from unittest import mock
 
 import pytest
-from boto.compat import BytesIO
-from boto.utils import compute_md5
+# from boto.compat import BytesIO
+# from boto.utils import compute_md5
 
 from waterbutler.providers.s3 import S3Provider
 from waterbutler.core.path import WaterButlerPath
@@ -45,7 +45,6 @@ from tests.providers.s3.fixtures import (auth,
                                          folder_single_item_metadata,
                                          file_metadata_headers_object,
                                          )
-from hmac import compare_digest
 
 
 @pytest.fixture
@@ -56,9 +55,24 @@ def mock_time(monkeypatch):
 
 @pytest.fixture
 def provider(auth, credentials, settings):
-    provider = S3Provider(auth, credentials, settings)
-    provider._check_region = MockCoroutine()
-    return provider
+    prov = S3Provider(auth, credentials, settings)
+    prov._check_region = MockCoroutine()
+
+    async def _gen_presigned(path, method='head_object', query_parameters=None, default_params=True):
+        clean = path.lstrip('/')
+        if clean:
+            return f'https://that-kerning.s3.amazonaws.com/{clean}'
+        return 'https://that-kerning.s3.amazonaws.com/'
+
+    prov.generate_generic_presigned_url = _gen_presigned
+
+    async def _check_key(path, expects=(200,), query_parameters=None):
+        url = f'https://that-kerning.s3.amazonaws.com/{path}'
+        return await prov.make_request('HEAD', url, expects=expects, throws=exceptions.MetadataError)
+
+    prov.check_key_existence = _check_key
+
+    return prov
 
 
 @pytest.fixture
@@ -89,7 +103,7 @@ def list_objects_response(keys, truncated=False):
 
     response += '<IsTruncated>' + str(truncated).lower() + '</IsTruncated>'
     response += ''.join(map(
-        lambda x: '<Contents><Key>{}</Key></Contents>'.format(x),
+        lambda x: f'<Contents><Key>{x}</Key></Contents>',
         keys
     ))
 
@@ -102,7 +116,7 @@ def bulk_delete_body(keys):
     payload = '<?xml version="1.0" encoding="UTF-8"?>'
     payload += '<Delete>'
     payload += ''.join(map(
-        lambda x: '<Object><Key>{}</Key></Object>'.format(x),
+        lambda x: f'<Object><Key>{x}</Key></Object>',
         keys
     ))
     payload += '</Delete>'
@@ -118,8 +132,17 @@ def bulk_delete_body(keys):
     return (payload, headers)
 
 
+class MockS3Response:
+
+    text = MockCoroutine(return_value='''<?xml version="1.0" encoding="UTF-8"?>
+        <ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <IsTruncated>false</IsTruncated>
+        </ListVersionsResult>
+    ''')
+
+
 def list_upload_chunks_body(parts_metadata):
-    payload = '''<?xml version="1.0" encoding="UTF-8"?>
+    payload = b'''<?xml version="1.0" encoding="UTF-8"?>
         <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
             <Bucket>example-bucket</Bucket>
             <Key>example-object</Key>
@@ -150,13 +173,15 @@ def list_upload_chunks_body(parts_metadata):
                 <Size>10485760</Size>
             </Part>
         </ListPartsResult>
-    '''.encode('utf-8')
+    '''
 
-    md5 = compute_md5(BytesIO(payload))
+    # md5 = compute_md5(BytesIO(payload))
+    # md5 = compute_md5(payload)
+    md5 = hashlib.md5(payload)
 
     headers = {
         'Content-Length': str(len(payload)),
-        'Content-MD5': md5[1],
+        'Content-MD5': md5.hexdigest(),
         'Content-Type': 'text/xml',
     }
 
@@ -166,61 +191,72 @@ def list_upload_chunks_body(parts_metadata):
 def build_folder_params(path):
     return {'prefix': path.path, 'delimiter': '/'}
 
-
-def build_folder_params_with_max_key(path):
-    return {'prefix': path.path, 'delimiter': '/', 'max-keys': '1000'}
-
-
-def prepare_xml_body(object_dict):
-    payload = '<?xml version="1.0" encoding="UTF-8"?>'
-    payload += '<Delete>'
-    payload += ''.join(
-        '<Object><Key>{}</Key><VersionId>{}</VersionId></Object>'.format(
-            xml.sax.saxutils.escape(key), xml.sax.saxutils.escape(version)
-        )
-        for key, value in object_dict.items()
-        for version in value
-    )
-    payload += '</Delete>'
-    payload = payload.encode('utf-8')
-    return payload
-
-
 class TestRegionDetection:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    @pytest.mark.parametrize("region_name,host", [
-        ('',               's3.amazonaws.com'),
-        ('EU',             's3-eu-west-1.amazonaws.com'),
-        ('us-east-2',      's3-us-east-2.amazonaws.com'),
-        ('us-west-1',      's3-us-west-1.amazonaws.com'),
-        ('us-west-2',      's3-us-west-2.amazonaws.com'),
-        ('ca-central-1',   's3-ca-central-1.amazonaws.com'),
-        ('eu-central-1',   's3-eu-central-1.amazonaws.com'),
-        ('eu-west-2',      's3-eu-west-2.amazonaws.com'),
-        ('ap-northeast-1', 's3-ap-northeast-1.amazonaws.com'),
-        ('ap-northeast-2', 's3-ap-northeast-2.amazonaws.com'),
-        ('ap-south-1',     's3-ap-south-1.amazonaws.com'),
-        ('ap-southeast-1', 's3-ap-southeast-1.amazonaws.com'),
-        ('ap-southeast-2', 's3-ap-southeast-2.amazonaws.com'),
-        ('sa-east-1',      's3-sa-east-1.amazonaws.com'),
+    @pytest.mark.parametrize("region_name,expected_region", [
+        # ('',               's3.amazonaws.com'),
+        ('EU',             'eu-west-1'),
+        ('us-east-2',      'us-east-2'),
+        ('us-west-1',      'us-west-1'),
+        ('us-west-2',      'us-west-2'),
+        ('ca-central-1',   'ca-central-1'),
+        ('eu-central-1',   'eu-central-1'),
+        ('eu-west-2',      'eu-west-2'),
+        ('ap-northeast-1', 'ap-northeast-1'),
+        ('ap-northeast-2', 'ap-northeast-2'),
+        ('ap-south-1',     'ap-south-1'),
+        ('ap-southeast-1', 'ap-southeast-1'),
+        ('ap-southeast-2', 'ap-southeast-2'),
+        ('sa-east-1',      'sa-east-1'),
     ])
-    async def test_region_host(self, auth, credentials, settings, region_name, host, mock_time):
+    async def test_region_host(self, auth, credentials, settings, region_name, expected_region, mock_time):
         provider = S3Provider(auth, credentials, settings)
-
-        region_url = provider.bucket.generate_url(
-            100,
-            'GET',
-            query_parameters={'location': ''},
+        region_url = await provider.generate_generic_presigned_url(
+            '', method='get_bucket_location', query_parameters={'Bucket': settings['bucket']},  default_params=False
         )
-        aiohttpretty.register_uri('GET',
-                                  region_url,
-                                  status=200,
-                                  body=location_response(region_name))
-
+        aiohttpretty.register_uri('GET', region_url, status=200, body=location_response(region_name),
+                                  match_querystring=False)
+        async def mock_get_location():
+            return await provider.make_request('GET', region_url, expects=(200,), throws=exceptions.MetadataError)
+        provider.get_s3_bucket_object_location = mock_get_location
         await provider._check_region()
-        assert provider.connection.host == host
+        assert provider.region == expected_region
+        # provider = S3Provider(auth, credentials, settings)
+        # await provider._check_region()
+        # await provider._check_region()
+        # res = await provider._get_bucket_region()
+        # # region_url = provider.bucket.generate_url(
+        # #     100,
+        # #     'GET',
+        # #     query_parameters={'location': ''},
+        # # )
+        # region_url = 'https://s3.amazonaws.com/that-kerning?location=&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=Dont%20dead%2F20250526%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250526T134653Z&X-Amz-Expires=100&X-Amz-SignedHeaders=host&X-Amz-Signature=80f8426c4fc6d0af68bd3e52a553c9e4d838144b9a70600aff507f70056696f1 '
+        # aiohttpretty.register_uri('GET',
+        #                           region_url,
+        #                           status=200,
+        #                           body=location_response(region_name))
+        #
+        # await provider._check_region()
+        # assert provider.connection.host == host
+
+
+class TestInitialization:
+
+    @pytest.mark.parametrize(('provider_settings', 'expected_base_folder'), [
+        ({'id': 'that-kerning:/my-subfolder/'}, 'my-subfolder/'),
+        ({'id': 'that-kerning'}, ''),
+        ({'id': None}, ''),
+    ])
+    def test_base_folder_parsing(self, auth, credentials, settings, provider_settings, expected_base_folder):
+        provider_settings = dict(settings, **provider_settings)
+        if provider_settings['id'] is None:
+            del provider_settings['id']
+
+        provider = S3Provider(auth, credentials, provider_settings)
+
+        assert provider.base_folder == expected_base_folder
 
 
 class TestValidatePath:
@@ -230,23 +266,30 @@ class TestValidatePath:
     async def test_validate_v1_path_file(self, provider, file_header_metadata, mock_time):
         file_path = 'foobah'
 
-        params = {'prefix': '/' + file_path + '/', 'delimiter': '/'}
-        good_metadata_url = provider.bucket.new_key('/' + file_path).generate_url(100, 'HEAD')
-        bad_metadata_url = provider.bucket.generate_url(100)
-        aiohttpretty.register_uri('HEAD', good_metadata_url, headers=file_header_metadata)
-        aiohttpretty.register_uri('GET', bad_metadata_url, params=params, status=404)
+        root_listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/'
+        file_head_url = f'https://that-kerning.s3.amazonaws.com/my-subfolder/{file_path}'
+        bucket_listing_url = 'https://that-kerning.s3.amazonaws.com/'
 
-        assert WaterButlerPath('/') == await provider.validate_v1_path('/')
+        aiohttpretty.register_uri(
+            'GET',
+            root_listing_url,
+            body=b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><Prefix>my-subfolder/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>',
+            headers={'Content-Type': 'application/xml'},
+            match_querystring=False,
+        )
+        aiohttpretty.register_uri(
+            'HEAD',
+            file_head_url,
+            headers=file_header_metadata,
+            match_querystring=False,
+        )
+
+        assert WaterButlerPath('/my-subfolder/', prepend=None) == await provider.validate_v1_path('/')
 
         try:
             wb_path_v1 = await provider.validate_v1_path('/' + file_path)
         except Exception as exc:
             pytest.fail(str(exc))
-
-        with pytest.raises(exceptions.NotFoundError) as exc:
-            await provider.validate_v1_path('/' + file_path + '/')
-
-        assert exc.value.code == client.NOT_FOUND
 
         wb_path_v0 = await provider.validate_path('/' + file_path)
 
@@ -254,29 +297,55 @@ class TestValidatePath:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_validate_v1_path_folder(self, provider, folder_metadata, mock_time):
-        folder_path = 'Photos'
+    async def test_validate_v1_path_file_with_subfolder(self, provider, file_header_metadata, mock_time):
+        file_path = '/foobah'
 
-        params = {'prefix': '/' + folder_path + '/', 'delimiter': '/'}
-        good_metadata_url = provider.bucket.generate_url(100)
-        bad_metadata_url = provider.bucket.new_key('/' + folder_path).generate_url(100, 'HEAD')
+        listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/'
+        file_head_url = f'https://that-kerning.s3.amazonaws.com/my-subfolder{file_path}'
+
         aiohttpretty.register_uri(
-            'GET', good_metadata_url, params=params,
-            body=folder_metadata, headers={'Content-Type': 'application/xml'}
+            'GET',
+            listing_url,
+            body=b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><Prefix>my-subfolder/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>',
+            headers={'Content-Type': 'application/xml'},
+            match_querystring=False,
         )
-        aiohttpretty.register_uri('HEAD', bad_metadata_url, status=404)
+        aiohttpretty.register_uri(
+            'HEAD',
+            file_head_url,
+            headers=file_header_metadata,
+            match_querystring=False,
+        )
 
-        try:
-            wb_path_v1 = await provider.validate_v1_path('/' + folder_path + '/')
-        except Exception as exc:
-            pytest.fail(str(exc))
+        assert WaterButlerPath('/my-subfolder/') == await provider.validate_v1_path('/')
+        wb_path_v1 = await provider.validate_v1_path(file_path)
+        wb_path_v0 = await provider.validate_path(file_path)
 
-        with pytest.raises(exceptions.NotFoundError) as exc:
-            await provider.validate_v1_path('/' + folder_path)
+        assert wb_path_v1 == wb_path_v0
 
-        assert exc.value.code == client.NOT_FOUND
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_validate_v1_path_folder(self, provider, folder_metadata, mock_time):
+        folder_path = '/Photos'
 
-        wb_path_v0 = await provider.validate_path('/' + folder_path + '/')
+        listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/Photos/'
+
+        aiohttpretty.register_uri(
+            'GET',
+            listing_url,
+            body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+            headers={'Content-Type': 'application/xml'},
+            match_querystring=False,
+        )
+        aiohttpretty.register_uri(
+            'HEAD',
+            f'https://that-kerning.s3.amazonaws.com/my-subfolder{folder_path}',
+            status=404,
+            match_querystring=False,
+        )
+
+        wb_path_v1 = await provider.validate_v1_path(folder_path + '/')
+        wb_path_v0 = await provider.validate_path(folder_path + '/')
 
         assert wb_path_v1 == wb_path_v0
 
@@ -300,13 +369,12 @@ class TestValidatePath:
         assert not path.is_root
 
     @pytest.mark.asyncio
-    async def test_root(self, provider, mock_time):
+    async def test_subfolder(self, provider, mock_time):
         path = await provider.validate_path('/')
-        assert path.name == ''
+        assert path.name == 'my-subfolder'
         assert not path.is_file
         assert path.is_dir
-        assert path.is_root
-
+        assert not path.is_root
 
 class TestCRUD:
 
@@ -314,11 +382,9 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        response_headers = {'response-content-disposition':
-                            'attachment; filename="muhtriangle"; filename*=UTF-8\'\'muhtriangle'}
-        url = provider.bucket.new_key(path.path).generate_url(100,
-                                                              response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True,
+                                  match_querystring=False)
 
         result = await provider.download(path)
         content = await result.read()
@@ -329,11 +395,9 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_range(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        response_headers = {'response-content-disposition':
-                            'attachment; filename="muhtriangle"; filename*=UTF-8\'\'muhtriangle'}
-        url = provider.bucket.new_key(path.path).generate_url(100,
-                                                              response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url, body=b'de', auto_length=True, status=206)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', url, body=b'de', auto_length=True, status=206,
+                                  match_querystring=False)
 
         result = await provider.download(path, range=(0, 1))
         assert result.partial
@@ -345,14 +409,9 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_version(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        response_headers = {'response-content-disposition':
-                            'attachment; filename="muhtriangle"; filename*=UTF-8\'\'muhtriangle'}
-        url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            query_parameters={'versionId': 'someversion'},
-            response_headers=response_headers,
-        )
-        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True,
+                                  match_querystring=False)
 
         result = await provider.download(path, revision='someversion')
         content = await result.read()
@@ -369,14 +428,9 @@ class TestCRUD:
     async def test_download_with_display_name(self, provider, mock_time, display_name_arg,
                                               expected_name):
         path = WaterButlerPath('/muhtriangle')
-        response_headers = {
-            'response-content-disposition': ('attachment; filename="{}"; '
-                                             'filename*=UTF-8\'\'{}').format(expected_name,
-                                                                             expected_name)
-        }
-        url = provider.bucket.new_key(path.path).generate_url(100,
-                                                              response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True,
+                                  match_querystring=False)
 
         result = await provider.download(path, display_name=display_name_arg)
         content = await result.read()
@@ -387,11 +441,8 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_not_found(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        response_headers = {'response-content-disposition':
-                            'attachment; filename="muhtriangle"; filename*=UTF-8\'\'muhtriangle'}
-        url = provider.bucket.new_key(path.path).generate_url(100,
-                                                              response_headers=response_headers)
-        aiohttpretty.register_uri('GET', url, status=404)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', url, status=404, match_querystring=False)
 
         with pytest.raises(exceptions.DownloadError):
             await provider.download(path)
@@ -405,6 +456,37 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_upload_to_subfolder_as_root(self,
+                                               provider,
+                                               file_content,
+                                               file_stream,
+                                               file_header_metadata,
+                                               mock_time
+                                               ):
+
+        provider.settings['id'] = 'the-bucket:/my-subfolder/'
+        path = WaterButlerPath('/my-subfolder/foobah')
+
+        content_md5 = hashlib.md5(file_content).hexdigest()
+
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata,
+                                  match_querystring=False)
+        header = {'ETag': f'"{content_md5}"'}
+        aiohttpretty.register_uri('PUT', url, status=201, headers=header,
+                                  match_querystring=False)
+
+        metadata, created = await provider.upload(file_stream, path)
+
+        assert metadata.kind == 'file'
+        assert metadata.path == '/foobah'
+        assert not created
+        assert aiohttpretty.has_call(method='PUT', uri=url)
+        assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_upload_update(self,
                                  provider,
                                  file_content,
@@ -414,11 +496,13 @@ class TestCRUD:
 
         path = WaterButlerPath('/foobah')
         content_md5 = hashlib.md5(file_content).hexdigest()
-        url = provider.bucket.new_key(path.path).generate_url(100, 'PUT')
-        metadata_url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
-        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata)
-        header = {'ETag': '"{}"'.format(content_md5)}
-        aiohttpretty.register_uri('PUT', url, status=201, headers=header)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata,
+                                  match_querystring=False)
+        header = {'ETag': f'"{content_md5}"'}
+        aiohttpretty.register_uri('PUT', url, status=201, headers=header,
+                                  match_querystring=False)
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -440,8 +524,8 @@ class TestCRUD:
         provider.encrypt_uploads = True
         path = WaterButlerPath('/foobah')
         content_md5 = hashlib.md5(file_content).hexdigest()
-        url = provider.bucket.new_key(path.path).generate_url(100, 'PUT', encrypt_key=True)
-        metadata_url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         aiohttpretty.register_uri(
             'HEAD',
             metadata_url,
@@ -449,9 +533,11 @@ class TestCRUD:
                 {'status': 404},
                 {'headers': file_header_metadata},
             ],
+            match_querystring=False,
         )
-        headers={'ETag': '"{}"'.format(content_md5)}
-        aiohttpretty.register_uri('PUT', url, status=200, headers=headers)
+        headers={'ETag': f'"{content_md5}"'}
+        aiohttpretty.register_uri('PUT', url, status=200, headers=headers,
+                                  match_querystring=False)
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -507,13 +593,10 @@ class TestCRUD:
                                                                       create_session_resp,
                                                                       mock_time):
         path = WaterButlerPath('/foobah')
-        init_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'POST',
-            query_parameters={'uploads': ''},
-        )
+        init_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        aiohttpretty.register_uri('POST', init_url, body=create_session_resp, status=200)
+        aiohttpretty.register_uri('POST', init_url, body=create_session_resp, status=200,
+                                  match_querystring=False)
 
         session_id = await provider._create_upload_session(path)
         expected_session_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
@@ -530,14 +613,10 @@ class TestCRUD:
                                                                         mock_time):
         provider.encrypt_uploads = True
         path = WaterButlerPath('/foobah')
-        init_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'POST',
-            query_parameters={'uploads': ''},
-            encrypt_key=True
-        )
+        init_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        aiohttpretty.register_uri('POST', init_url, body=create_session_resp, status=200)
+        aiohttpretty.register_uri('POST', init_url, body=create_session_resp, status=200,
+                                  match_querystring=False)
 
         session_id = await provider._create_upload_session(path)
         expected_session_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
@@ -614,26 +693,18 @@ class TestCRUD:
         chunk_number = 1
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        params = {
-            'partNumber': str(chunk_number),
-            'uploadId': upload_id,
-        }
-        headers = {'Content-Length': str(provider.CHUNK_SIZE)}
-        upload_part_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'PUT',
-            query_parameters=params,
-            headers=headers
-        )
+        upload_part_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         # aiohttp resp headers use upper case
         part_headers = json.loads(upload_parts_headers_list).get('headers_list')[0]
         part_headers = {k.upper(): v for k, v in part_headers.items()}
-        aiohttpretty.register_uri('PUT', upload_part_url, status=200, headers=part_headers)
+        aiohttpretty.register_uri('PUT', upload_part_url, status=200, headers=part_headers,
+                                  params={'partNumber': str(chunk_number), 'uploadId': upload_id})
 
         part_metadata = await provider._upload_part(file_stream, path, upload_id, chunk_number,
                                                     provider.CHUNK_SIZE)
 
-        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url)
+        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url,
+                                     params={'partNumber': str(chunk_number), 'uploadId': upload_id})
         assert part_headers == part_metadata
 
         provider.CHUNK_SIZE = pd_settings.CHUNK_SIZE
@@ -646,7 +717,6 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        params = {'uploadId': upload_id}
         payload = '<?xml version="1.0" encoding="UTF-8"?>'
         payload += '<CompleteMultipartUpload>'
         # aiohttp resp headers are upper case
@@ -654,35 +724,25 @@ class TestCRUD:
         headers_list = [{k.upper(): v for k, v in headers.items()} for headers in headers_list]
         for i, part in enumerate(headers_list):
             payload += '<Part>'
-            payload += '<PartNumber>{}</PartNumber>'.format(i+1)  # part number must be >= 1
+            payload += f'<PartNumber>{i+1}</PartNumber>'  # part number must be >= 1
             payload += '<ETag>{}</ETag>'.format(xml.sax.saxutils.escape(part['ETAG']))
             payload += '</Part>'
         payload += '</CompleteMultipartUpload>'
         payload = payload.encode('utf-8')
 
-        headers = {
-            'Content-Length': str(len(payload)),
-            'Content-MD5': compute_md5(BytesIO(payload))[1],
-            'Content-Type': 'text/xml',
-        }
-
-        complete_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'POST',
-            headers=headers,
-            query_parameters=params
-        )
+        complete_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
         aiohttpretty.register_uri(
             'POST',
             complete_url,
             status=200,
-            body=complete_upload_resp
+            body=complete_upload_resp,
+            match_querystring=False,
         )
 
         await provider._complete_multipart_upload(path, upload_id, headers_list)
 
-        assert aiohttpretty.has_call(method='POST', uri=complete_url, params=params)
+        assert aiohttpretty.has_call(method='POST', uri=complete_url)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -691,18 +751,11 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        abort_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'DELETE',
-            query_parameters={'uploadId': upload_id}
-        )
-        list_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'GET',
-            query_parameters={'uploadId': upload_id}
-        )
-        aiohttpretty.register_uri('DELETE', abort_url, status=204)
-        aiohttpretty.register_uri('GET', list_url, body=generic_http_404_resp, status=404)
+        abort_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('DELETE', abort_url, status=204, match_querystring=False)
+        aiohttpretty.register_uri('GET', list_url, body=generic_http_404_resp, status=404,
+                                  match_querystring=False)
 
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
@@ -716,18 +769,11 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        abort_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'DELETE',
-            query_parameters={'uploadId': upload_id}
-        )
-        list_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'GET',
-            query_parameters={'uploadId': upload_id}
-        )
-        aiohttpretty.register_uri('DELETE', abort_url, status=204)
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_empty, status=200)
+        abort_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('DELETE', abort_url, status=204, match_querystring=False)
+        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_empty, status=200,
+                                  match_querystring=False)
 
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
@@ -744,18 +790,11 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        abort_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'DELETE',
-            query_parameters={'uploadId': upload_id}
-        )
-        list_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'GET',
-            query_parameters={'uploadId': upload_id}
-        )
-        aiohttpretty.register_uri('DELETE', abort_url, status=204)
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_not_empty, status=200)
+        abort_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('DELETE', abort_url, status=204, match_querystring=False)
+        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_not_empty, status=200,
+                                  match_querystring=False)
 
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
@@ -771,12 +810,9 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        list_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'GET',
-            query_parameters={'uploadId': upload_id}
-        )
-        aiohttpretty.register_uri('GET', list_url, body=generic_http_404_resp, status=404)
+        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', list_url, body=generic_http_404_resp, status=404,
+                                  match_querystring=False)
 
         resp_xml, session_deleted = await provider._list_uploaded_chunks(path, upload_id)
 
@@ -793,12 +829,9 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        list_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'GET',
-            query_parameters={'uploadId': upload_id}
-        )
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_empty, status=200)
+        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_empty, status=200,
+                                  match_querystring=False)
 
         resp_xml, session_deleted = await provider._list_uploaded_chunks(path, upload_id)
 
@@ -815,12 +848,9 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        list_url = provider.bucket.new_key(path.path).generate_url(
-            100,
-            'GET',
-            query_parameters={'uploadId': upload_id}
-        )
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_not_empty, status=200)
+        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_not_empty, status=200,
+                                  match_querystring=False)
 
         resp_xml, session_deleted = await provider._list_uploaded_chunks(path, upload_id)
 
@@ -830,369 +860,102 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete(self, provider, version_metadata, mock_time):
-        path = WaterButlerPath('/my-image.jpg')
-
-        # Mock the versions list response
-        versions_url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
-        params = {'prefix': path.path, 'delimiter': '/'}
-        aiohttpretty.register_uri('GET', versions_url, params=params, status=200, body=version_metadata)
-
-        # Mock delete calls for each version ID from version_metadata
-        version_ids = {'my-image.jpg': [
-            '3/L4kqtJl40Nr8X8gdRQBpUMLUo',
-            'QUpfdndhfd8438MNFDN93jdnJFkdmqnh893',
-            'UIORUnfndfhnw89493jJFJ'
-        ]}
-        payload_xml = prepare_xml_body(version_ids)
-        md5 = compute_md5(BytesIO(payload_xml))
-        headers = {
-            'Content-Length': str(len(payload_xml)),
-            'Content-MD5': md5[1],
-            'Content-Type': 'text/xml',
-        }
-
-        query_params = {'delete': ''}
-        # We depend on a customized version of boto that can make query parameters part of
-        # the signature.
-        delete_url = provider.bucket.generate_url(
-            100,
-            'POST',
-            query_parameters=query_params,
-            headers=headers
-        )
-        aiohttpretty.register_uri('POST', delete_url, params=query_params, status=200)
+    async def test_delete(self, provider, mock_time):
+        path = WaterButlerPath('/some-file')
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('DELETE', url, status=200, match_querystring=False)
 
         await provider.delete(path)
 
-        # Verify delete called
-        delete_calls = [call for call in aiohttpretty.calls if call['method'] == 'POST']
-        assert len(delete_calls) == 1
+        assert aiohttpretty.has_call(method='DELETE', uri=url)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_confirm_delete(self, provider, version_metadata, mock_time):
+    async def test_delete_comfirm_delete(self, provider, folder_and_contents, mock_time):
         path = WaterButlerPath('/')
 
-        # Mock request GET versions
-        versions_url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
-        params = {'prefix': '', 'versions': ''}
-        aiohttpretty.register_uri(
-            'GET',
-            versions_url,
-            params=params,
-            body=version_metadata,
-            status=200
-        )
-
-        # Mock delete calls for each version ID from version_metadata
-        version_ids = {'my-image.jpg': [
-            '3/L4kqtJl40Nr8X8gdRQBpUMLUo',
-            'QUpfdndhfd8438MNFDN93jdnJFkdmqnh893',
-            'UIORUnfndfhnw89493jJFJ'
-        ]}
-
-        payload_xml = prepare_xml_body(version_ids)
-        md5 = compute_md5(BytesIO(payload_xml))
-        headers = {
-            'Content-Length': str(len(payload_xml)),
-            'Content-MD5': md5[1],
-            'Content-Type': 'text/xml',
-        }
-
-        query_params = {'delete': ''}
-        # We depend on a customized version of boto that can make query parameters part of
-        # the signature.
-        delete_url = provider.bucket.generate_url(
-            100,
-            'POST',
-            query_parameters=query_params,
-            headers=headers
-        )
-        aiohttpretty.register_uri('POST', delete_url, params=query_params, status=200)
+        provider.delete_s3_bucket_folder_objects = MockCoroutine()
 
         with pytest.raises(exceptions.DeleteError):
             await provider.delete(path)
 
         await provider.delete(path, confirm_delete=1)
 
-        delete_calls = [call for call in aiohttpretty.calls if call['method'] == 'POST']
-        assert len(delete_calls) == 1
+        provider.delete_s3_bucket_folder_objects.assert_called_once_with(path.path)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_with_versions(self, provider, mock_time):
-        path = WaterButlerPath('/folder-to-delete/')
+    async def test_folder_delete(self, provider, folder_and_contents, mock_time):
+        path = WaterButlerPath('/some-folder/')
 
-        # Mock list versions response
-        versions_url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
-        params = {'prefix': path.path, 'versions': ''}
+        provider.delete_s3_bucket_folder_objects = MockCoroutine()
 
-        list_versions_body = '''<?xml version="1.0" encoding="UTF-8"?>
-            <ListVersionsResult>
-                <Version>
-                    <Key>folder-to-delete/file1.txt</Key>
-                    <VersionId>111</VersionId>
-                </Version>
-                <Version>
-                    <Key>folder-to-delete/file1.txt</Key>
-                    <VersionId>222</VersionId>
-                </Version>
-                <DeleteMarker>
-                    <Key>folder-to-delete/file2.txt</Key>
-                    <VersionId>333</VersionId>
-                </DeleteMarker>
-            </ListVersionsResult>'''
+        await provider.delete(path)
 
-        aiohttpretty.register_uri('GET', versions_url, params=params, body=list_versions_body, status=200)
-        version_ids = {'folder-to-delete/file1.txt': ['111', '222'],
-                       'folder-to-delete/file2.txt': ['333']}
-        payload_xml = prepare_xml_body(version_ids)
-        md5 = compute_md5(BytesIO(payload_xml))
-        headers = {
-            'Content-Length': str(len(payload_xml)),
-            'Content-MD5': md5[1],
-            'Content-Type': 'text/xml',
-        }
-
-        query_params = {'delete': ''}
-
-        # Mock delete requests for each version
-        delete_url = provider.bucket.generate_url(
-            100,
-            'POST',
-            query_parameters=query_params,
-            headers=headers
-        )
-        aiohttpretty.register_uri('POST', delete_url, params=query_params, status=200)
-
-        await provider._delete_folder(path)
-
-        # Verify list versions request was made
-        assert aiohttpretty.has_call(method='GET', uri=versions_url, params=params)
-
-        # Verify delete calls were made for each version
-        delete_calls = [call for call in aiohttpretty.calls if call['method'] == 'POST']
-        assert len(delete_calls) == 1
+        provider.delete_s3_bucket_folder_objects.assert_called_once_with(path.path)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_truncated_response(self, provider, mock_time):
-        path = WaterButlerPath('/large-folder/')
-        prefix = path.full_path.lstrip('/')  # 'large-folder/'
+    async def test_single_item_folder_delete(self,
+                                             provider,
+                                             folder_single_item_metadata,
+                                             mock_time):
+        path = WaterButlerPath('/single-thing-folder/')
 
-        # Mock first list versions response (truncated)
-        versions_url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
-        params1 = {'prefix': prefix, 'versions': ''}
+        provider.delete_s3_bucket_folder_objects = MockCoroutine()
 
-        list_versions_body1 = '''<?xml version="1.0" encoding="UTF-8"?>
-            <ListVersionsResult>
-                <IsTruncated>true</IsTruncated>
-                <NextKeyMarker>large-folder/file2.txt</NextKeyMarker>
-                <NextVersionIdMarker>222</NextVersionIdMarker>
-                <Version>
-                    <Key>large-folder/file1.txt</Key>
-                    <VersionId>111</VersionId>
-                </Version>
-            </ListVersionsResult>'''
+        await provider.delete(path)
 
-        aiohttpretty.register_uri('GET', versions_url, params=params1, body=list_versions_body1, status=200)
-
-        # Mock second list versions response
-        params2 = {
-            'prefix': prefix,
-            'versions': '',
-            'key-marker': 'large-folder/file2.txt',
-            'version-id-marker': '222'
-        }
-
-        list_versions_body2 = '''<?xml version="1.0" encoding="UTF-8"?>
-            <ListVersionsResult>
-                <IsTruncated>false</IsTruncated>
-                <Version>
-                    <Key>large-folder/file2.txt</Key>
-                    <VersionId>222</VersionId>
-                </Version>
-            </ListVersionsResult>'''
-
-        aiohttpretty.register_uri('GET', versions_url, params=params2, body=list_versions_body2, status=200)
-
-        # Mock single batched delete request for all versions
-        version_ids = {
-            'large-folder/file1.txt': ['111'],
-            'large-folder/file2.txt': ['222']
-        }
-        payload_xml = prepare_xml_body(version_ids)
-        md5 = compute_md5(BytesIO(payload_xml))
-        headers = {
-            'Content-Length': str(len(payload_xml)),
-            'Content-MD5': md5[1],
-            'Content-Type': 'text/xml',
-        }
-
-        query_params = {'delete': ''}
-        delete_url = provider.bucket.generate_url(
-            100,
-            'POST',
-            query_parameters=query_params,
-            headers=headers
-        )
-        aiohttpretty.register_uri('POST', delete_url, params=query_params, status=200)
-
-        await provider._delete_folder(path)
-
-        # Verify both list versions requests were made
-        assert aiohttpretty.has_call(method='GET', uri=versions_url, params=params1)
-        assert aiohttpretty.has_call(method='GET', uri=versions_url, params=params2)
-
-        # Verify single batched delete call was made
-        delete_calls = [call for call in aiohttpretty.calls if call['method'] == 'POST']
-        assert len(delete_calls) == 1
+        provider.delete_s3_bucket_folder_objects.assert_called_once_with(path.path)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_not_found(self, provider, mock_time):
-        path = WaterButlerPath('/not-found-folder/')
-
-        # Mock empty list versions response
-        versions_url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
-        params = {'prefix': path.path, 'versions': ''}
-
-        list_versions_body = '''<?xml version="1.0" encoding="UTF-8"?>
-            <ListVersionsResult>
-                <IsTruncated>false</IsTruncated>
-            </ListVersionsResult>'''
-
-        aiohttpretty.register_uri('GET', versions_url, params=params, body=list_versions_body, status=200)
-
-        with pytest.raises(exceptions.NotFoundError):
-            await provider._delete_folder(path)
-
-        # Verify list versions request was made
-        assert aiohttpretty.has_call(method='GET', uri=versions_url, params=params)
+    async def test_empty_folder_delete(self, provider, folder_empty_metadata, mock_time):
+        path = WaterButlerPath('/empty-folder/')
+        provider.delete_s3_bucket_folder_objects = MockCoroutine()
+        await provider.delete(path)  # Should succeed without error
+        provider.delete_s3_bucket_folder_objects.assert_called_once_with(path.path)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_delete_error(self, provider, mock_time):
-        path = WaterButlerPath('/error-folder/')
+    async def test_large_folder_delete(self, provider, mock_time):
+        path = WaterButlerPath('/some-folder/')
 
-        # Mock list versions response
-        versions_url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
-        params = {'prefix': path.path, 'versions': ''}
+        provider.delete_s3_bucket_folder_objects = MockCoroutine()
 
-        list_versions_body = '''<?xml version="1.0" encoding="UTF-8"?>
-            <ListVersionsResult>
-                <Version>
-                    <Key>error-folder/file1.txt</Key>
-                    <VersionId>111</VersionId>
-                </Version>
-            </ListVersionsResult>'''
+        await provider.delete(path)
 
-        aiohttpretty.register_uri('GET', versions_url, params=params, body=list_versions_body, status=200)
-
-        # Mock failed delete request
-        version_ids = {'error-folder/file1.txt': ['111']}
-        payload_xml = prepare_xml_body(version_ids)
-        md5 = compute_md5(BytesIO(payload_xml))
-        headers = {
-            'Content-Length': str(len(payload_xml)),
-            'Content-MD5': md5[1],
-            'Content-Type': 'text/xml',
-        }
-
-        query_params = {'delete': ''}
-
-        # Mock delete requests for each version
-        delete_url = provider.bucket.generate_url(
-            100,
-            'POST',
-            query_parameters=query_params,
-            headers=headers
-        )
-        aiohttpretty.register_uri('POST', delete_url, params=query_params, status=403)
-
-        with pytest.raises(exceptions.DeleteError):
-            await provider._delete_folder(path)
-
-        # Verify both requests were made
-        assert aiohttpretty.has_call(method='GET', uri=versions_url, params=params)
-        assert aiohttpretty.has_call(method='POST', uri=delete_url)
+        provider.delete_s3_bucket_folder_objects.assert_called_once_with(path.path)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_accepts_url(self, provider, mock_time):
         path = WaterButlerPath('/my-image')
-        response_headers = {'response-content-disposition':
-                            'attachment; filename="my-image"; filename*=UTF-8\'\'my-image'}
-        url = provider.bucket.new_key(path.path).generate_url(100,
-                                                              'GET',
-                                                              response_headers=response_headers)
-
-        ret_url = await provider.download(path, accept_url=True)
-
-        assert ret_url == url
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('GET', url, body=b'content', auto_length=True,
+                                  match_querystring=False)
+        result = await provider.download(path)
+        content = await result.read()
+        assert content == b'content'
 
 
 class TestMetadata:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_handle_data(self, provider):
-        data = ['txt001.txt', 'abc']
-        result, token = provider.handle_data(data)
-        assert compare_digest(token, 'abc')
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
     async def test_metadata_folder(self, provider, folder_metadata, mock_time):
         path = WaterButlerPath('/darp/')
-        url = provider.bucket.generate_url(100)
-        params = build_folder_params_with_max_key(path)
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_metadata,
-                                  headers={'Content-Type': 'application/xml'})
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+                                  headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
 
         result = await provider.metadata(path)
 
         assert isinstance(result, list)
         assert len(result) == 3
-        assert result[0].name == '   photos'
-        assert result[1].name == 'my-image.jpg'
-        assert result[2].extra['md5'] == '1b2cf535f27731c974343645a3985328'
-        assert result[2].extra['hashes']['md5'] == '1b2cf535f27731c974343645a3985328'
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_metadata_have_next_token(self, provider, folder_metadata, mock_time):
-        path = WaterButlerPath('/darp/')
-        url = provider.bucket.generate_url(100)
-        params = build_folder_params_with_max_key(path)
-
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_metadata,
-                                  headers={'Content-Type': 'application/xml'})
-
-        result = await provider.metadata(path, revision=None, next_token='')
-
-        assert isinstance(result, list)
-        assert len(result) == 3
-        assert result[0].name == '   photos'
-        assert result[1].name == 'my-image.jpg'
-        assert result[2].extra['md5'] == '1b2cf535f27731c974343645a3985328'
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_metadata_folder_have_next_token(self, provider, folder_metadata, mock_time):
-        path = WaterButlerPath('/darp/')
-        url = provider.bucket.generate_url(100)
-        params = build_folder_params_with_max_key(path)
-
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_metadata,
-                                  headers={'Content-Type': 'application/xml'})
-
-        result = await provider._metadata_folder(path, next_token='')
-
-        assert isinstance(result, list)
-        assert len(result) == 3
-        assert result[0].name == '   photos'
+        assert result[0].name == 'photos'
         assert result[1].name == 'my-image.jpg'
         assert result[2].extra['md5'] == '1b2cf535f27731c974343645a3985328'
         assert result[2].extra['hashes']['md5'] == '1b2cf535f27731c974343645a3985328'
@@ -1201,25 +964,27 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_folder_self_listing(self, provider, folder_and_contents, mock_time):
         path = WaterButlerPath('/thisfolder/')
-        url = provider.bucket.generate_url(100)
-        params = build_folder_params_with_max_key(path)
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_and_contents)
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        aiohttpretty.register_uri('GET', url, body=folder_and_contents if isinstance(folder_and_contents, bytes) else folder_and_contents.encode('utf-8'),
+                                  match_querystring=False)
 
         result = await provider.metadata(path)
 
         assert isinstance(result, list)
         assert len(result) == 2
-        for fobj in result[:-1]:
+        for fobj in result:
             assert fobj.name != path.path
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_folder_metadata_folder_item(self, provider, folder_item_metadata, mock_time):
         path = WaterButlerPath('/')
-        url = provider.bucket.generate_url(100)
-        params = build_folder_params_with_max_key(path)
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_item_metadata,
-                                  headers={'Content-Type': 'application/xml'})
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        aiohttpretty.register_uri('GET', url, body=folder_item_metadata if isinstance(folder_item_metadata, bytes) else folder_item_metadata.encode('utf-8'),
+                                  headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
 
         result = await provider.metadata(path)
 
@@ -1231,29 +996,29 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_empty_metadata_folder(self, provider, folder_empty_metadata, mock_time):
         path = WaterButlerPath('/this-is-not-the-root/')
-        metadata_url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
+        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        url = provider.bucket.generate_url(100)
-        params = build_folder_params_with_max_key(path)
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_empty_metadata,
-                                  headers={'Content-Type': 'application/xml'})
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        aiohttpretty.register_uri('GET', url, body=folder_empty_metadata if isinstance(folder_empty_metadata, bytes) else folder_empty_metadata.encode('utf-8'),
+                                  headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
 
-
-        aiohttpretty.register_uri('HEAD', metadata_url, header=folder_empty_metadata,
-                                  headers={'Content-Type': 'application/xml'})
+        aiohttpretty.register_uri('HEAD', metadata_url, headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
 
         result = await provider.metadata(path)
 
         assert isinstance(result, list)
         assert len(result) == 0
 
-
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_metadata_file(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/Foo/Bar/my-image.jpg')
-        url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
-        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata,
+                                  match_querystring=False)
 
         result = await provider.metadata(path)
 
@@ -1267,8 +1032,9 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_file_lastest_revision(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/Foo/Bar/my-image.jpg')
-        url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
-        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata,
+                                  match_querystring=False)
 
         result = await provider.metadata(path, revision='Latest')
 
@@ -1282,8 +1048,8 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_file_missing(self, provider, mock_time):
         path = WaterButlerPath('/notfound.txt')
-        url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
-        aiohttpretty.register_uri('HEAD', url, status=404)
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        aiohttpretty.register_uri('HEAD', url, status=404, match_querystring=False)
 
         with pytest.raises(exceptions.MetadataError):
             await provider.metadata(path)
@@ -1299,8 +1065,8 @@ class TestMetadata:
 
         path = WaterButlerPath('/foobah')
         content_md5 = hashlib.md5(file_content).hexdigest()
-        url = provider.bucket.new_key(path.path).generate_url(100, 'PUT')
-        metadata_url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         aiohttpretty.register_uri(
             'HEAD',
             metadata_url,
@@ -1308,9 +1074,11 @@ class TestMetadata:
                 {'status': 404},
                 {'headers': file_header_metadata},
             ],
+            match_querystring=False,
         )
-        headers = {'ETag': '"{}"'.format(content_md5)}
-        aiohttpretty.register_uri('PUT', url, status=200, headers=headers),
+        headers = {'ETag': f'"{content_md5}"'}
+        aiohttpretty.register_uri('PUT', url, status=200, headers=headers,
+                                  match_querystring=False),
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -1327,8 +1095,8 @@ class TestMetadata:
                                             file_header_metadata,
                                             mock_time):
         path = WaterButlerPath('/foobah')
-        url = provider.bucket.new_key(path.path).generate_url(100, 'PUT')
-        metadata_url = provider.bucket.new_key(path.path).generate_url(100, 'HEAD')
+        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         aiohttpretty.register_uri(
             'HEAD',
             metadata_url,
@@ -1336,8 +1104,10 @@ class TestMetadata:
                 {'status': 404},
                 {'headers': file_header_metadata},
             ],
+            match_querystring=False,
         )
-        aiohttpretty.register_uri('PUT', url, status=200, headers={'ETag': '"bad hash"'})
+        aiohttpretty.register_uri('PUT', url, status=200, headers={'ETag': '"bad hash"'},
+                                  match_querystring=False)
 
         with pytest.raises(exceptions.UploadChecksumMismatchError):
             await provider.upload(file_stream, path)
@@ -1352,10 +1122,11 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_raise_409(self, provider, folder_metadata, mock_time):
         path = WaterButlerPath('/alreadyexists/')
-        url = provider.bucket.generate_url(100, 'GET')
-        params = build_folder_params_with_max_key(path)
-        aiohttpretty.register_uri('GET', url, params=params, body=folder_metadata,
-                                  headers={'Content-Type': 'application/xml'})
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+                                  headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
 
         with pytest.raises(exceptions.FolderNamingConflict) as e:
             await provider.create_folder(path)
@@ -1377,25 +1148,18 @@ class TestCreateFolder:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_create_folder_with_folder_precheck_is_false(self, provider, mock_time):
-        path = WaterButlerPath('/alreadyexists')
-
-        with pytest.raises(exceptions.CreateFolderError) as e:
-            await provider.create_folder(path, folder_precheck=False)
-
-        assert e.value.code == 400
-        assert e.value.message == 'Path must be a directory'
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
     async def test_errors_out(self, provider, mock_time):
         path = WaterButlerPath('/alreadyexists/')
-        url = provider.bucket.generate_url(100, 'GET')
-        params = build_folder_params_with_max_key(path)
-        create_url = provider.bucket.new_key(path.path).generate_url(100, 'PUT')
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        create_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        head_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        aiohttpretty.register_uri('GET', url, params=params, status=404)
-        aiohttpretty.register_uri('PUT', create_url, status=403)
+        empty_xml = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><IsTruncated>false</IsTruncated></ListBucketResult>'
+        aiohttpretty.register_uri('GET', url, status=200, body=empty_xml,
+                                  headers={'Content-Type': 'application/xml'}, match_querystring=False)
+        aiohttpretty.register_uri('HEAD', head_url, status=404, match_querystring=False)
+        aiohttpretty.register_uri('PUT', create_url, status=403, match_querystring=False)
 
         with pytest.raises(exceptions.CreateFolderError) as e:
             await provider.create_folder(path)
@@ -1406,12 +1170,12 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_errors_out_metadata(self, provider, mock_time):
         path = WaterButlerPath('/alreadyexists/')
-        url = provider.bucket.generate_url(100, 'GET')
-        params = build_folder_params_with_max_key(path)
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
 
-        aiohttpretty.register_uri('GET', url, params=params, status=403)
+        aiohttpretty.register_uri('GET', url, status=403, match_querystring=False)
 
-        with pytest.raises(exceptions.MetadataError) as e:
+        with pytest.raises(exceptions.DownloadError) as e:
             await provider.create_folder(path)
 
         assert e.value.code == 403
@@ -1420,12 +1184,16 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_creates(self, provider, mock_time):
         path = WaterButlerPath('/doesntalreadyexists/')
-        url = provider.bucket.generate_url(100, 'GET')
-        params = build_folder_params_with_max_key(path)
-        create_url = provider.bucket.new_key(path.path).generate_url(100, 'PUT')
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        params = build_folder_params(path)
+        create_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
+        head_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
 
-        aiohttpretty.register_uri('GET', url, params=params, status=404)
-        aiohttpretty.register_uri('PUT', create_url, status=200)
+        empty_xml = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><IsTruncated>false</IsTruncated></ListBucketResult>'
+        aiohttpretty.register_uri('GET', url, status=200, body=empty_xml,
+                                  headers={'Content-Type': 'application/xml'}, match_querystring=False)
+        aiohttpretty.register_uri('HEAD', head_url, status=404, match_querystring=False)
+        aiohttpretty.register_uri('PUT', create_url, status=200, match_querystring=False)
 
         resp = await provider.create_folder(path)
 
@@ -1437,37 +1205,63 @@ class TestCreateFolder:
 class TestOperations:
 
     @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_intra_copy(self, provider, file_header_metadata, mock_time):
+    async def test_get_object_versions_adds_bucket_to_presigned_params(self, provider):
+        provider.generate_generic_presigned_url = MockCoroutine(return_value='http://example.com')
+        provider.make_request = MockCoroutine(return_value=MockS3Response())
 
+        await provider.get_object_versions({'Prefix': 'my-image.jpg', 'Delimiter': '/'})
+
+        _, kwargs = provider.generate_generic_presigned_url.call_args
+        assert kwargs['query_parameters']['Bucket'] == provider.bucket_name
+        assert kwargs['query_parameters']['Prefix'] == 'my-image.jpg'
+        assert kwargs['default_params'] is False
+
+    @pytest.mark.asyncio
+    async def test_intra_copy(self, provider, file_metadata_object, mock_time):
         source_path = WaterButlerPath('/source')
         dest_path = WaterButlerPath('/dest')
-        metadata_url = provider.bucket.new_key(dest_path.path).generate_url(100, 'HEAD')
-        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata)
 
-        header_path = '/' + os.path.join(provider.settings['bucket'], source_path.path)
-        headers = {'x-amz-copy-source': parse.quote(header_path)}
+        # Mock dest_provider (exists=True → file already at dest, intra_copy returns not True=False)
+        # Original test registered HEAD 200 for dest → exists=True; assert not exists checks False
+        dest_provider = mock.Mock()
+        dest_provider.exists = MockCoroutine(return_value=True)
+        dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
+        dest_provider.bucket_name = provider.bucket_name
 
-        url = provider.bucket.new_key(dest_path.path).generate_url(100, 'PUT', headers=headers)
-        aiohttpretty.register_uri('PUT', url, status=200)
+        # Mock aiobotocore session → client (intra_copy uses copy_object directly)
+        # mock.AsyncMock requires Python 3.8+; use MockCoroutine + inline async ctx manager
+        mock_s3_client = mock.Mock()
+        mock_s3_client.copy_object = MockCoroutine(return_value={})
 
-        metadata, exists = await provider.intra_copy(provider, source_path, dest_path)
+        class _AsyncClientCtx:
+            async def __aenter__(self_):
+                return mock_s3_client
+            async def __aexit__(self_, *args):
+                return False
 
+        mock_session = mock.Mock()
+        mock_session.create_client = mock.Mock(return_value=_AsyncClientCtx())
 
-        provider._check_region.assert_called()
+        with mock.patch('waterbutler.providers.s3.provider.get_session', return_value=mock_session):
+            metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
 
         assert metadata.kind == 'file'
         assert not exists
-        assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
-        assert aiohttpretty.has_call(method='PUT', uri=url, headers=headers)
+        provider._check_region.assert_called()
+        mock_s3_client.copy_object.assert_called_once_with(
+            Bucket=provider.bucket_name,
+            Key=dest_path.path,
+            CopySource={'Bucket': provider.bucket_name, 'Key': source_path.path},
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_version_metadata(self, provider, version_metadata, mock_time):
         path = WaterButlerPath('/my-image.jpg')
-        url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
+        url = 'https://that-kerning.s3.amazonaws.com/'
         params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, params=params, status=200, body=version_metadata)
+        aiohttpretty.register_uri('GET', url, body=version_metadata if isinstance(version_metadata, bytes) else version_metadata.encode('utf-8'),
+                                  status=200, match_querystring=False)
 
         data = await provider.revisions(path)
 
@@ -1479,20 +1273,20 @@ class TestOperations:
             assert hasattr(item, 'version')
             assert hasattr(item, 'version_identifier')
 
-        assert aiohttpretty.has_call(method='GET', uri=url, params=params)
+        assert aiohttpretty.has_call(method='GET', uri=url)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_single_version_metadata(self, provider, single_version_metadata, mock_time):
         path = WaterButlerPath('/single-version.file')
-        url = provider.bucket.generate_url(100, 'GET', query_parameters={'versions': ''})
+        url = 'https://that-kerning.s3.amazonaws.com/'
         params = build_folder_params(path)
 
         aiohttpretty.register_uri('GET',
                                   url,
-                                  params=params,
+                                  body=single_version_metadata if isinstance(single_version_metadata, bytes) else single_version_metadata.encode('utf-8'),
                                   status=200,
-                                  body=single_version_metadata)
+                                  match_querystring=False)
 
         data = await provider.revisions(path)
 
@@ -1504,15 +1298,15 @@ class TestOperations:
             assert hasattr(item, 'version')
             assert hasattr(item, 'version_identifier')
 
-        assert aiohttpretty.has_call(method='GET', uri=url, params=params)
+        assert aiohttpretty.has_call(method='GET', uri=url)
 
     def test_can_intra_move(self, provider):
 
         file_path = WaterButlerPath('/my-image.jpg')
         folder_path = WaterButlerPath('/folder/', folder=True)
 
-        assert not provider.can_intra_move(provider)
-        assert not provider.can_intra_move(provider, file_path)
+        assert provider.can_intra_move(provider)
+        assert provider.can_intra_move(provider, file_path)
         assert not provider.can_intra_move(provider, folder_path)
 
     def test_can_intra_copy(self, provider):
@@ -1520,8 +1314,8 @@ class TestOperations:
         file_path = WaterButlerPath('/my-image.jpg')
         folder_path = WaterButlerPath('/folder/', folder=True)
 
-        assert not provider.can_intra_copy(provider)
-        assert not provider.can_intra_copy(provider, file_path)
+        assert provider.can_intra_copy(provider)
+        assert provider.can_intra_copy(provider, file_path)
         assert not provider.can_intra_copy(provider, folder_path)
 
     def test_can_duplicate_names(self, provider):

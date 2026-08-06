@@ -1,6 +1,7 @@
 import abc
 import typing
 import hashlib
+import importlib
 
 import furl
 
@@ -104,6 +105,36 @@ class BaseMetadata(metaclass=abc.ABCMeta):
         if self.kind == 'folder' and not path.endswith('/'):
             path += '/'
         return path
+
+    def dehydrate(self) -> dict:
+        return self._dehydrate()
+
+    def _dehydrate(self) -> dict:
+        module_name = self.__class__.__module__
+        class_name = self.__class__.__name__
+
+        payload: dict[str, object] = {
+            "__wb_meta__": True,
+            "cls": f"{module_name}.{class_name}",
+            "raw": self.raw,
+        }
+        return payload
+
+    @classmethod
+    def rehydrate(cls, payload) -> dict:
+        module_name, class_name = payload["cls"].rsplit(".", 1)
+        module = importlib.import_module(module_name)
+        meta_cls = getattr(module, class_name)
+
+        args = meta_cls._rehydrate(payload)
+        return meta_cls(*args)  # type: ignore
+
+    @classmethod
+    def _rehydrate(cls, payload):
+        args = [payload["raw"]]
+        if "path" in payload:
+            args.insert(0, payload["path"])
+        return args
 
     @property
     def is_folder(self) -> bool:
