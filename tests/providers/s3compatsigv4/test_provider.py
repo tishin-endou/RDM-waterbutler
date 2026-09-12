@@ -1250,13 +1250,123 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_chunked_upload_storage_quota_exceeded(self, provider, file_stream, mock_time):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
+                    '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message></Error>')
+
+        provider._create_upload_session = MockCoroutine()
+        provider._create_upload_session.return_value = upload_id
+        provider._upload_parts = MockCoroutine()
+        provider._upload_parts.side_effect = storage_error({'response': error_xml}, code=403)
+        provider._abort_chunked_upload = MockCoroutine()
+        provider._abort_chunked_upload.return_value = True
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        # A storage-side quota error must surface as HTTP 507 with an explicit,
+        # user-readable message, and the multipart session must be aborted.
+        assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
+        assert 'QuotaExceeded' in exc.value.message
+        provider._abort_chunked_upload.assert_called_with(path, upload_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_quota_exceeded_and_abort_fails(self, provider, file_stream,
+                                                                 mock_time):
+        # Worst case: the quota error and the abort failure have
+        # to be reported together.  The abort warning is threaded through
+        # _translate_upload_error as ``extra_message``, so it is easy to drop
+        # while keeping both single-fault tests green.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message></Error>')
+
+        provider._create_upload_session = MockCoroutine(return_value=upload_id)
+        provider._upload_parts = MockCoroutine(
+            side_effect=storage_error({'response': error_xml}, code=403))
+        provider._abort_chunked_upload = MockCoroutine(return_value=False)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
+        assert 'QuotaExceeded' in exc.value.message
+        # The abort FAILED, so the manual clean-up warning must also be present.
+        assert 'Please manually remove them.' in exc.value.message
+        provider._abort_chunked_upload.assert_called_with(path, upload_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_contiguous_upload_storage_quota_exceeded(self, provider, file_stream,
+                                                            mock_time):
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message></Error>')
+
+        # ``make_request`` raises ``UploadError`` built by
+        # ``exception_from_response`` when the storage rejects the PUT.
+        provider.make_request = MockCoroutine()
+        provider.make_request.side_effect = exceptions.UploadError({'response': error_xml},
+                                                                   code=403)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._contiguous_upload(file_stream, path)
+
+        # A storage-side quota error must surface as HTTP 507 with an explicit,
+        # user-readable message.
+        assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
+        assert 'QuotaExceeded' in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_contiguous_upload_other_storage_error(self, provider, file_stream,
+                                                         mock_time):
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>AccessDenied</Code>'
+                     '<Message>Access Denied</Message></Error>')
+
+        provider.make_request = MockCoroutine()
+        provider.make_request.side_effect = exceptions.UploadError({'response': error_xml},
+                                                                   code=403)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._contiguous_upload(file_stream, path)
+
+        # Non-quota errors keep the storage's status code but get a readable
+        # message (not the raw XML body).
+        assert exc.value.code == 403
+        assert 'AccessDenied' in exc.value.message
+        assert '<Error' not in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_exception_from_response_contract_xml(self, provider, mock_time,
                                                         generate_url_helper):
-        # ``_parse_s3_error_body`` depends on exception_from_response putting the
-        # XML body into ``data['response']``.  Every other parser test builds
+        # The whole quota translation depends on exception_from_response putting
+        # an XML body into ``data['response']``.  Every other quota test builds
         # that shape by hand, so this one pins down the actual contract: if
         # ``exception_from_response`` ever changes (e.g. resp.json() starts
-        # succeeding), the parser stops seeing a body and only this test fails.
+        # succeeding), the translation breaks silently and only this test fails.
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         url = generate_url_helper(key=path.full_path, method='PUT', expires=100,
                                   headers={}, query_parameters={})
@@ -1294,13 +1404,141 @@ class TestCRUD:
         assert isinstance(exc.value.message, str)
         assert provider._parse_s3_error_body(exc.value) == (None, None)
 
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_contiguous_upload_quota_exceeded_over_http(self, provider, file_stream,
+                                                              mock_time, generate_url_helper):
+        # End-to-end over a simulated HTTP exchange: no hand-built UploadError,
+        # so make_request / exception_from_response / _parse_s3_error_body /
+        # _translate_upload_error are all exercised together.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        url = generate_url_helper(key=path.full_path, method='PUT', expires=100,
+                                  headers={}, query_parameters={})
+        error_body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                      '<Error><Code>QuotaExceeded</Code>'
+                      '<Message>The bucket quota has been exceeded</Message>'
+                      '<RequestId>REQ123</RequestId></Error>')
+        aiohttpretty.register_uri('PUT', url, status=403, body=error_body,
+                                  headers={'Content-Type': 'application/xml'})
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._contiguous_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert exc.value.is_user_error
+        assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
+        assert 'QuotaExceeded' in exc.value.message
+        assert aiohttpretty.has_call(method='PUT', uri=url)
+
+    def test_quota_exceeded_error_codes_defaults(self):
+        codes = pd_settings.QUOTA_EXCEEDED_ERROR_CODES
+        # MinIO returns XMinioStorageFull on the S3 data path when the disk is
+        # full; XMinioAdminBucketQuotaExceeded is the bucket-quota code.
+        assert 'QuotaExceeded' in codes
+        assert 'XMinioAdminBucketQuotaExceeded' in codes
+        assert 'XMinioStorageFull' in codes
+        # Not an S3 error code -- it is an HTTP reason phrase.
+        assert 'InsufficientStorage' not in codes
+
+    def test_translate_upload_error_507_fallback(self, provider):
+        # The storage may answer 507 with an error code we do not know.  The
+        # status alone is enough to treat it as a quota failure.
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>SomeVendorSpecificCode</Code>'
+                     '<Message>no space left</Message></Error>')
+        err = storage_error({'response': error_xml}, code=HTTPStatus.INSUFFICIENT_STORAGE)
+
+        translated = provider._translate_upload_error(err)
+        assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in translated.message
+        assert 'SomeVendorSpecificCode' in translated.message
+        # The 507 fallback is a quota failure like any other, so
+        # it must get the same non-paging treatment as a recognised code.
+        assert translated.is_user_error is True
+
+    def test_translate_upload_error_507_without_xml_body(self, provider):
+        # A 507 with an unparsable body must still become a quota message.
+        err = storage_error('Insufficient Storage', code=HTTPStatus.INSUFFICIENT_STORAGE)
+
+        translated = provider._translate_upload_error(err)
+        assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in translated.message
+        assert translated.is_user_error is True
+
+    def test_translate_upload_error_quota_is_user_error(self, provider):
+        # Filling up a bucket is an expected user-side failure: it must not be
+        # reported to Sentry at error level nor page oncall via 5xx alerts.
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message></Error>')
+        err = storage_error({'response': error_xml}, code=403)
+
+        assert provider._translate_upload_error(err).is_user_error is True
+
+        # Non-quota storage errors are not the user's doing.
+        other_xml = error_xml.replace('QuotaExceeded', 'AccessDenied')
+        other = storage_error({'response': other_xml}, code=403)
+        assert provider._translate_upload_error(other).is_user_error is False
+
+    @pytest.mark.parametrize('label,err_factory', [
+        # Quota, by error code.
+        ('quota-code', lambda: storage_error(
+            {'response': '<Error><Code>QuotaExceeded</Code>'
+                         '<Message>quota</Message>'
+                         '<Resource>/bucket/secret-key-name</Resource></Error>'}, code=403)),
+        # Quota, by HTTP 507 fallback.
+        ('quota-507', lambda: storage_error(
+            {'response': '<Error><Code>Whatever</Code>'
+                         '<Resource>/bucket/secret-key-name</Resource></Error>'},
+            code=HTTPStatus.INSUFFICIENT_STORAGE)),
+        # Classified, but not quota.
+        ('other-code', lambda: storage_error(
+            {'response': '<Error><Code>AccessDenied</Code><Message>nope</Message>'
+                         '<Resource>/bucket/secret-key-name</Resource></Error>'}, code=403)),
+        # Unclassifiable XML.
+        ('unclassifiable', lambda: storage_error(
+            {'response': '<Error><Resource>/bucket/secret-key-name</Resource></Error>'},
+            code=HTTPStatus.BAD_GATEWAY)),
+        # Not XML at all.
+        ('non-xml', lambda: storage_error(
+            {'response': '/bucket/secret-key-name is over quota'}, code=403)),
+        # ``exception_from_response`` builds this shape for a HEAD/no-body
+        # response: a *string* message that embeds the presigned URL.
+        ('default-msg', lambda: storage_error(
+            'An error occurred while making a PUT request to '
+            'https://host/bucket/secret-key-name?X-Amz-Signature=deadbeef', code=403)),
+    ])
+    @pytest.mark.parametrize('extra_message', ['', '  abort failed'])
+    def test_translate_upload_error_never_leaks_raw_body(self, provider, label, err_factory,
+                                                         extra_message):
+        # ``BaseHandler.write_error`` (server/api/v1/core.py:28) writes
+        # ``exc.data`` verbatim as the response body when it is truthy, and
+        # otherwise writes ``exc.message``.  Either way, anything left on the
+        # translated exception is shown to the user -- including the storage's
+        # Resource paths and, on the string-message path, the presigned URL and
+        # its signature.  The translated error must carry a summary only.
+        err = err_factory()
+        translated = provider._translate_upload_error(err, extra_message=extra_message)
+
+        assert translated.data is None, 'raw body would be written as the response body'
+        assert 'secret-key-name' not in translated.message
+        assert 'X-Amz-Signature' not in translated.message
+        if extra_message:
+            assert translated.message.endswith(extra_message)
+
     def test_parse_s3_error_body_non_xml(self, provider):
         err = storage_error({'response': 'not xml at all'}, code=500)
         assert provider._parse_s3_error_body(err) == (None, None)
+        # Unclassifiable, so the translator cannot say anything specific -- but
+        # it must not hand the raw body back to the caller either.
+        translated = provider._translate_upload_error(err)
+        assert translated is not err
+        assert translated.data is None
+        assert 'not xml at all' not in translated.message
 
     def test_parse_s3_error_body_pretty_printed(self, provider):
         # Storages are free to pretty-print their XML.  Surrounding whitespace
-        # must not end up inside the parsed code or message.
+        # must not defeat the quota lookup.
         error_xml = ('<?xml version="1.0" encoding="UTF-8"?>\n'
                      '<Error>\n'
                      '  <Code>\n    QuotaExceeded\n  </Code>\n'
@@ -1308,14 +1546,19 @@ class TestCRUD:
                      '</Error>\n')
         err = storage_error({'response': error_xml}, code=403)
 
-        assert provider._parse_s3_error_body(err) == (
-            'QuotaExceeded', 'The bucket quota has been exceeded')
+        assert provider._parse_s3_error_body(err)[0] == 'QuotaExceeded'
+        translated = provider._translate_upload_error(err)
+        assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in translated.message
 
     def test_parse_s3_error_body_scalar_error_element(self, provider):
         # ``xmltodict`` maps an element without children to a plain string, so
         # ``parsed['Error']`` is not always a dict.
         err = storage_error({'response': '<Error>something went wrong</Error>'}, code=500)
         assert provider._parse_s3_error_body(err) == (None, None)
+        translated = provider._translate_upload_error(err)
+        assert translated is not err
+        assert translated.data is None
 
     def test_parse_s3_error_body_empty_code_element(self, provider):
         # An empty ``<Code/>`` becomes ``None``; an element with attributes only
@@ -1332,7 +1575,8 @@ class TestCRUD:
         # ``xmltodict`` collapses repeated siblings into a list, so a malformed
         # or merged error document gives ``Code`` as ``['A', 'QuotaExceeded']``.
         # Picking one of them would be guesswork, so this is unclassifiable --
-        # and it must not crash from ``.strip()`` on a list either.
+        # but it must stay safe end to end: no crash from ``.strip()`` on a
+        # list, no HTTP 500, and no raw body handed to the user.
         error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
                      '<Error><Code>SlowDown</Code><Code>QuotaExceeded</Code>'
                      '<Message>first</Message><Message>second</Message>'
@@ -1340,6 +1584,11 @@ class TestCRUD:
         err = storage_error({'response': error_xml}, code=403)
 
         assert provider._parse_s3_error_body(err) == (None, None)
+
+        translated = provider._translate_upload_error(err)
+        assert int(translated.code) == 403
+        assert translated.data is None
+        assert 'secret-key-name' not in translated.message
 
     def test_parse_s3_error_body_namespaced(self, provider):
         # Some S3-compatible storages emit namespace-prefixed error documents.
@@ -1352,6 +1601,35 @@ class TestCRUD:
 
         assert provider._parse_s3_error_body(err) == (
             'QuotaExceeded', 'The bucket quota has been exceeded')
+        translated = provider._translate_upload_error(err)
+        assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in translated.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_create_session_quota_exceeded(self, provider, file_stream,
+                                                                mock_time):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message></Error>')
+
+        provider._create_upload_session = MockCoroutine()
+        provider._create_upload_session.side_effect = storage_error(
+            {'response': error_xml}, code=403)
+        provider._abort_chunked_upload = MockCoroutine()
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
+        # No session was created, so nothing must be aborted.
+        provider._abort_chunked_upload.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
