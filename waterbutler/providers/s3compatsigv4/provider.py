@@ -42,12 +42,43 @@ ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
 # and then goes silent.
 CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
+# Upper bound on how much of the storage's raw error body is written to the log.
+# The body is the only place ``RequestId`` / ``Resource`` survive once the error
+# has been translated into a summary message, but it must not be unbounded: a
+# misconfigured proxy can answer with a full HTML page.
+ERROR_BODY_LOG_LIMIT = 512
+
+
 # Sentinel for "the key is not in the mapping at all".  ``xmltodict`` maps an
 # empty element to ``None`` (``<Error/>``, ``<Error></Error>`` and
 # ``<Error>   </Error>`` all become ``{'Error': None}``), so ``None`` on its own
 # cannot distinguish "absent" from "present but empty".  Those two must not be
 # conflated: an empty ``<Error>`` element still means the request failed.
 _MISSING = object()
+
+
+# ``_translate_upload_error`` interprets an error by parsing the storage's XML
+# body out of it.  That is only meaningful for errors that actually carry one.
+# WaterButler also raises ``UploadError`` with its own prose -- e.g. the 502
+# ``_create_upload_session`` raises when the session response is unreadable --
+# and those must pass through untouched: parsing them yields "unclassifiable"
+# and the fallback would overwrite the message with a generic one.
+#
+# The distinction is carried explicitly on the exception rather than inferred
+# from its shape.  Inferring it (e.g. "``data`` is a dict, so it must be raw")
+# is not safe: the two kinds are indistinguishable by inspection, so a newly
+# added WaterButler-authored error would silently pick the wrong branch.
+_STORAGE_RESPONSE_FLAG = '_wb_storage_response'
+
+
+def _mark_storage_response(err):
+    """Tag ``err`` as carrying a raw storage response body."""
+    setattr(err, _STORAGE_RESPONSE_FLAG, True)
+    return err
+
+
+def _is_storage_response(err):
+    return getattr(err, _STORAGE_RESPONSE_FLAG, False)
 
 
 def _local_name_lookup(mapping, local_name, default=None):
@@ -143,6 +174,22 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         'been exceeded, or that there was a network problem.  Please retry the upload, and '
         'contact the storage administrator if the problem persists.'
     )
+
+    async def _make_upload_request(self, *args, **kwargs):
+        """``make_request`` for the upload path, tagging storage-origin failures.
+
+        Every ``UploadError`` that escapes here was built by
+        ``exception_from_response`` from an actual storage response, so it is
+        the raw material ``_translate_upload_error`` is allowed to interpret.
+        Marking at the source keeps that judgement next to the request that
+        justifies it, instead of re-deriving it from the exception's shape at
+        the point of use.
+        """
+        try:
+            return await self.make_request(*args, **kwargs)
+        except exceptions.UploadError as err:
+            _mark_storage_response(err)
+            raise
 
     def __init__(self, auth, credentials, settings, **kwargs):
         """
@@ -281,7 +328,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # an upstream fault, so report HTTP 502 -- consistently with
             # ``_create_upload_session``.
             logger.warning('Couldn\'t parse %s result', s3_api_name)
-            raise exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY)
+            raise _mark_storage_response(
+                exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
         error = _local_name_lookup(result, 'Error', _MISSING) \
             if isinstance(result, dict) else _MISSING
@@ -300,7 +348,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         # attributed upstream: HTTP 502 rather than 500.
         # ``_translate_upload_error`` refines this to 507 when the body turns
         # out to be a quota rejection.
-        raise exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY)
+        raise _mark_storage_response(
+            exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
     async def download(self, path, accept_url=False, revision=None, range=None, **kwargs):
         r"""Returns a ResponseWrapper (Stream) for the specified path
@@ -452,7 +501,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         Because the list of vendor-specific quota codes cannot be exhaustive,
         a response that already carries HTTP 507 counts whatever its code is.
         """
-        if not isinstance(err, exceptions.UploadError):
+        if not isinstance(err, exceptions.UploadError) or not _is_storage_response(err):
             return False
         if err.code == HTTPStatus.INSUFFICIENT_STORAGE:
             return True
@@ -478,8 +527,50 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             error (e.g. a warning that the multipart-upload abort failed)
         :rtype: :class:`.UploadError`
         """
+        if not _is_storage_response(err):
+            # WaterButler authored this message, so there is no storage body to
+            # interpret and the text is already user-facing.  Parsing it would
+            # yield "unclassifiable" and the fallback below would replace it
+            # with a generic message -- losing, for example, the instruction to
+            # have an administrator remove a stale multipart session.
+            #
+            # This branch is also where an upload call site that forgot
+            # ``_make_upload_request`` would land, and it degrades *quietly*:
+            # quota errors would simply stop becoming 507s, with nothing
+            # failing.  DEBUG rather than WARNING because the legitimate case is
+            # the common one -- this is a breadcrumb for whoever is asking why a
+            # 507 did not happen, not an alert.
+            logger.debug('Passing through an untagged upload error unmodified: '
+                         'type=%s status=%s', type(err).__name__, err.code)
+            if not extra_message:
+                return err
+            return exceptions.UploadError(
+                '{}{}'.format(err.message, extra_message),
+                code=err.code,
+                # Rebuilding the exception must not silently re-classify it.
+                # ``is_user_error`` decides the Sentry level in
+                # ``server/api/v1/core.py``; defaulting it to ``False`` here
+                # would promote a user-caused failure to an error-level event
+                # purely because the abort warning had to be appended.
+                is_user_error=err.is_user_error,
+            )
+
         error_code, error_message = self._parse_s3_error_body(err)
         is_quota_error = self._is_quota_exhaustion(err)
+
+        # The translated error only carries a summary message, so this is the
+        # single place where the storage's own diagnostics (RequestId, Resource)
+        # can still be recorded.  Both upload paths funnel through here.
+        # Quota exhaustion is logged one level down: it is an expected,
+        # user-resolvable failure and should not trip log-based alerting (the
+        # same reasoning as ``is_user_error`` below).
+        raw_body = self._raw_error_body(err)
+        # ``int()`` keeps the rendering stable across Python versions: before
+        # 3.11 ``'%s' % HTTPStatus.FORBIDDEN`` is ``'HTTPStatus.FORBIDDEN'``.
+        status = int(err.code) if isinstance(err.code, int) else err.code
+        log = logger.warning if is_quota_error else logger.error
+        log('Storage rejected the upload: status=%s code=%s body=%.*s',
+            status, error_code, ERROR_BODY_LOG_LIMIT, raw_body)
 
         if is_quota_error:
             code_note = '  (storage error code: {})'.format(error_code) \
@@ -504,7 +595,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         # otherwise.  For a dict message that body is the storage's raw XML
         # (Resource paths, RequestId); for the string message that
         # ``exception_from_response`` builds when there is no body, it is the
-        # presigned URL including its signature.
+        # presigned URL including its signature.  The raw body is already in
+        # the log above, which is where it belongs.
         return exceptions.UploadError(
             '{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, extra_message),
             code=err.code)
@@ -550,7 +642,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         query_parameters = {'Bucket': self.bucket_name, 'Key': path.full_path}
 
         try:
-            resp = await self.make_request(
+            resp = await self._make_upload_request(
                 'PUT',
                 functools.partial(
                     self.connection.generate_presigned_url,
@@ -613,7 +705,19 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             await self._complete_multipart_upload(path, session_upload_id, parts_metadata)
         except Exception as err:
             msg = 'An unexpected error has occurred during the multi-part upload.'
-            logger.error('{} upload_id={} error={!r}'.format(msg, session_upload_id, err))
+            # Type and status only.  ``repr()`` of a WaterButlerError renders
+            # its whole message, and for a dict message that is the storage's
+            # raw body serialised as JSON -- unbounded, and about to be logged
+            # again (bounded) by ``_translate_upload_error``.
+            err_code = getattr(err, 'code', None)
+            # Quota exhaustion is expected and the user can resolve it, so it
+            # must not go out at ERROR here after the translator has already
+            # classified it as a warning -- otherwise this line alone keeps
+            # paging oncall.
+            log = logger.warning if self._is_quota_exhaustion(err) else logger.error
+            log('%s upload_id=%s error_type=%s error_code=%s', msg, session_upload_id,
+                type(err).__name__,
+                int(err_code) if isinstance(err_code, int) else err_code)
             aborted = await self._abort_chunked_upload(path, session_upload_id)
             abort_message = ''
             if not aborted:
@@ -650,7 +754,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
         query_parameters = {'Bucket': self.bucket_name, 'Key': path.full_path}
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'POST',
             functools.partial(
                 self.connection.generate_presigned_url,
@@ -727,7 +831,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id,
         }
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'PUT',
             functools.partial(
                 self.connection.generate_presigned_url,
@@ -747,6 +851,31 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         )
         await resp.release()
         return resp.headers
+
+    @staticmethod
+    def _log_abort_failure(err, session_upload_id, s3_error_code=None):
+        """Log an abort attempt that failed, by *kind* rather than by content.
+
+        ``'{!r}'.format(err)`` renders ``WaterButlerError.__repr__``, which
+        embeds the whole message -- and for an error built from a storage
+        response that message is the raw body serialised as JSON.  It is
+        unbounded, it carries the storage's ``Resource`` paths, and it is
+        emitted once per retry.  ``_translate_upload_error`` already logs the
+        body once, bounded by ``ERROR_BODY_LOG_LIMIT``, so repeating it here
+        buys nothing.  The type and status are what actually identify the
+        failure when reading the log.
+
+        Dropping the body still has to leave the log able to say *which* S3
+        error this was.  The caller has already parsed the code to test for
+        ``NoSuchUpload``, so passing it on costs nothing; ``error_code=``
+        then means the same thing here as it does in the entry log, and the
+        HTTP status gets its own name.
+        """
+        status = getattr(err, 'code', None)
+        logger.error('An unexpected error has occurred during the aborting a multipart '
+                     'upload. upload_id={} error_type={} status={} error_code={}'.format(
+                         session_upload_id, type(err).__name__,
+                         int(status) if isinstance(status, int) else status, s3_error_code))
 
     async def _abort_chunked_upload(self, path, session_upload_id):
         """This operation aborts a multipart upload. After a multipart upload is aborted, no
@@ -779,7 +908,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         while iteration_count < settings.CHUNKED_UPLOAD_MAX_ABORT_RETRIES:
             try:
                 # ABORT
-                resp = await self.make_request(
+                resp = await self._make_upload_request(
                     'DELETE',
                     functools.partial(
                         self.connection.generate_presigned_url,
@@ -808,9 +937,11 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     # Abort is successful when there is no part left
                     is_aborted = True
                     break
+            except exceptions.UploadError as err:
+                self._log_abort_failure(err, session_upload_id,
+                                        self._parse_s3_error_body(err)[0])
             except Exception as err:
-                msg = 'An unexpected error has occurred during the aborting a multipart upload.'
-                logger.error('{} upload_id={} error={!r}'.format(msg, session_upload_id, err))
+                self._log_abort_failure(err, session_upload_id)
 
             iteration_count += 1
 
@@ -836,7 +967,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id,
         }
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'GET',
             functools.partial(
                 self.connection.generate_presigned_url,
@@ -885,7 +1016,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id
         }
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'POST',
             functools.partial(
                 self.connection.generate_presigned_url,

@@ -6,6 +6,7 @@ import time
 import base64
 import hashlib
 import asyncio
+import logging
 import datetime
 
 import aiohttp
@@ -31,13 +32,20 @@ PROVIDER_LOGGER = pd_provider.__name__
 def storage_error(message, code=403, exception_type=exceptions.UploadError):
     """Build the error a storage rejection produces on the upload path.
 
-    In production these errors are born in ``make_request``, via
-    ``exception_from_response``, so the message is the storage's own response
-    body.  Tests that fake a storage failure above the ``make_request``
-    boundary go through here rather than constructing the exception inline, so
-    that there is one place to change when the shape of that payload does.
+    In production these errors are born in ``make_request`` (via
+    ``exception_from_response``) and are tagged by ``_make_upload_request`` so
+    that ``_translate_upload_error`` knows the payload is a raw storage
+    response rather than a message WaterButler wrote itself.
+
+    Tests that fake a storage failure above the ``make_request`` boundary have
+    to reproduce that tag, and must do it by calling the provider's own
+    ``_mark_storage_response`` -- re-implementing the tag here would let the
+    test keep passing if the marker were renamed or its semantics changed.
+    An *untagged* error carrying a storage body cannot occur in production, so
+    asserting translation behaviour against one would test a state the
+    provider never actually sees.
     """
-    return exception_type(message, code=code)
+    return pd_provider._mark_storage_response(exception_type(message, code=code))
 
 
 from tests.utils import MockCoroutine
@@ -1513,6 +1521,52 @@ class TestCRUD:
         assert exc.value.is_user_error is False
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
 
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_entry_log_omits_raw_body(self, provider, file_stream,
+                                                           mock_time, caplog):
+        # ``'{!r}'.format(UploadError(...))`` renders the *whole* message, and
+        # for a dict message that message is the storage's raw body serialised
+        # as JSON -- unbounded, and duplicated a few lines later by
+        # ``_translate_upload_error``.  The entry log must only say what kind of
+        # failure it was; the body belongs to the single bounded log in the
+        # translator.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        error_xml = ('<Error><Code>AccessDenied</Code>'
+                     '<RequestId>TESTREQUESTID</RequestId>'
+                     '<Message>{}</Message></Error>').format('y' * 4096)
+
+        provider._create_upload_session = MockCoroutine(return_value=upload_id)
+        provider._upload_parts = MockCoroutine(side_effect=storage_error(
+            {'response': error_xml}, code=HTTPStatus.FORBIDDEN))
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.UploadError):
+                await provider._chunked_upload(file_stream, path)
+
+        records = [r.getMessage() for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 2
+
+        entry, translated = records
+        # The entry log identifies the failure by type and status only.
+        assert 'UploadError' in entry
+        assert str(int(HTTPStatus.FORBIDDEN)) in entry
+        assert upload_id in entry
+        assert 'TESTREQUESTID' not in entry
+        assert 'y' * 64 not in entry
+        # The body survives exactly once, bounded by ERROR_BODY_LOG_LIMIT.
+        assert 'TESTREQUESTID' in translated
+        assert 'y' * pd_provider.ERROR_BODY_LOG_LIMIT not in translated
+        # Neither record may be unbounded.
+        for record in records:
+            assert len(record) < 1024
+
     def test_connection_interrupted_message_does_not_assert_capacity(self, provider):
         # A dropped connection is only *evidence* of a full
         # storage -- it is equally often a network fault.  The message must not
@@ -1520,6 +1574,210 @@ class TestCRUD:
         message = provider.CONNECTION_INTERRUPTED_MESSAGE
         assert 'network' in message.lower()
         assert 'may indicate' in message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('error_code,status,expected_level', [
+        # Quota exhaustion is expected and the user can fix it themselves --
+        # ``_translate_upload_error`` already logs it at WARNING and marks it
+        # ``is_user_error``.  The entry log has to agree, or this line alone
+        # keeps paging oncall every time somebody fills a bucket.
+        ('QuotaExceeded', HTTPStatus.FORBIDDEN, logging.WARNING),
+        ('XMinioStorageFull', HTTPStatus.FORBIDDEN, logging.WARNING),
+        # ...including the 507 fallback, where the code is unrecognised.
+        ('SomeVendorCode', HTTPStatus.INSUFFICIENT_STORAGE, logging.WARNING),
+        # A real fault must still be an error: the downgrade must not be blanket.
+        ('AccessDenied', HTTPStatus.FORBIDDEN, logging.ERROR),
+        ('InternalError', HTTPStatus.INTERNAL_SERVER_ERROR, logging.ERROR),
+    ])
+    async def test_chunked_upload_entry_log_level_follows_quota(
+            self, provider, file_stream, mock_time, caplog, error_code, status, expected_level):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>{}</Code><Message>nope</Message></Error>').format(error_code)
+
+        provider._create_upload_session = MockCoroutine(return_value=upload_id)
+        provider._upload_parts = MockCoroutine(
+            side_effect=storage_error({'response': error_xml}, code=status))
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.UploadError):
+                await provider._chunked_upload(file_stream, path)
+
+        entry = [r for r in caplog.records
+                 if r.name == PROVIDER_LOGGER and 'multi-part upload' in r.getMessage()]
+        assert len(entry) == 1
+        assert entry[0].levelno == expected_level
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_entry_log_requires_the_storage_tag(
+            self, provider, file_stream, mock_time, caplog):
+        # Every other case above builds its error with ``storage_error``, which
+        # tags it.  So deleting the ``_is_storage_response`` guard from
+        # ``_is_quota_exhaustion`` leaves the whole suite green while the
+        # predicate silently starts trusting messages WaterButler wrote itself.
+        # A 507 that carries no tag must stay an ERROR.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
+        # Deliberately untagged: this is the shape of an error WaterButler
+        # authored, not one built from a storage response.
+        provider._upload_parts = MockCoroutine(side_effect=exceptions.UploadError(
+            'WaterButler wrote this', code=HTTPStatus.INSUFFICIENT_STORAGE))
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.UploadError):
+                await provider._chunked_upload(file_stream, path)
+
+        entry = [r for r in caplog.records
+                 if r.name == PROVIDER_LOGGER and 'multi-part upload' in r.getMessage()]
+        assert len(entry) == 1
+        assert entry[0].levelno == logging.ERROR
+
+    def test_passthrough_preserves_is_user_error(self, provider):
+        # The untagged branch rebuilds the exception to append the abort
+        # warning.  Dropping ``is_user_error`` there promotes a failure the user
+        # caused from Sentry's info level to error (server/api/v1/core.py).
+        err = exceptions.UploadError('WaterButler wrote this', code=HTTPStatus.CONFLICT,
+                                     is_user_error=True)
+
+        translated = provider._translate_upload_error(err, extra_message='  Abort failed.')
+
+        assert translated.is_user_error is True
+        assert translated.code == HTTPStatus.CONFLICT
+        assert 'Abort failed.' in translated.message
+
+    def test_passthrough_is_observable(self, provider, caplog):
+        # An untagged error reaching the translator is accepted as normal, so a
+        # new upload call site that forgets ``_make_upload_request`` degrades
+        # silently: quota errors stop becoming 507s and nothing fails.  A debug
+        # line is the only thing that makes the omission findable in the field.
+        err = exceptions.UploadError('WaterButler wrote this', code=HTTPStatus.CONFLICT)
+
+        with caplog.at_level(logging.DEBUG, logger=PROVIDER_LOGGER):
+            provider._translate_upload_error(err)
+
+        assert [r for r in caplog.records
+                if r.name == PROVIDER_LOGGER and r.levelno == logging.DEBUG
+                and 'untagged' in r.getMessage()]
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('stage', ['contiguous', 'create-session', 'chunked'])
+    async def test_translated_error_does_not_chain_the_raw_body(self, provider, file_stream,
+                                                                mock_time, stage):
+        # ``raise translated`` inside an ``except`` block sets ``__context__``
+        # to the untranslated error, so the raw body comes back in the rendered
+        # traceback -- which is what the logs and Sentry show.  Stripping the
+        # body from the message accomplishes nothing if the chained exception
+        # carries it anyway.
+        import traceback
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Resource>/bucket/secret-key-name</Resource></Error>')
+        failure = storage_error({'response': error_xml}, code=403)
+
+        if stage == 'contiguous':
+            provider.make_request = MockCoroutine(side_effect=failure)
+            coro = provider._contiguous_upload(file_stream, path)
+        else:
+            assert file_stream.size == 6
+            provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+            provider.CHUNK_SIZE = 2
+            provider._abort_chunked_upload = MockCoroutine(return_value=True)
+            if stage == 'create-session':
+                provider.make_request = MockCoroutine(side_effect=failure)
+            else:
+                provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
+                provider._upload_parts = MockCoroutine(side_effect=failure)
+            coro = provider._chunked_upload(file_stream, path)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await coro
+
+        assert exc.value.__suppress_context__ is True
+        rendered = ''.join(traceback.format_exception(type(exc.value), exc.value,
+                                                      exc.value.__traceback__))
+        assert 'secret-key-name' not in rendered
+
+    def test_translate_upload_error_logs_raw_body(self, provider, caplog):
+        # The translated error only carries a summary message, so the raw body
+        # (RequestId / Resource) is the only way to investigate afterwards.  It
+        # used to be dropped entirely on the contiguous path.
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>AccessDenied</Code><Message>Access Denied</Message>'
+                     '<RequestId>TESTREQUESTID</RequestId>'
+                     '<Resource>/bucket/foobah</Resource></Error>')
+        err = storage_error({'response': error_xml}, code=HTTPStatus.FORBIDDEN)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            provider._translate_upload_error(err)
+
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        logged = records[0].getMessage()
+        assert 'TESTREQUESTID' in logged
+        assert '/bucket/foobah' in logged
+        assert 'AccessDenied' in logged
+        assert str(int(HTTPStatus.FORBIDDEN)) in logged
+        # A non-quota storage rejection is a genuine error.
+        assert records[0].levelno == logging.ERROR
+
+    def test_translate_upload_error_log_truncates_body(self, provider, caplog):
+        # An unbounded body would flood the log; storages can return very large
+        # error documents (or a proxy's HTML error page).
+        #
+        # The bound is declared here as a literal rather than read from the
+        # module: deriving it from the constant makes the test agree with
+        # whatever the constant happens to say, so shrinking it to 10 (or
+        # growing it to 1 MB) would keep this green.  512 is the reviewed
+        # value, so changing it has to be a deliberate edit here too.
+        limit = 512
+        assert pd_provider.ERROR_BODY_LOG_LIMIT == limit
+        error_xml = '<Error><Code>AccessDenied</Code><Message>{}</Message></Error>'.format(
+            'x' * (limit * 8))
+        err = storage_error({'response': error_xml}, code=HTTPStatus.FORBIDDEN)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            provider._translate_upload_error(err)
+
+        logged = [r for r in caplog.records if r.name == PROVIDER_LOGGER][0].getMessage()
+        # Pin the bound itself, not just "shorter than the input": the body is
+        # cut at exactly ERROR_BODY_LOG_LIMIT characters and no further.
+        assert error_xml[:limit] in logged
+        assert error_xml[:limit + 1] not in logged
+        # Nothing else in the record may reintroduce the rest of the body.
+        assert len(logged) < limit * 2
+
+    def test_translate_upload_error_quota_logged_as_warning(self, provider, caplog):
+        # Quota exhaustion is an expected, user-resolvable failure (see the
+        # is_user_error handling), so it must not be logged at ERROR level and
+        # trip the on-call alerting.
+        error_xml = ('<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message>'
+                     '<RequestId>QUOTAREQUESTID</RequestId></Error>')
+        err = storage_error({'response': error_xml}, code=HTTPStatus.FORBIDDEN)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            provider._translate_upload_error(err)
+
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert 'QUOTAREQUESTID' in records[0].getMessage()
 
     def test_quota_exceeded_error_codes_defaults(self):
         codes = pd_settings.QUOTA_EXCEEDED_ERROR_CODES
@@ -1728,6 +1986,71 @@ class TestCRUD:
 
         assert int(exc.value.code) != int(HTTPStatus.INTERNAL_SERVER_ERROR)
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_session_error_keeps_waterbutler_message(
+            self, provider, file_stream, mock_time):
+        # ``_create_upload_session`` authors its own 502: a session may exist on
+        # the storage but its UploadId is unknown, so it cannot be aborted and
+        # an administrator has to remove it by hand.  That message has no
+        # storage body behind it, so ``_translate_upload_error`` must not
+        # replace it with the generic "could not be interpreted" text.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        resp = mock.Mock()
+        resp.read = MockCoroutine(return_value=b'this is not the expected xml')
+        provider.make_request = MockCoroutine(return_value=resp)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.BAD_GATEWAY
+        assert 'stale multipart upload session' in exc.value.message
+        assert provider.UNCLASSIFIED_STORAGE_ERROR_MESSAGE not in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('stage', ['create-session', 'upload-part', 'complete'])
+    async def test_every_upload_stage_tags_its_storage_errors(self, provider, file_stream,
+                                                              mock_time, stage):
+        # ``_translate_upload_error`` only translates errors the upload path
+        # tagged in ``_make_upload_request``.  A call site that reaches for
+        # ``make_request`` directly therefore stops being translated *silently*:
+        # the user gets the storage's raw 403 instead of the quota message.
+        #
+        # Every other test for these three stages mocks above ``make_request``
+        # (``_create_upload_session`` / ``_upload_parts`` are replaced wholesale),
+        # so none of them would notice the tag going missing.  This one mocks the
+        # boundary itself, which keeps each real call site under test.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>QuotaExceeded</Code>'
+                     '<Message>The bucket quota has been exceeded</Message></Error>')
+        # Deliberately *untagged*: ``make_request`` is the boundary where the tag
+        # is applied, so tagging it here would defeat the purpose of the test.
+        failure = exceptions.UploadError({'response': error_xml}, code=403)
+
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+        if stage != 'create-session':
+            provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
+        if stage == 'complete':
+            provider._upload_parts = MockCoroutine(return_value=[{'ETAG': '"etag1"'}])
+
+        provider.make_request = MockCoroutine(side_effect=failure)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+        assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -2333,6 +2656,78 @@ class TestCRUD:
 
         assert aiohttpretty.has_call(method='DELETE', uri=abort_url)
         assert aborted is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_abort_path_errors_carry_the_storage_tag(
+            self, provider, mock_time, generate_url_helper, monkeypatch):
+        # ``_abort_chunked_upload`` parses the S3 error body to recognise
+        # ``NoSuchUpload``.  The rule is that the tag, not the shape of the
+        # exception, is what licenses reading a body as a storage response --
+        # so the abort path has to go through ``_make_upload_request`` too.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        params = {'uploadId': upload_id}
+        abort_url = generate_url_helper(key=path.full_path, method='DELETE', expires=100,
+                                        headers={}, query_parameters=params)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>AccessDenied</Code><Message>nope</Message></Error>')
+        aiohttpretty.register_uri('DELETE', abort_url, body=error_xml.encode('utf-8'), status=403)
+
+        seen = []
+        original = provider._log_abort_failure
+        monkeypatch.setattr(provider, '_log_abort_failure',
+                            lambda err, *a, **kw: (seen.append(err), original(err, *a, **kw))[1])
+
+        await provider._abort_chunked_upload(path, upload_id)
+
+        assert seen
+        assert all(pd_provider._is_storage_response(err) for err in seen)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_abort_failure_log_omits_raw_body(self, provider, mock_time,
+                                                    generate_url_helper, caplog):
+        # ``'{!r}'.format(UploadError(...))`` renders the entire message, and for
+        # a dict message that is the storage's raw body serialised as JSON --
+        # unbounded, and carrying Resource paths.  ``_translate_upload_error``
+        # has a single bounded log for the body; this one must only identify the
+        # failure by type and status.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        params = {'uploadId': upload_id}
+        abort_url = generate_url_helper(key=path.full_path, method='DELETE', expires=100,
+                                        headers={}, query_parameters=params)
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>AccessDenied</Code>'
+                     '<Resource>/bucket/secret-key-name</Resource>'
+                     '<Message>{}</Message></Error>').format('z' * 4096)
+        aiohttpretty.register_uri('DELETE', abort_url, body=error_xml.encode('utf-8'),
+                                  status=403)
+
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            aborted = await provider._abort_chunked_upload(path, upload_id)
+
+        assert aborted is False
+        failures = [r.getMessage() for r in caplog.records
+                    if r.name == PROVIDER_LOGGER and 'upload_id={}'.format(upload_id) in
+                    r.getMessage() and 'has failed to abort' not in r.getMessage()]
+        assert failures
+        for logged in failures:
+            # Enough to triage with...
+            assert 'UploadError' in logged
+            assert str(int(HTTPStatus.FORBIDDEN)) in logged
+            assert upload_id in logged
+            # ...including *which* S3 error it was.  Removing the raw body
+            # without carrying the error code over left the log unable to
+            # distinguish AccessDenied from InternalError, which is the first
+            # thing anyone reading it needs to know.  The code is already
+            # parsed one line earlier to test for NoSuchUpload.
+            assert 'AccessDenied' in logged
+            # ...and nothing of the body itself.
+            assert 'secret-key-name' not in logged
+            assert 'zzzz' not in logged
+            assert len(logged) < 200
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
