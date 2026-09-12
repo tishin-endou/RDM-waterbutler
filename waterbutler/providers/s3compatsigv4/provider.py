@@ -42,6 +42,13 @@ ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
 # and then goes silent.
 CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
+# Sentinel for "the key is not in the mapping at all".  ``xmltodict`` maps an
+# empty element to ``None`` (``<Error/>``, ``<Error></Error>`` and
+# ``<Error>   </Error>`` all become ``{'Error': None}``), so ``None`` on its own
+# cannot distinguish "absent" from "present but empty".  Those two must not be
+# conflated: an empty ``<Error>`` element still means the request failed.
+_MISSING = object()
+
 
 def _local_name_lookup(mapping, local_name, default=None):
     """Look up ``local_name`` in an ``xmltodict`` mapping, ignoring any XML
@@ -243,24 +250,57 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         try to parse response body as a xml.
         if the xml has an 'Error' element then raise an exception.
 
+        The raised exception carries the raw body under ``data['response']``,
+        which is the same shape :func:`.exceptions.exception_from_response`
+        builds for a genuine non-2xx XML response.  Keeping the two shapes
+        identical is what lets ``_translate_upload_error`` recognise a quota
+        failure that S3 reported with HTTP 200 (CompleteMultipartUpload does
+        this) instead of surfacing a bare HTTP 500.
+
+        The check is deliberately *fail-closed*: once an ``Error`` element is
+        seen the operation has failed, so being unable to classify it (empty
+        element, missing ``Code``, unparsable body) still raises.  Returning
+        normally would let ``upload()`` go on to read the *previous* object's
+        metadata and report a successful upload of data that was never
+        committed.
+
         :param str response_body: API response body.
         :param str s3_api_name: S3 API name for logging.
         :param type exception_type: raise Exception type
         """
+        body = response_body.decode('utf-8', 'replace') \
+            if isinstance(response_body, bytes) else response_body
+
         try:
             # memo: If no element, the parser will raise an ExpatError.
             result = xmltodict.parse(response_body)
         except ExpatError:
+            # Letting ExpatError escape surfaces as a bare HTTP 500 with a
+            # stack trace: ``_translate_upload_error`` has no ``.message`` to
+            # work with on it.  The storage answered unintelligibly, which is
+            # an upstream fault, so report HTTP 502 -- consistently with
+            # ``_create_upload_session``.
             logger.warning('Couldn\'t parse %s result', s3_api_name)
-            raise
+            raise exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY)
 
-        if 'Error' in result:
-            error_code = result['Error'].get('Code', 'Unknown')
-            logger.warning('%s returned with an error: %s', s3_api_name, error_code)
-            raise exception_type(
-                f'{s3_api_name} returned with an error.',
-                code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
+        error = _local_name_lookup(result, 'Error', _MISSING) \
+            if isinstance(result, dict) else _MISSING
+        if error is _MISSING:
+            return
+
+        error_code = None
+        if isinstance(error, dict):
+            code = _local_name_lookup(error, 'Code')
+            if isinstance(code, str) and code.strip():
+                error_code = code.strip()
+        logger.warning('%s returned with an error: %s', s3_api_name, error_code or 'Unknown')
+
+        # The storage reported a failure inside a 2xx response.  Sending the
+        # request was not something WaterButler got wrong, so the fault is
+        # attributed upstream: HTTP 502 rather than 500.
+        # ``_translate_upload_error`` refines this to 507 when the body turns
+        # out to be a quota rejection.
+        raise exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY)
 
     async def download(self, path, accept_url=False, revision=None, range=None, **kwargs):
         r"""Returns a ResponseWrapper (Stream) for the specified path
@@ -628,9 +668,34 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             throws=exceptions.UploadError,
         )
         upload_session_metadata = await resp.read()
-        session_data = xmltodict.parse(upload_session_metadata, strip_whitespace=False)
-        # Session upload id is the only info we need
-        return session_data['InitiateMultipartUploadResult']['UploadId']
+        try:
+            session_data = xmltodict.parse(upload_session_metadata, strip_whitespace=False)
+            # Session upload id is the only info we need
+            session_upload_id = session_data['InitiateMultipartUploadResult']['UploadId']
+            if not isinstance(session_upload_id, str) or not session_upload_id.strip():
+                # An empty ``<UploadId/>`` parses to ``None`` and an attribute-only
+                # element to a dict.  Returning either would make every following
+                # request use a bogus upload id.
+                raise ValueError('UploadId is missing or blank')
+            # ``strip_whitespace=False`` keeps the indentation of a
+            # pretty-printed body inside the element, and the id goes straight
+            # into the ``uploadId`` query parameter of every following request
+            # (and into its SigV4 signature).
+            return session_upload_id.strip()
+        except (ExpatError, KeyError, TypeError, ValueError) as err:
+            # The storage returned 200/201 but the body is not the expected XML.
+            # NOTE: at this point a multipart session MAY have been created on
+            # the storage side but its UploadId is unknown, so it cannot be
+            # aborted here.  Log enough information for manual clean-up.
+            logger.error('Failed to parse the CreateMultipartUpload response: key={} '
+                         'error={!r} body={!r}'.format(path.full_path, err,
+                                                       upload_session_metadata[:512]))
+            raise exceptions.UploadError(
+                'Failed to create a multipart upload session: the cloud storage returned an '
+                'unexpected response.  A stale multipart upload session may remain on the '
+                'storage; please ask the storage administrator to check for and remove it.',
+                code=HTTPStatus.BAD_GATEWAY,
+            )
 
     async def _upload_parts(self, stream, path, session_upload_id):
         """Uploads all parts/chunks of the given stream to S3 one by one."""
@@ -837,11 +902,19 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             ),
             throws=exceptions.UploadError,
         )
-
-        response_body = await resp.read()
-        self._check_for_200_error(response_body, "CompleteMultipartUpload", exceptions.UploadError)
-
-        await resp.release()
+        try:
+            # ``read()`` belongs inside the try: a connection dropped mid-body
+            # is exactly what a struggling storage does, and leaving the read
+            # outside meant that case skipped the release entirely.
+            response_body = await resp.read()
+            # S3 reports CompleteMultipartUpload failures as HTTP 200 plus an
+            # <Error> body, so this raises on what looks like a success -- and
+            # that is exactly the path a quota-exhausted storage takes for
+            # every upload.  Without the finally, each one leaks a connection.
+            self._check_for_200_error(response_body, "CompleteMultipartUpload",
+                                      exceptions.UploadError)
+        finally:
+            await resp.release()
 
     async def move(self, dest_provider, src_path, dest_path,
                   rename=None, conflict='replace', handle_naming=True):
