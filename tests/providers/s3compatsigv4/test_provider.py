@@ -8,6 +8,7 @@ import hashlib
 import datetime
 import aiohttpretty
 from http import client
+from http import HTTPStatus
 from urllib import parse
 from unittest import mock
 
@@ -19,6 +20,22 @@ from waterbutler.core import streams, metadata, exceptions
 from waterbutler.core.path import WaterButlerPath
 from waterbutler.providers.s3compatsigv4 import S3CompatSigV4Provider
 from waterbutler.providers.s3compatsigv4 import settings as pd_settings
+from waterbutler.providers.s3compatsigv4 import provider as pd_provider
+
+PROVIDER_LOGGER = pd_provider.__name__
+
+
+def storage_error(message, code=403, exception_type=exceptions.UploadError):
+    """Build the error a storage rejection produces on the upload path.
+
+    In production these errors are born in ``make_request``, via
+    ``exception_from_response``, so the message is the storage's own response
+    body.  Tests that fake a storage failure above the ``make_request``
+    boundary go through here rather than constructing the exception inline, so
+    that there is one place to change when the shape of that payload does.
+    """
+    return exception_type(message, code=code)
+
 
 from tests.utils import MockCoroutine
 from collections import OrderedDict
@@ -1230,6 +1247,111 @@ class TestCRUD:
         assert str(exc.value) == ', '.join(['500', msg])
 
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_exception_from_response_contract_xml(self, provider, mock_time,
+                                                        generate_url_helper):
+        # ``_parse_s3_error_body`` depends on exception_from_response putting the
+        # XML body into ``data['response']``.  Every other parser test builds
+        # that shape by hand, so this one pins down the actual contract: if
+        # ``exception_from_response`` ever changes (e.g. resp.json() starts
+        # succeeding), the parser stops seeing a body and only this test fails.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        url = generate_url_helper(key=path.full_path, method='PUT', expires=100,
+                                  headers={}, query_parameters={})
+        error_body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                      '<Error><Code>QuotaExceeded</Code>'
+                      '<Message>The bucket quota has been exceeded</Message></Error>')
+        aiohttpretty.register_uri('PUT', url, status=403, body=error_body,
+                                  headers={'Content-Type': 'application/xml'})
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider.make_request('PUT', url, expects=(HTTPStatus.OK, ),
+                                        throws=exceptions.UploadError)
+
+        assert exc.value.data == {'response': error_body}
+        assert provider._parse_s3_error_body(exc.value) == (
+            'QuotaExceeded', 'The bucket quota has been exceeded')
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_exception_from_response_contract_head(self, provider, mock_time,
+                                                         generate_url_helper):
+        # HEAD responses have no body, so exception_from_response produces a
+        # plain string message.  _parse_s3_error_body must degrade to
+        # (None, None) rather than raising on that shape.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        url = generate_url_helper(key=path.full_path, method='HEAD', expires=100,
+                                  headers={}, query_parameters={})
+        aiohttpretty.register_uri('HEAD', url, status=403)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider.make_request('HEAD', url, expects=(HTTPStatus.OK, ),
+                                        throws=exceptions.UploadError)
+
+        assert exc.value.data is None
+        assert isinstance(exc.value.message, str)
+        assert provider._parse_s3_error_body(exc.value) == (None, None)
+
+    def test_parse_s3_error_body_non_xml(self, provider):
+        err = storage_error({'response': 'not xml at all'}, code=500)
+        assert provider._parse_s3_error_body(err) == (None, None)
+
+    def test_parse_s3_error_body_pretty_printed(self, provider):
+        # Storages are free to pretty-print their XML.  Surrounding whitespace
+        # must not end up inside the parsed code or message.
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                     '<Error>\n'
+                     '  <Code>\n    QuotaExceeded\n  </Code>\n'
+                     '  <Message>\n    The bucket quota has been exceeded\n  </Message>\n'
+                     '</Error>\n')
+        err = storage_error({'response': error_xml}, code=403)
+
+        assert provider._parse_s3_error_body(err) == (
+            'QuotaExceeded', 'The bucket quota has been exceeded')
+
+    def test_parse_s3_error_body_scalar_error_element(self, provider):
+        # ``xmltodict`` maps an element without children to a plain string, so
+        # ``parsed['Error']`` is not always a dict.
+        err = storage_error({'response': '<Error>something went wrong</Error>'}, code=500)
+        assert provider._parse_s3_error_body(err) == (None, None)
+
+    def test_parse_s3_error_body_empty_code_element(self, provider):
+        # An empty ``<Code/>`` becomes ``None``; an element with attributes only
+        # becomes a dict.  Neither is a usable error code.
+        err = exceptions.UploadError(
+            {'response': '<Error><Code/><Message>nope</Message></Error>'}, code=500)
+        assert provider._parse_s3_error_body(err) == (None, None)
+
+        err = exceptions.UploadError(
+            {'response': '<Error><Code lang="en"/></Error>'}, code=500)
+        assert provider._parse_s3_error_body(err) == (None, None)
+
+    def test_parse_s3_error_body_repeated_code_elements(self, provider):
+        # ``xmltodict`` collapses repeated siblings into a list, so a malformed
+        # or merged error document gives ``Code`` as ``['A', 'QuotaExceeded']``.
+        # Picking one of them would be guesswork, so this is unclassifiable --
+        # and it must not crash from ``.strip()`` on a list either.
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>SlowDown</Code><Code>QuotaExceeded</Code>'
+                     '<Message>first</Message><Message>second</Message>'
+                     '<Resource>/bucket/secret-key-name</Resource></Error>')
+        err = storage_error({'response': error_xml}, code=403)
+
+        assert provider._parse_s3_error_body(err) == (None, None)
+
+    def test_parse_s3_error_body_namespaced(self, provider):
+        # Some S3-compatible storages emit namespace-prefixed error documents.
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<s3:Error xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">'
+                     '<s3:Code>QuotaExceeded</s3:Code>'
+                     '<s3:Message>The bucket quota has been exceeded</s3:Message>'
+                     '</s3:Error>')
+        err = storage_error({'response': error_xml}, code=403)
+
+        assert provider._parse_s3_error_body(err) == (
+            'QuotaExceeded', 'The bucket quota has been exceeded')
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
