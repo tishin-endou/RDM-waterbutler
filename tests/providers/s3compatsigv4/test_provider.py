@@ -5,7 +5,10 @@ import json
 import time
 import base64
 import hashlib
+import asyncio
 import datetime
+
+import aiohttp
 import aiohttpretty
 from http import client
 from http import HTTPStatus
@@ -1360,6 +1363,45 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_contiguous_upload_connection_interrupted(self, provider, file_stream,
+                                                            mock_time):
+        import aiohttp
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+
+        # Some storages close the connection mid-upload when the quota has been
+        # exceeded; the raw client error must not propagate as an HTTP 500.
+        provider.make_request = MockCoroutine()
+        provider.make_request.side_effect = aiohttp.ClientOSError('Connection reset by peer')
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._contiguous_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.BAD_GATEWAY
+        assert provider.CONNECTION_INTERRUPTED_MESSAGE in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_contiguous_upload_timeout(self, provider, file_stream, mock_time):
+        # ``asyncio.TimeoutError`` is NOT an ``aiohttp.ClientError``, so the
+        # whole-request timeout (AIOHTTP_TIMEOUT) used to escape untranslated
+        # and reach the user as an unexplained HTTP 500.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+
+        provider.make_request = MockCoroutine()
+        provider.make_request.side_effect = asyncio.TimeoutError()
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._contiguous_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.BAD_GATEWAY
+        assert provider.CONNECTION_INTERRUPTED_MESSAGE in exc.value.message
+        # Only quota exhaustion is the user's to resolve.  A
+        # dropped connection is an infrastructure fault and must keep paging.
+        assert exc.value.is_user_error is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_exception_from_response_contract_xml(self, provider, mock_time,
                                                         generate_url_helper):
         # The whole quota translation depends on exception_from_response putting
@@ -1429,6 +1471,55 @@ class TestCRUD:
         assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
         assert 'QuotaExceeded' in exc.value.message
         assert aiohttpretty.has_call(method='PUT', uri=url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_create_session_timeout(self, provider, file_stream, mock_time):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+
+        provider._create_upload_session = MockCoroutine(side_effect=asyncio.TimeoutError())
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert exc.value.code == HTTPStatus.BAD_GATEWAY
+        assert provider.CONNECTION_INTERRUPTED_MESSAGE in exc.value.message
+        assert exc.value.is_user_error is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_parts_timeout(self, provider, file_stream, mock_time):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+
+        provider._create_upload_session = MockCoroutine(return_value=upload_id)
+        provider._upload_parts = MockCoroutine(side_effect=asyncio.TimeoutError())
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        # A timeout is a connection-level failure, not an "unexpected error".
+        assert exc.value.code == HTTPStatus.BAD_GATEWAY
+        assert provider.CONNECTION_INTERRUPTED_MESSAGE in exc.value.message
+        assert exc.value.is_user_error is False
+        provider._abort_chunked_upload.assert_called_with(path, upload_id)
+
+    def test_connection_interrupted_message_does_not_assert_capacity(self, provider):
+        # A dropped connection is only *evidence* of a full
+        # storage -- it is equally often a network fault.  The message must not
+        # send the user off to free up space when nothing is full.
+        message = provider.CONNECTION_INTERRUPTED_MESSAGE
+        assert 'network' in message.lower()
+        assert 'may indicate' in message
 
     def test_quota_exceeded_error_codes_defaults(self):
         codes = pd_settings.QUOTA_EXCEEDED_ERROR_CODES

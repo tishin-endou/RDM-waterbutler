@@ -10,6 +10,7 @@ from xml.parsers.expat import ExpatError
 from io import BytesIO
 import base64
 
+import aiohttp
 import xmltodict
 import boto3
 from botocore.config import Config
@@ -31,6 +32,15 @@ logger = logging.getLogger(__name__)
 # Matches an ``<Error>`` element with or without a namespace prefix, so that
 # namespace-prefixed error documents are not rejected by the cheap pre-filter.
 ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
+
+# Failures that mean "the exchange with the storage was cut short", as opposed
+# to "the storage answered with an error".  ``asyncio.TimeoutError`` is NOT a
+# subclass of ``aiohttp.ClientError``: the whole-request timeout that
+# ``make_request`` applies (``settings.AIOHTTP_TIMEOUT``, 3600s by default)
+# raises it directly, so it has to be listed explicitly.  This is the exact
+# path taken when a storage stops reading the request body on quota exhaustion
+# and then goes silent.
+CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
 
 def _local_name_lookup(mapping, local_name, default=None):
@@ -116,6 +126,15 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         'Upload failed because the cloud storage returned an error that could not be '
         'interpreted.  Please retry the upload, and contact the storage administrator if the '
         'problem persists.'
+    )
+    # A dropped connection is only evidence of exhausted capacity, never proof:
+    # it is just as often a network fault.  Naming both keeps the message from
+    # sending the user off to free up space when nothing is full.
+    CONNECTION_INTERRUPTED_MESSAGE = (
+        'Upload failed because the connection to the cloud storage was interrupted before the '
+        'upload completed.  This may indicate that the storage is full, that its quota has '
+        'been exceeded, or that there was a network problem.  Please retry the upload, and '
+        'contact the storage administrator if the problem persists.'
     )
 
     def __init__(self, auth, credentials, settings, **kwargs):
@@ -515,6 +534,14 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # body, and a chained ``__context__`` puts it straight back into
             # the rendered traceback.
             raise self._translate_upload_error(err) from None
+        except CONNECTION_ERRORS as err:
+            # Some S3-compatible storages close the connection while the client
+            # is still sending the request body (e.g. when the storage-side
+            # quota has been exceeded).  Without this handler the raw client
+            # error propagates as an unexplained HTTP 500.
+            logger.error('Connection error during contiguous upload: {!r}'.format(err))
+            raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
+                                         code=HTTPStatus.BAD_GATEWAY)
 
         # S3-compatible server automatically validates Content-MD5
         # If MD5 doesn't match, server returns 400 UploadError before writing data
@@ -534,6 +561,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # body, and a chained ``__context__`` puts it straight back into
             # the rendered traceback.
             raise self._translate_upload_error(err) from None
+        except CONNECTION_ERRORS as err:
+            logger.error('Connection error during multipart session creation: {!r}'.format(err))
+            raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
+                                         code=HTTPStatus.BAD_GATEWAY)
 
         try:
             # Step 2. Break stream into chunks and upload them one by one
@@ -556,6 +587,11 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 # translate quota-exhaustion responses into a user-facing error.
                 raise self._translate_upload_error(
                     err, extra_message=abort_message) from None
+            if isinstance(err, CONNECTION_ERRORS):
+                raise exceptions.UploadError(
+                    '{}{}'.format(self.CONNECTION_INTERRUPTED_MESSAGE, abort_message),
+                    code=HTTPStatus.BAD_GATEWAY,
+                )
             raise exceptions.UploadError('{}{}'.format(msg, abort_message))
 
     async def _create_upload_session(self, path):
