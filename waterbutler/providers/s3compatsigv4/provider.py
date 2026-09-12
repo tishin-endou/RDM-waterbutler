@@ -70,6 +70,10 @@ _MISSING = object()
 # added WaterButler-authored error would silently pick the wrong branch.
 _STORAGE_RESPONSE_FLAG = '_wb_storage_response'
 
+# The failure was observed while committing a multipart upload, so the object
+# may exist on the storage even though the request is reported as failed.
+_COMMIT_OUTCOME_UNKNOWN_FLAG = '_wb_commit_outcome_unknown'
+
 
 def _mark_storage_response(err):
     """Tag ``err`` as carrying a raw storage response body."""
@@ -79,6 +83,15 @@ def _mark_storage_response(err):
 
 def _is_storage_response(err):
     return getattr(err, _STORAGE_RESPONSE_FLAG, False)
+
+
+def _mark_commit_outcome_unknown(err):
+    setattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, True)
+    return err
+
+
+def _is_commit_outcome_unknown(err):
+    return getattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, False)
 
 
 def _local_name_lookup(mapping, local_name, default=None):
@@ -168,11 +181,22 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     # A dropped connection is only evidence of exhausted capacity, never proof:
     # it is just as often a network fault.  Naming both keeps the message from
     # sending the user off to free up space when nothing is full.
+    # "before the upload completed" was removed deliberately: the same message
+    # is returned when the connection drops while *reading the answer to the
+    # commit*, and there the upload may well have completed.  Asserting the
+    # opposite is what sends the user off to upload the file a second time.
     CONNECTION_INTERRUPTED_MESSAGE = (
-        'Upload failed because the connection to the cloud storage was interrupted before the '
-        'upload completed.  This may indicate that the storage is full, that its quota has '
-        'been exceeded, or that there was a network problem.  Please retry the upload, and '
-        'contact the storage administrator if the problem persists.'
+        'Upload failed because the connection to the cloud storage was interrupted.  This may '
+        'indicate that the storage is full, that its quota has been exceeded, or that there '
+        'was a network problem.  Please retry the upload, and contact the storage '
+        'administrator if the problem persists.'
+    )
+    # The commit is still reported as failed (fail-closed), but an unreadable
+    # answer is not proof that nothing was written.  Saying only "the upload
+    # failed" invites a duplicate upload.
+    UPLOAD_MAY_HAVE_COMPLETED_MESSAGE = (
+        '  The upload may in fact have completed; please check the file list before '
+        'uploading the file again.'
     )
 
     async def _make_upload_request(self, *args, **kwargs):
@@ -508,6 +532,27 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         error_code = cls._parse_s3_error_body(err)[0]
         return error_code is not None and error_code in settings.QUOTA_EXCEEDED_ERROR_CODES
 
+    @classmethod
+    def _commit_outcome_note(cls, err):
+        """The notice to append when the commit's outcome is genuinely unknown.
+
+        Decision: a 4xx is the storage *stating* that it refused the request, so
+        nothing was assembled and telling the user otherwise would send them
+        hunting for a file that does not exist.  Anything else -- a 5xx, or no
+        status at all because the connection dropped -- leaves "accepted, then
+        failed while processing" open, and a silent success there is exactly
+        what produces a duplicate upload.
+
+        The rule lives here rather than at each mark site so that the three
+        ways a commit can fail cannot drift apart.
+        """
+        if not _is_commit_outcome_unknown(err):
+            return ''
+        code = getattr(err, 'code', None)
+        if isinstance(code, int) and HTTPStatus.BAD_REQUEST <= code < HTTPStatus.INTERNAL_SERVER_ERROR:
+            return ''
+        return cls.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+
     def _translate_upload_error(self, err, extra_message=''):
         """Translate a raw :class:`.UploadError` from the storage backend into a
         user-facing error.
@@ -557,6 +602,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
         error_code, error_message = self._parse_s3_error_body(err)
         is_quota_error = self._is_quota_exhaustion(err)
+        outcome_note = self._commit_outcome_note(err)
 
         # The translated error only carries a summary message, so this is the
         # single place where the storage's own diagnostics (RequestId, Resource)
@@ -576,7 +622,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             code_note = '  (storage error code: {})'.format(error_code) \
                 if error_code is not None else ''
             return exceptions.UploadError(
-                '{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note, extra_message),
+                '{}{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note, outcome_note,
+                                  extra_message),
                 code=HTTPStatus.INSUFFICIENT_STORAGE,
                 # Running out of storage is an expected, user-resolvable failure:
                 # keep it out of Sentry's error level and the 5xx alerting path.
@@ -585,8 +632,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         if error_code is not None:
             return exceptions.UploadError(
                 'Upload failed because the cloud storage returned an error.  '
-                '(storage error code: {}, message: {}){}'.format(
-                    error_code, error_message, extra_message),
+                '(storage error code: {}, message: {}){}{}'.format(
+                    error_code, error_message, outcome_note, extra_message),
                 code=err.code,
             )
         # Nothing could be classified.  ``err`` must still not be handed back:
@@ -598,7 +645,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         # presigned URL including its signature.  The raw body is already in
         # the log above, which is where it belongs.
         return exceptions.UploadError(
-            '{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, extra_message),
+            '{}{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, outcome_note,
+                            extra_message),
             code=err.code)
 
     async def upload(self, stream, path, conflict='replace', **kwargs):
@@ -732,11 +780,16 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 raise self._translate_upload_error(
                     err, extra_message=abort_message) from None
             if isinstance(err, CONNECTION_ERRORS):
+                # A connection error carries no status, so the notice applies
+                # whenever the commit was the request that dropped.  This is
+                # the path a read failure at commit time takes.
                 raise exceptions.UploadError(
-                    '{}{}'.format(self.CONNECTION_INTERRUPTED_MESSAGE, abort_message),
+                    '{}{}{}'.format(self.CONNECTION_INTERRUPTED_MESSAGE,
+                                    self._commit_outcome_note(err), abort_message),
                     code=HTTPStatus.BAD_GATEWAY,
                 )
-            raise exceptions.UploadError('{}{}'.format(msg, abort_message))
+            raise exceptions.UploadError(
+                '{}{}{}'.format(msg, self._commit_outcome_note(err), abort_message))
 
     async def _create_upload_session(self, path):
         """This operation initiates a multipart upload and returns an upload ID. This upload ID is
@@ -877,6 +930,35 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                          session_upload_id, type(err).__name__,
                          int(status) if isinstance(status, int) else status, s3_error_code))
 
+    @staticmethod
+    def _no_parts_left(resp_xml):
+        """Whether a LIST PARTS body reports an empty parts list."""
+        uploaded_chunks_list = xmltodict.parse(resp_xml, strip_whitespace=False)
+        return len(uploaded_chunks_list['ListPartsResult'].get('Part', [])) == 0
+
+    async def _abort_confirmed_by_list_parts(self, path, session_upload_id):
+        """Ask LIST PARTS whether an abort that reported ``NoSuchUpload`` took effect.
+
+        This is the same criterion the success path applies, asked of the same
+        endpoint -- the point is precisely that it is *not* the DELETE's own
+        word for it.
+
+        A failure to obtain the answer returns ``False``.  The whole reason this
+        check exists is that declaring success on an unestablished claim is what
+        suppresses the "please remove the parts manually" warning; an
+        unanswerable question has to keep the claim unestablished, not resolve
+        it by default.  The caller then logs and retries, which is what it would
+        have done without this branch at all.
+        """
+        try:
+            resp_xml, session_deleted = await self._list_uploaded_chunks(path, session_upload_id)
+            return session_deleted or self._no_parts_left(resp_xml)
+        except Exception as err:
+            logger.warning('Could not confirm a NoSuchUpload abort via ListParts. '
+                           'upload_id={} error_type={}'.format(session_upload_id,
+                                                               type(err).__name__))
+            return False
+
     async def _abort_chunked_upload(self, path, session_upload_id):
         """This operation aborts a multipart upload. After a multipart upload is aborted, no
         additional parts can be uploaded using that upload ID. The storage consumed by any
@@ -926,20 +1008,33 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 # LIST PARTS
                 resp_xml, session_deleted = await self._list_uploaded_chunks(path, session_upload_id)
 
-                if session_deleted:
-                    # Abort is successful if the session has been deleted
-                    is_aborted = True
-                    break
-
-                uploaded_chunks_list = xmltodict.parse(resp_xml, strip_whitespace=False)
-                parsed_parts_list = uploaded_chunks_list['ListPartsResult'].get('Part', [])
-                if len(parsed_parts_list) == 0:
-                    # Abort is successful when there is no part left
+                # Abort is successful if the session has been deleted, or when
+                # there is no part left.
+                if session_deleted or self._no_parts_left(resp_xml):
                     is_aborted = True
                     break
             except exceptions.UploadError as err:
-                self._log_abort_failure(err, session_upload_id,
-                                        self._parse_s3_error_body(err)[0])
+                # ``NoSuchUpload`` means the session is already gone, which is
+                # exactly the state abort is trying to reach.  Retrying to the
+                # cap and then reporting failure sends the user hunting for
+                # parts that do not exist -- which is what happens whenever the
+                # commit actually succeeded and only its response was
+                # unreadable.
+                #
+                # But "the session is gone" is not the same claim as "the parts
+                # are gone".  The docstring's own success criterion is LIST
+                # PARTS returning 404 or an empty list, and ``NoSuchUpload`` on
+                # the DELETE does not establish either -- a storage that has
+                # dropped the session record while parts are still billable
+                # would answer exactly this way.  So confirm it with the same
+                # LIST PARTS check the success path uses, and fall through to
+                # log-and-retry when the check disagrees.
+                s3_error_code = self._parse_s3_error_body(err)[0]
+                if s3_error_code == 'NoSuchUpload' and \
+                        await self._abort_confirmed_by_list_parts(path, session_upload_id):
+                    is_aborted = True
+                    break
+                self._log_abort_failure(err, session_upload_id, s3_error_code)
             except Exception as err:
                 self._log_abort_failure(err, session_upload_id)
 
@@ -1016,23 +1111,35 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id
         }
 
-        resp = await self._make_upload_request(
-            'POST',
-            functools.partial(
-                self.connection.generate_presigned_url,
-                'complete_multipart_upload',
-                Params=query_parameters,
-                ExpiresIn=200,
-                HttpMethod='POST',
-            ),
-            data=payload,
-            headers=headers,
-            expects=(
-                HTTPStatus.OK,
-                HTTPStatus.CREATED,
-            ),
-            throws=exceptions.UploadError,
-        )
+        # Every failure from here on is a failure of the commit itself, and the
+        # commit is the one request whose outcome WaterButler cannot infer:
+        # the parts are already stored, so "did the assemble happen?" is
+        # answered only by the response.  Marking at each of the three places
+        # the commit can fail is what lets ``_translate_upload_error`` tell the
+        # user before they upload the file a second time.  Which marks actually
+        # produce the notice is decided there, not here.
+        try:
+            resp = await self._make_upload_request(
+                'POST',
+                functools.partial(
+                    self.connection.generate_presigned_url,
+                    'complete_multipart_upload',
+                    Params=query_parameters,
+                    ExpiresIn=200,
+                    HttpMethod='POST',
+                ),
+                data=payload,
+                headers=headers,
+                expects=(
+                    HTTPStatus.OK,
+                    HTTPStatus.CREATED,
+                ),
+                throws=exceptions.UploadError,
+            )
+        except Exception as err:
+            _mark_commit_outcome_unknown(err)
+            raise
+
         try:
             # ``read()`` belongs inside the try: a connection dropped mid-body
             # is exactly what a struggling storage does, and leaving the read
@@ -1044,6 +1151,13 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # every upload.  Without the finally, each one leaks a connection.
             self._check_for_200_error(response_body, "CompleteMultipartUpload",
                                       exceptions.UploadError)
+        except Exception as err:
+            # ``Exception`` rather than ``UploadError``: the storage did answer
+            # the commit and we could not read the answer, which arrives as an
+            # aiohttp error.  Narrowing this to ``UploadError`` meant the one
+            # case the notice exists for was the one case that never got it.
+            _mark_commit_outcome_unknown(err)
+            raise
         finally:
             await resp.release()
 

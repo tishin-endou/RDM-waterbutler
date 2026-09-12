@@ -2054,6 +2054,130 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('error_body', [
+        b'<Error/>',
+        b'<Error><Message>no code here</Message></Error>',
+        b'<Error><Code>QuotaExceeded',
+    ])
+    async def test_chunked_upload_complete_unclassifiable_warns_upload_may_exist(
+            self, provider, file_stream, mock_time, error_body):
+        # Fail-closed is kept, but the complete may in fact
+        # have succeeded -- we simply could not read the answer.  Telling the
+        # user only that the upload failed invites a duplicate.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        provider._create_upload_session = MockCoroutine(return_value=upload_id)
+        provider._upload_parts = MockCoroutine(return_value=[{'ETAG': '"etag1"'}])
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        resp = mock.Mock()
+        resp.read = MockCoroutine(return_value=error_body)
+        resp.release = MockCoroutine()
+        provider.make_request = MockCoroutine(return_value=resp)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message
+        # Asserting against the constant alone passes for *any* value of it,
+        # including ``''``.  Pinning the wording here is what makes the
+        # assertion above detect the message being emptied (the same failure
+        # mode the ERROR_BODY_LOG_LIMIT test was fixed for).
+        assert 'may in fact have completed' in provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+        assert 'check the file list' in provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+        # The raw body must still not reach the user.
+        assert 'Error' not in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_complete_read_failure_warns_upload_may_exist(
+            self, provider, file_stream, mock_time):
+        # The commit was sent and the storage answered -- we just could not read
+        # the answer.  This is the case the notice exists for, yet it
+        # was the one case that did not get it: ``_mark_commit_outcome_unknown``
+        # sat behind ``except exceptions.UploadError``, which a dropped
+        # connection does not satisfy.  The user was told the upload was
+        # "interrupted before the upload completed" and asked to retry.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
+        provider._upload_parts = MockCoroutine(return_value=[{'ETAG': '"etag1"'}])
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        resp = mock.Mock()
+        resp.read = MockCoroutine(side_effect=aiohttp.ServerDisconnectedError())
+        resp.release = MockCoroutine()
+        provider.make_request = MockCoroutine(return_value=resp)
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message
+        # The connection message must not contradict the notice it now carries.
+        assert 'before the upload completed' not in exc.value.message
+        # The connection was still released despite the read blowing up.
+        assert resp.release.called
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('status,error_code,expect_notice', [
+        # Decision (C): a 4xx is the storage stating it refused the request, so
+        # nothing was committed and the notice would be misleading.  A 5xx says
+        # the server failed while handling a request it had already accepted --
+        # whether the parts were assembled is genuinely unknown.
+        (403, 'AccessDenied', False),
+        (400, 'InvalidPart', False),
+        (500, 'InternalError', True),
+        (503, 'SlowDown', True),
+    ])
+    async def test_chunked_upload_complete_notice_follows_status_class(
+            self, provider, file_stream, mock_time, status, error_code, expect_notice):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
+        provider._upload_parts = MockCoroutine(return_value=[{'ETAG': '"etag1"'}])
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Error><Code>{}</Code><Message>boom</Message></Error>'.format(error_code))
+        provider.make_request = MockCoroutine(
+            side_effect=exceptions.UploadError({'response': error_xml}, code=status))
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert (provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message) is expect_notice
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_create_session_connection_error_does_not_claim_a_commit(
+            self, provider, file_stream, mock_time):
+        # No commit was ever in flight at session creation, so the notice must
+        # not appear -- otherwise it stops meaning anything.
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        provider.make_request = MockCoroutine(side_effect=aiohttp.ServerDisconnectedError())
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+
+        assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE not in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_chunked_upload_complete_200_with_error_quota(self, provider, file_stream,
                                                                 mock_time):
         assert file_stream.size == 6
@@ -2656,6 +2780,68 @@ class TestCRUD:
 
         assert aiohttpretty.has_call(method='DELETE', uri=abort_url)
         assert aborted is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_abort_chunked_upload_no_such_upload_is_already_clean(
+            self, provider, mock_time, generate_url_helper):
+        # The session is gone, which is precisely the state
+        # abort is trying to reach.  Retrying until the cap and then reporting
+        # failure sends the user hunting for parts that do not exist.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        params = {'uploadId': upload_id}
+        abort_url = generate_url_helper(key=path.full_path, method='DELETE', expires=100,
+                                        headers={}, query_parameters=params)
+        no_such_upload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                          '<Error><Code>NoSuchUpload</Code>'
+                          '<Message>The specified upload does not exist.</Message></Error>')
+        aiohttpretty.register_uri('DELETE', abort_url, body=no_such_upload.encode('utf-8'),
+                                  status=404)
+
+        list_url = generate_url_helper(key=path.full_path, method='GET', expires=100,
+                                       headers={}, query_parameters=params)
+        aiohttpretty.register_uri('GET', list_url, body=no_such_upload.encode('utf-8'),
+                                  status=404)
+
+        aborted = await provider._abort_chunked_upload(path, upload_id)
+
+        assert aborted is True
+        # Decision (B): ListParts is what the docstring names as the criterion
+        # for a successful abort, so ``NoSuchUpload`` is confirmed rather than
+        # trusted.  One extra request; still no retry budget burned.
+        assert len(aiohttpretty.calls) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_abort_no_such_upload_with_parts_left_still_warns(
+            self, provider, mock_time, generate_url_helper):
+        # ``NoSuchUpload`` has three causes: the commit succeeded, the session
+        # was already aborted, or the session expired by TTL.  Only the third
+        # can leave parts behind, and S3-compatible storages do not all match
+        # AWS here.  Treating the code alone as proof would suppress the
+        # "please remove them manually" warning exactly when it is needed.
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEUPLOADID'
+        params = {'uploadId': upload_id}
+        abort_url = generate_url_helper(key=path.full_path, method='DELETE', expires=100,
+                                        headers={}, query_parameters=params)
+        no_such_upload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                          '<Error><Code>NoSuchUpload</Code>'
+                          '<Message>The specified upload does not exist.</Message></Error>')
+        aiohttpretty.register_uri('DELETE', abort_url, body=no_such_upload.encode('utf-8'),
+                                  status=404)
+
+        list_url = generate_url_helper(key=path.full_path, method='GET', expires=100,
+                                       headers={}, query_parameters=params)
+        parts_left = ('<?xml version="1.0" encoding="UTF-8"?>'
+                      '<ListPartsResult><Part><PartNumber>1</PartNumber>'
+                      '<ETag>"etag1"</ETag></Part></ListPartsResult>')
+        aiohttpretty.register_uri('GET', list_url, body=parts_left.encode('utf-8'), status=200)
+
+        aborted = await provider._abort_chunked_upload(path, upload_id)
+
+        assert aborted is False
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
