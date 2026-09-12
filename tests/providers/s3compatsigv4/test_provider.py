@@ -8,6 +8,7 @@ import hashlib
 import asyncio
 import logging
 import datetime
+import importlib
 
 import aiohttp
 import aiohttpretty
@@ -1779,6 +1780,110 @@ class TestCRUD:
         assert records[0].levelno == logging.WARNING
         assert 'QUOTAREQUESTID' in records[0].getMessage()
 
+    def test_quota_exceeded_error_codes_env_override(self):
+        # ``SettingsDict.get`` always returns a ``str`` when the envvar is set,
+        # which turns the ``error_code in ...`` membership test into substring
+        # matching.  List settings must be read with ``get_object``.
+        env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES':
+               '["XMinioStorageFull"]'}
+        try:
+            with mock.patch.dict(os.environ, env):
+                codes = importlib.reload(pd_settings).QUOTA_EXCEEDED_ERROR_CODES
+        finally:
+            # Restore the module *after* the envvar patch is undone, otherwise
+            # the override leaks into every later test.
+            importlib.reload(pd_settings)
+
+        assert not isinstance(codes, str)
+        assert 'XMinioStorageFull' in codes
+        # A substring of a configured code must never be treated as a match.
+        assert 'StorageFull' not in codes
+
+    @pytest.mark.parametrize('label,raw,expected', [
+        # ``get_object`` is ``json.loads`` with no type check, so the envvar can
+        # legitimately decode to any JSON type.  Every one of them has to end up
+        # as a set of strings, because the only consumer is ``code in codes``.
+        ('json-array', '["XMinioStorageFull"]', {'XMinioStorageFull'}),
+        # A quoted JSON scalar decodes to ``str``.  Feeding that to ``frozenset``
+        # explodes it into one entry per character, so the configured code stops
+        # matching entirely -- and nothing fails loudly.
+        ('json-scalar-string', '"QuotaExceeded"', {'QuotaExceeded'}),
+        # A JSON number is not iterable at all: ``frozenset(507)`` raises
+        # ``TypeError`` while the settings module is being imported, which takes
+        # the whole provider down rather than just mis-classifying an error.
+        ('json-number', '507', {'507'}),
+    ])
+    def test_quota_exceeded_error_codes_env_types(self, label, raw, expected):
+        # This must exercise the *real* path: envvar -> ``get_object`` ->
+        # whatever normalisation the settings module does.  Patching the
+        # already-computed attribute would skip exactly the code under test.
+        env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': raw}
+        try:
+            with mock.patch.dict(os.environ, env):
+                codes = importlib.reload(pd_settings).QUOTA_EXCEEDED_ERROR_CODES
+        finally:
+            importlib.reload(pd_settings)
+
+        assert set(codes) == expected
+        # A substring of a configured code must never be treated as a match.
+        for code in expected:
+            assert code[:-1] not in codes
+
+    @pytest.mark.parametrize('label,raw', [
+        # The value operators are most likely to write: the bare error code,
+        # without the JSON quoting ``get_object`` requires.
+        ('bare-word', 'QuotaExceeded'),
+        ('comma-separated', 'QuotaExceeded,XMinioStorageFull'),
+        ('empty-string', ''),
+        ('truncated-json', '["QuotaExceeded"'),
+    ])
+    def test_malformed_json_falls_back_instead_of_killing_the_import(self, label, raw):
+        # ``_normalise_error_codes`` is applied to the *return value* of
+        # ``get_object``, so it never sees a value that ``json.loads`` refused.
+        # An import-time ``JSONDecodeError`` is not a loud failure: stevedore
+        # turns the entry-point load error into ``ProviderNotFound``, so every
+        # s3compatsigv4 request answers 404 while the process stays up and the
+        # other providers keep working.  A quota-code typo must not do that.
+        env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': raw}
+        try:
+            with mock.patch.dict(os.environ, env):
+                codes = importlib.reload(pd_settings).QUOTA_EXCEEDED_ERROR_CODES
+        finally:
+            importlib.reload(pd_settings)
+
+        # Falling back to the defaults keeps quota detection working rather
+        # than leaving it configured with a half-parsed value.
+        assert 'QuotaExceeded' in codes
+        assert 'XMinioStorageFull' in codes
+
+    def test_mapping_config_is_rejected_rather_than_silently_degraded(self):
+        # A ``dict`` satisfies ``Iterable``, so it slips past the scalar branch
+        # and ``frozenset(str(code) for code in ...)`` quietly reduces it to its
+        # *keys*.  That is indistinguishable from a working configuration until
+        # a quota error fails to be recognised in production.
+        env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': '{"QuotaExceeded": 507}'}
+        try:
+            with mock.patch.dict(os.environ, env):
+                codes = importlib.reload(pd_settings).QUOTA_EXCEEDED_ERROR_CODES
+        finally:
+            importlib.reload(pd_settings)
+
+        assert 'XMinioStorageFull' in codes
+
+    def test_quota_error_codes_env_types_reach_the_provider(self, provider):
+        # The normalisation is only useful if the value the provider actually
+        # reads is the normalised one.
+        env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': '"QuotaExceeded"'}
+        try:
+            with mock.patch.dict(os.environ, env):
+                importlib.reload(pd_settings)
+                translated = provider._translate_upload_error(storage_error(
+                    {'response': '<Error><Code>QuotaExceeded</Code></Error>'}, code=403))
+        finally:
+            importlib.reload(pd_settings)
+
+        assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
+
     def test_quota_exceeded_error_codes_defaults(self):
         codes = pd_settings.QUOTA_EXCEEDED_ERROR_CODES
         # MinIO returns XMinioStorageFull on the S3 data path when the disk is
@@ -1788,6 +1893,43 @@ class TestCRUD:
         assert 'XMinioStorageFull' in codes
         # Not an S3 error code -- it is an HTTP reason phrase.
         assert 'InsufficientStorage' not in codes
+
+    @pytest.mark.parametrize('label,configured,expected', [
+        ('list', ['QuotaExceeded'], {'QuotaExceeded'}),
+        # A bare ``str`` must be wrapped, not iterated: iterating it yields one
+        # entry per character and ``'Quota' in 'QuotaExceeded'`` would have
+        # turned the membership test into substring matching.
+        ('bare-string', 'QuotaExceeded', {'QuotaExceeded'}),
+        # A JSON number is not iterable, so it has to be wrapped before the
+        # ``frozenset`` call rather than after it.
+        ('bare-int', 507, {'507'}),
+        ('mixed-list', ['QuotaExceeded', 507], {'QuotaExceeded', '507'}),
+        ('tuple', ('QuotaExceeded',), {'QuotaExceeded'}),
+    ])
+    def test_normalise_error_codes(self, label, configured, expected):
+        codes = pd_settings._normalise_error_codes(configured)
+
+        assert isinstance(codes, frozenset)
+        assert codes == expected
+        # Every element is a ``str``, so ``code in codes`` can never raise.
+        assert all(isinstance(code, str) for code in codes)
+
+    @pytest.mark.parametrize('configured,warns', [
+        (['QuotaExceeded'], False),
+        ('QuotaExceeded', True),
+        (507, True),
+    ])
+    def test_normalise_error_codes_warns_on_scalar(self, caplog, configured, warns):
+        # A scalar is coerced, not rejected: raising here would happen at import
+        # time and take the provider down over a typo.  The warning is the only
+        # signal the operator gets, so it must actually be emitted.
+        with caplog.at_level(logging.WARNING, logger=pd_settings.__name__):
+            pd_settings._normalise_error_codes(configured)
+
+        records = [r for r in caplog.records if r.name == pd_settings.__name__]
+        assert bool(records) is warns
+        if warns:
+            assert 'QUOTA_EXCEEDED_ERROR_CODES' in records[0].getMessage()
 
     def test_translate_upload_error_507_fallback(self, provider):
         # The storage may answer 507 with an error code we do not know.  The
