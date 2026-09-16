@@ -24,11 +24,7 @@ CHUNKED_UPLOAD_MAX_ABORT_RETRIES = int(config.get('CHUNKED_UPLOAD_MAX_ABORT_RETR
 # This list is not exhaustive, so ``_translate_upload_error`` additionally
 # treats HTTP 507 as a quota failure regardless of the error code.
 # Deployments can replace this list via the provider config when their storage
-# vendor uses a different error code.  ``get_object`` is required here: plain
-# ``get`` returns the raw string when the value comes from an envvar, which
-# would silently turn the membership test into substring matching.
-
-
+# vendor uses a different error code.
 QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS = [
     'QuotaExceeded',
     'XMinioAdminBucketQuotaExceeded',
@@ -38,6 +34,14 @@ QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS = [
 
 def _read_error_codes():
     """Read the configured error-code list, surviving anything the envvar holds.
+
+    ``get_object`` is required here rather than plain ``get``: ``get`` returns
+    the raw string when the value comes from an envvar, i.e. the *undecoded*
+    JSON text.  A bare ``str`` takes ``_normalise_error_codes``'s scalar
+    branch and becomes ``frozenset({'["QuotaExceeded"]'})``, one entry holding
+    the JSON text itself.  That is worse than substring matching, not better:
+    no storage error code can ever equal it, so quota detection silently stops
+    working everywhere except the HTTP 507 fallback.
 
     ``SettingsDict.get_object`` calls ``json.loads`` with no ``try``, so an
     envvar that is not valid JSON raises while this module is being imported.
@@ -93,7 +97,14 @@ def _normalise_error_codes(configured):
     a result that is indistinguishable from a working configuration until a
     quota error goes unrecognised in production.  There is no reading of
     ``{"QuotaExceeded": 507}`` that makes the operator's intent unambiguous.
+
+    ``None`` is treated as "not configured".  JSON ``null`` decodes to it and
+    it is neither a ``Mapping``, a ``str``, nor ``Iterable``, so it used to
+    reach the scalar branch and produce ``frozenset({'None'})`` -- a
+    configuration under which no storage error code can ever match.
     """
+    if configured is None:
+        return frozenset(QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS)
     if isinstance(configured, Mapping):
         logger.warning('S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES is a mapping; '
                        'expected a list of error codes.  Falling back to the built-in '
