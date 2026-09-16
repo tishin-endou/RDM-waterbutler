@@ -28,6 +28,22 @@ from waterbutler.providers.s3compatsigv4.metadata import (
 
 logger = logging.getLogger(__name__)
 
+# Matches an ``<Error>`` element with or without a namespace prefix, so that
+# namespace-prefixed error documents are not rejected by the cheap pre-filter.
+ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
+
+
+def _local_name_lookup(mapping, local_name, default=None):
+    """Look up ``local_name`` in an ``xmltodict`` mapping, ignoring any XML
+    namespace prefix on the keys.  Returns ``default`` when absent.
+    """
+    if local_name in mapping:
+        return mapping[local_name]
+    for key, value in mapping.items():
+        if isinstance(key, str) and key.rsplit(':', 1)[-1] == local_name:
+            return value
+    return default
+
 
 def compute_md5(fp):
     """Compute MD5 hash for file-like object."""
@@ -306,6 +322,53 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         except KeyError:
             raise exceptions.MetadataError('Cannot get content size and ETag')
         return size, etag
+
+    @staticmethod
+    def _raw_error_body(err):
+        """Return the storage's raw response body carried by ``err``, or ``None``.
+
+        ``exception_from_response`` stores an XML error body either as
+        ``err.data['response']`` (dict) or as ``err.message`` (str).
+        """
+        body = None
+        data = getattr(err, 'data', None)
+        if isinstance(data, dict):
+            body = data.get('response')
+        if body is None:
+            body = getattr(err, 'message', None)
+        return body if isinstance(body, str) else None
+
+    @classmethod
+    def _parse_s3_error_body(cls, err):
+        """Extract the S3 XML error ``Code`` and ``Message`` from an
+        :class:`waterbutler.core.exceptions.UploadError` raised by ``make_request``.
+
+        :param err: ( :class:`.UploadError` ) The error raised by ``make_request``
+        :rtype: tuple(str or None, str or None)
+        :return: ``(error_code, error_message)``, or ``(None, None)`` when the
+            response body is not a parsable S3 XML error
+        """
+        body = cls._raw_error_body(err)
+        if body is None or not ERROR_ELEMENT_RE.search(body):
+            return None, None
+        try:
+            parsed = xmltodict.parse(body)
+        except ExpatError:
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        error = _local_name_lookup(parsed, 'Error')
+        if not isinstance(error, dict):
+            # ``<Error>text</Error>`` parses to a plain string, and an empty
+            # document parses to ``None``.  Neither carries an error code.
+            return None, None
+        code = _local_name_lookup(error, 'Code')
+        message = _local_name_lookup(error, 'Message')
+        if not isinstance(code, str) or not code.strip():
+            # An empty ``<Code/>`` is ``None`` and ``<Code attr="..."/>`` is a
+            # dict; without a code there is nothing to translate.
+            return None, None
+        return code.strip(), message.strip() if isinstance(message, str) else None
 
     async def upload(self, stream, path, conflict='replace', **kwargs):
         """Uploads the given stream to S3 Compatible Storage
