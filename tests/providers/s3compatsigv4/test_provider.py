@@ -61,14 +61,15 @@ from waterbutler.providers.s3compatsigv4.metadata import (S3CompatSigV4Revision,
                                                      )
 from hmac import compare_digest
 
-# --- commit 成否注記の全直積テストの素材 ---------------------------
+# --- Material for the commit-notice cartesian product ----------------------
 #
-# 不変条件は「同じ操作文脈・同じ *観測* コードなら、輸送経路が違っても同じ結果」。
-# 経路ごとにパラメータ集合が重ならないと矛盾が表に出ないので、経路と
-# コードの直積を1本で張る。
+# Invariant: for the same operation and the same *observed* code, every
+# transport reaches the same verdict.  Eight representative codes: 3
+# definitive rejections (no notice), 3 indeterminate, 1 unknown, 1 missing.
 #
-# コードは分類表の代表8種: 確定拒否(注記なし)3件 / 不定3件 / 未知コード /
-# コードなし。未知コードとコードなしは **UNKNOWN に倒す**(fail-safe)。
+# An unknown code and a missing code both fall to UNKNOWN.  That is the
+# fail-safe direction: an over-reported notice costs the user a re-check,
+# an under-reported one silently claims nothing was stored.
 COMMIT_CODE_CASES = [
     ('AccessDenied', False),
     ('InvalidPart', False),
@@ -80,9 +81,9 @@ COMMIT_CODE_CASES = [
     (None, True),
 ]
 
-# 確定拒否コードの分類表そのもの。実装(``DEFINITIVE_REJECTION_CODES``)からは
-# 生成せず、独立に書き下す。実装から生成すると、行を消す変更で
-# パラメータごと消えてしまい、その行を守るテストが存在しなくなる。
+# The classification table, written out independently of the implementation's
+# ``DEFINITIVE_REJECTION_CODES``.  Generating it from the implementation would
+# let a deleted row delete its own parameter, leaving that row unguarded.
 DEFINITIVE_REJECTION_CODES = [
     'AccessDenied',
     'InvalidPart',
@@ -95,18 +96,18 @@ DEFINITIVE_REJECTION_CODES = [
     'NoSuchBucket',
 ]
 
-# コードが観測できる経路。3 x 8 = 24 セル。
+# Transports where the code is observable.  3 x 8 = 24 cells.
 OBSERVED_TRANSPORTS = ['direct_4xx', 'direct_5xx', 'complete_200_error']
-# コードが観測できない経路。2 x 8 = 16 セル。ストレージが何を言うつもりでも
-# WaterButler には届かないので、意図したコードに関わらず UNKNOWN になる。
+# Transports where it is not.  2 x 8 = 16 cells: whatever the storage meant
+# to say never reaches WaterButler, so the verdict is UNKNOWN regardless.
 LATENT_TRANSPORTS = ['disconnect', 'broken_xml']
 
 
 def commit_error_xml(error_code):
-    """CompleteMultipartUpload に対する S3 のエラー本文。
+    """An S3 error body for CompleteMultipartUpload.
 
-    ``error_code`` が ``None`` のときは ``<Code>`` を欠いた本文を返す
-    —— 解析はできるがコードが無い、という「コードなし」セルの実体である。
+    An ``error_code`` of ``None`` yields a body with no ``<Code>`` element:
+    the "missing code" cell, parsable but carrying no verdict.
     """
     if error_code is None:
         return ('<?xml version="1.0" encoding="UTF-8"?>'
@@ -116,7 +117,7 @@ def commit_error_xml(error_code):
 
 
 def arrange_commit_failure(provider, transport, error_code):
-    """``_complete_multipart_upload`` だけを ``transport`` の形で失敗させる。"""
+    """Fail only ``_complete_multipart_upload``, in the shape of ``transport``."""
     if transport == 'direct_4xx':
         provider.make_request = MockCoroutine(side_effect=exceptions.UploadError(
             {'response': commit_error_xml(error_code)}, code=400))
@@ -124,32 +125,33 @@ def arrange_commit_failure(provider, transport, error_code):
         provider.make_request = MockCoroutine(side_effect=exceptions.UploadError(
             {'response': commit_error_xml(error_code)}, code=500))
     elif transport == 'complete_200_error':
-        # S3 は CompleteMultipartUpload の失敗を HTTP 200 + <Error> で返す。
+        # S3 reports a failed CompleteMultipartUpload as HTTP 200 + <Error>.
         resp = mock.Mock()
         resp.read = MockCoroutine(return_value=commit_error_xml(error_code).encode('utf-8'))
         resp.release = MockCoroutine()
         provider.make_request = MockCoroutine(return_value=resp)
     elif transport == 'disconnect':
-        # 応答が届いていないのでコードは観測できない。aiohttp の例外が持つ
-        # ``message`` を本文と取り違えて拾う実装を殺すため、あえて S3 の
-        # エラー XML を message に入れる(``_raw_error_body`` は ``message``
-        # にフォールバックする)。
+        # No response arrived, so no code is observable.  The S3 error XML is
+        # put in the exception's ``message`` on purpose: ``_raw_error_body``
+        # falls back to ``message``, so an implementation that reads a code
+        # from there rather than from a response body has to fail here.
         provider.make_request = MockCoroutine(
             side_effect=aiohttp.ServerDisconnectedError(commit_error_xml(error_code)))
     elif transport == 'broken_xml':
-        # 本文は届いたが途中で切れている。コード文字列は本文中に存在するが
-        # 解析できないので観測はできない —— 部分一致で拾ってはならない。
+        # The body arrived but is truncated.  The code string is present in it
+        # yet cannot be parsed, so it is not observed -- a substring match must
+        # never pick it up.
         truncated = commit_error_xml(error_code)[:-12].encode('utf-8')
         resp = mock.Mock()
         resp.read = MockCoroutine(return_value=truncated)
         resp.release = MockCoroutine()
         provider.make_request = MockCoroutine(return_value=resp)
-    else:  # pragma: no cover - パラメータの打ち間違いを黙って通さない
+    else:  # pragma: no cover - a mistyped parameter must not pass silently
         raise AssertionError('unknown transport: {}'.format(transport))
 
 
 def arrange_chunked_commit(provider):
-    """commit だけが失敗する ``_chunked_upload`` の下ごしらえ。"""
+    """Set up ``_chunked_upload`` so that only the commit fails."""
     provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
     provider.CHUNK_SIZE = 2
     provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
@@ -158,28 +160,24 @@ def arrange_chunked_commit(provider):
 
 
 class commit_server:
-    """commit を1本だけ受ける ``aiohttp.web`` サーバ。
+    """An ``aiohttp.web`` server that accepts a single commit.
 
-    ``aiohttpretty`` は ``ClientSession._request`` の *上* で応答を差し込むため、
-    その呼び出しの *内側* で起きる **リダイレクト追随** は再現できない。
-    それを固定するテストは実ソケットを使うしかない。
+    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so
+    the redirect following that happens *inside* that call cannot be
+    reproduced with it, and pinning it needs a real socket.  The real socket
+    also pins, against a real ``ClientResponse``, the premise the three
+    mock-injection cells lean on -- that the injection point is correct.
 
-    デコードできない応答本文のほうは ``aiohttpretty`` でも再現できる ——
-    本文は素通しされ、core の ``exception_from_response`` が同じ
-    ``UnicodeDecodeError`` を出す。それでも実ソケットで1本張るのは、モック
-    注入の3セルが寄りかかっている「注入点が正しい」という前提ごと、実
-    ``ClientResponse`` で固定するためであって、再現不能だからではない。
+    Startup and teardown are owned here.  With ``runner.setup()`` through URL
+    assembly left outside the ``finally``, a failure after the server started
+    would carry a listening socket and the provider's sessions into the next
+    test.
 
-    起動から後始末までを丸ごと引き受ける。``runner.setup()`` から URL の
-    組み立てまでを ``finally`` の外に置くと、サーバを起動したあとに準備が
-    失敗したとき、待ち受けソケットと provider のセッションが開いたまま
-    次のテストへ持ち越される。
-
-    ``runner.setup()`` 自体は守っていない。aiohttp 3.6.2 の
-    ``BaseRunner.cleanup()`` は ``self._server is None`` のとき即 return する
-    ので、setup が落ちた状態で呼んでも何もしない。ここで使う ``Application``
-    は ``on_startup`` / ``on_cleanup`` を1つも登録しないため、setup が途中で
-    落ちて資源が残る経路そのものが無い。
+    ``runner.setup()`` itself is not guarded.  In aiohttp 3.6.2
+    ``BaseRunner.cleanup()`` returns immediately while ``self._server is
+    None``, so calling it after a failed setup does nothing, and the
+    ``Application`` used here registers no ``on_startup``/``on_cleanup`` --
+    there is no path by which a partial setup leaves resources behind.
     """
 
     def __init__(self, provider, app):
@@ -193,14 +191,14 @@ class commit_server:
         try:
             site = web.TCPSite(self.runner, '127.0.0.1', 0)
             await site.start()
-            # aiohttp 3.6.2 はバインド済みポートをここでしか公開しない。
-            # 将来この私有属性が消えたら AttributeError で落ちる —— 黙って
-            # skip されるより、テストが壊れたことが分かるほうがよい。
+            # aiohttp 3.6.2 exposes the bound port only here.  If this private
+            # attribute disappears the AttributeError is deliberate: a test
+            # that visibly breaks beats one that quietly skips.
             sockets = site._server.sockets
             assert sockets, 'the test server bound no socket'
             self.url = 'http://127.0.0.1:{}/first'.format(sockets[0].getsockname()[1])
         except Exception:
-            # ``__aenter__`` が投げると ``__aexit__`` は呼ばれない。
+            # ``__aexit__`` is not called when ``__aenter__`` raises.
             await self.runner.cleanup()
             raise
         return self
@@ -208,17 +206,17 @@ class commit_server:
     async def __aexit__(self, *exc_info):
         first = None
         try:
-            # 1本の close が失敗しても、残りのセッションは閉じる。for を
-            # 素通しにすると、先頭が投げた時点で後続のセッションが開いたまま
-            # 次のテストへ残る。
+            # One failing close must not strand the rest: letting the loop
+            # raise would leave every later session open and carry it into
+            # the next test.
             for session in self.provider.session_list:
                 try:
                     await session.close()
                 except Exception as err:
-                    # 伝えるのは最初の失敗だけ。後続は握り潰さず、閉じきる。
+                    # Raise the first failure, but finish closing them all.
                     first = first if first is not None else err
         finally:
-            # セッションの close が失敗しても、待ち受けソケットは必ず畳む。
+            # The listening socket comes down even if a session close fails.
             await self.runner.cleanup()
         if first is not None:
             raise first
@@ -1433,31 +1431,17 @@ class TestCRUD:
     ])
     async def test_chunked_upload_500_branch_notices_only_a_commit_failure(
             self, provider, file_stream, mock_time, fails_at, expect_notice):
-        # ``_chunked_upload`` の例外処理には出口が3つある。``UploadError`` と
-        # ``CONNECTION_ERRORS`` の2つは全直積テストが固定しているが、
-        # 「どちらでもない例外」の出口(provider.py の 500 分岐)だけは注記の
-        # 有無を誰も見ていなかった —— この行の ``_commit_outcome_note(err)`` を
-        # ``''`` に置き換える変異(N19)が全件緑のまま生き残る。
+        # The third exit of ``_chunked_upload``: an exception that is neither
+        # ``UploadError`` nor a connection error lands in the 500 arm.  It is
+        # reachable -- ``asyncio.CancelledError`` derives from ``Exception``
+        # but from neither ``aiohttp.ClientError`` nor ``asyncio.TimeoutError``.
         #
-        # 空論ではない。Python 3.6 の ``asyncio.CancelledError`` は
-        # ``Exception`` の派生でありながら ``CONNECTION_ERRORS``
-        # (``aiohttp.ClientError`` と ``asyncio.TimeoutError``)のどちらでも
-        # ないので、リクエスト実行中のキャンセルはちょうどこの分岐に落ちる。
-        # commit の応答読み取り中にキャンセルされれば、その commit が通ったか
-        # どうかは誰にも分からない = 注記が要る状況そのもの。
-        #
-        # コード軸は取らない。この分岐に来る例外は storage の応答ではないので
-        # 観測コードは常に ``None`` であり、分類表は最初から関与しない。
-        #
-        # **注入点は ``_complete_multipart_upload`` の外側の境界に置く**。
-        # commit メソッドそのものを
-        # マーク済み例外を投げるモックへ置き換えていたが、それでは
-        # 「マークが立った例外が来たら注記が出る」までしか固定できない。
-        # 実際に印を付けているのは commit 側の ``except Exception`` であり、
-        # そこを ``except (UploadError,) + CONNECTION_ERRORS`` へ狭める変異
-        # (X18)も、マークを ``isinstance`` ガードの内側へ移す変異(X16)も、
-        # 旧方式では 360 件すべて緑のまま生き残った。commit の要求側と
-        # 応答読取側それぞれに例外を注入すれば、印付けは実コードが行う。
+        # Injection stays at the *boundaries* of ``_complete_multipart_upload``
+        # (the commit request and the commit answer) and never replaces the
+        # method with a mock raising an already-marked exception.  The code
+        # under test has to be the thing that applies the mark, or narrowing
+        # its ``except Exception``, or moving the mark inside an ``isinstance``
+        # guard, leaves this test green.
         assert issubclass(asyncio.CancelledError, Exception)
         assert not issubclass(asyncio.CancelledError, pd_provider.CONNECTION_ERRORS)
 
@@ -1472,7 +1456,7 @@ class TestCRUD:
         released = []
 
         class _AnswerWeCannotRead:
-            """commit の応答。本文の読み取りだけが中断する。"""
+            """A commit answer whose body read is the part that gets cancelled."""
 
             async def read(self):
                 raise asyncio.CancelledError('cancelled while reading the commit answer')
@@ -1481,21 +1465,21 @@ class TestCRUD:
                 released.append(True)
 
         if fails_at == 'parts':
-            # パート送信中の中断。commit はまだ送られていないので、組み立ては
-            # 起きていないことが構造的に確定する = 注記は出してはいけない。
+            # Cancelled during the parts: no commit was sent, so no assembly
+            # can have started and the notice must stay off.
             provider._upload_parts = MockCoroutine(
                 side_effect=asyncio.CancelledError('cancelled during the parts'))
             provider._make_upload_request = MockCoroutine()
         else:
             provider._upload_parts = MockCoroutine(return_value=[{'ETAG': '"e"'}])
             if fails_at == 'commit-request':
-                # 要求の発行中に中断。応答が返っていないので、ストレージが
-                # 組み立てを始めたかどうかは分からない。
+                # Cancelled while sending: no answer came back, so whether
+                # the storage began assembling is unknowable.
                 provider._make_upload_request = MockCoroutine(
                     side_effect=asyncio.CancelledError('cancelled while sending the commit'))
             else:
-                # 応答は返ったが本文を読めなかった。commit が通ったかどうかは
-                # その本文にしか書かれていない。
+                # The answer came back but could not be read, and the body
+                # is the only place the commit's outcome is written.
                 provider._make_upload_request = MockCoroutine(
                     return_value=_AnswerWeCannotRead())
 
@@ -1505,11 +1489,11 @@ class TestCRUD:
         assert exc.value.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert (provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message) is expect_notice
         if fails_at == 'parts':
-            # commit は1バイトも出ていない。
+            # Not one byte of the commit went out.
             provider._make_upload_request.assert_not_called()
         else:
             assert provider._make_upload_request.call_count == 1
-        # 応答を受け取った経路では、読めなくても接続は返す。
+        # Where an answer arrived, the connection is released even unread.
         assert released == ([True] if fails_at == 'commit-read' else [])
 
     @pytest.mark.asyncio
@@ -2072,77 +2056,76 @@ class TestCRUD:
         assert len(logged.encode('utf-8')) < limit * 2
 
     @pytest.mark.parametrize('body', [
-        # 実測 **1536 バイト**(宣言の3倍)。``replace`` は
-        # デコード不能な 1 バイトごとに U+FFFD を置き、U+FFFD は UTF-8 で
-        # 3 バイトある。バイト単位で切ってからデコードするだけでは足りない。
+        # Decodes to 1536 bytes, three times the declared limit: ``replace``
+        # emits one U+FFFD per undecodable byte and U+FFFD is 3 bytes in
+        # UTF-8.  Truncating bytes and then decoding is not enough.
         b'\xff' * 512,
         b'\xff' * 4096,
-        # 有効な多バイト列。切断点が文字の途中に来ると +1〜+2 バイトになる。
+        # Valid multi-byte text: a cut inside a character adds 1-2 bytes.
         '\u3042' * 512,
         ('\u3042' * 512).encode('utf-8'),
-        # 不正バイトと有効文字が混ざった、実際のプロキシ応答に近い形。
+        # Invalid bytes mixed with valid text, as a real proxy reply looks.
         b'<html>' + b'\xc3\x28' * 300 + '\u3042'.encode('utf-8') * 100,
-        # 上限未満はそのまま通ること(切りすぎていないことの対照)。
+        # Under the limit the body passes through: the over-trimming control.
         b'<Error><Code>AccessDenied</Code></Error>',
         '<Error><Code>AccessDenied</Code></Error>',
         b'',
         '',
     ])
     def test_bounded_body_never_exceeds_the_declared_limit(self, body):
-        # 定数の宣言は「生エラー本文の先頭 ERROR_BODY_LOG_LIMIT **バイト**」。
-        # 宣言が守られているかは、戻り値を UTF-8 で**再計量**して初めて分かる。
-        # 既存テストはログ行全体を `limit * 2` 未満で見ていたため、3倍に膨らむ
-        # 入力(不正バイト列)を見逃していた。
+        # The constant declares "the first ERROR_BODY_LOG_LIMIT *bytes* of the
+        # raw error body", so the only way to check the declaration is to weigh
+        # the return value in UTF-8 again.  Bounding the whole log line instead
+        # misses inputs that inflate threefold on decode.
         bounded = pd_provider._bounded_body(body)
 
         assert len(bounded.encode('utf-8')) <= pd_provider.ERROR_BODY_LOG_LIMIT
-        # 切りすぎの検出。判定は**デコード後**の大きさで行う。入力バイト数で
-        # 書くと `b'\xff' * 512`(入力 512 バイト / デコード後 1536 バイト)で
-        # 上の表明と両立せず、テスト自体が充足不能になる。
+        # Over-trimming check, decided on the *decoded* size.  Measuring the
+        # input instead would make ``b'\xff' * 512`` (512 in, 1536 out)
+        # contradict the assertion above and the test unsatisfiable.
         source = body if isinstance(body, bytes) else body.encode('utf-8')
         decoded = source.decode('utf-8', 'replace')
         if len(decoded.encode('utf-8')) <= pd_provider.ERROR_BODY_LOG_LIMIT:
             assert bounded == decoded
         else:
-            # 上限超過側で大きさしか見ないと、何も残さず ``''`` を返す
-            # 実装でも通ってしまう。上限を守ることと本文を残すことは別の
-            # 要求で、``_bounded_body`` の存在理由は後者にある(調査のために
-            # 先頭を読ませる)。
+            # Size alone would also accept an implementation returning ``''``.
+            # Staying under the limit and keeping the body are two separate
+            # requirements and ``_bounded_body`` exists for the second one.
             #
-            # 「先頭であること」を接頭辞で固定する。何バイトで切れるかは
-            # 文字幅と不正バイトの位置で変わるので長さは指定しない。
+            # "It is the leading part" is pinned as a prefix, not as a length:
+            # where the cut lands depends on character width and on where the
+            # invalid bytes sit.
             assert bounded
             assert decoded.startswith(bounded)
-            # 上限の大半を使い切っていること。1文字だけ返す実装を落とす。
-            # U+FFFD / 3バイト文字でも 1/3 は必ず埋まる。
+            # Most of the budget has to be used, which kills an implementation
+            # returning a single character: even 3-byte units fill a third.
             assert len(bounded.encode('utf-8')) > pd_provider.ERROR_BODY_LOG_LIMIT // 3
 
     @pytest.mark.parametrize('body, expected', [
-        # 不正バイト列。``replace`` が 1 バイトごとに U+FFFD を置き、U+FFFD は
-        # UTF-8 で 3 バイトなので、512 バイトに収まるのは 512 // 3 = 170 文字。
+        # Invalid bytes: ``replace`` emits one U+FFFD per byte and U+FFFD is
+        # 3 bytes in UTF-8, so 512 // 3 = 170 characters fit.
         (b'\xff' * 512, '\ufffd' * 170),
-        # 入力がいくら長くても、残る量は同じ。
+        # However long the input, the same amount survives.
         (b'\xff' * 4096, '\ufffd' * 170),
-        # 有効な3バイト文字。端数の 2 バイトは2段目の ``ignore`` が落とす。
+        # Valid 3-byte characters; the 2 leftover bytes go in the ``ignore`` pass.
         ('\u3042' * 512, '\u3042' * 170),
         (('\u3042' * 512).encode('utf-8'), '\u3042' * 170),
     ])
     def test_bounded_body_keeps_exactly_the_leading_bytes(self, body, expected):
-        # 上限超過側を「接頭辞であること」と「上限の 1/3 より大きいこと」
-        # だけで見ると、下限が 170 バイトなので、多バイト本文だけを 256
-        # バイトへ切り詰める実装(= 現行の保持量のおよそ半分)でも
-        # 全件通ってしまう。
+        # "Is a prefix" plus "larger than a third of the limit" bottoms out at
+        # 170 bytes, which an implementation trimming multi-byte bodies to 256
+        # -- about half of what is kept today -- would still satisfy.
         #
-        # 代表入力については独立した**完全な期待値**を置く。170 という数は
-        # 実装から導かず、「U+FFFD は3バイト / 上限は512バイト」という宣言から
-        # 手で計算したものである。
+        # Representative inputs therefore carry a complete expected value.  The
+        # 170 is computed by hand from the declaration (U+FFFD is 3 bytes, the
+        # limit is 512), not derived from the implementation.
         assert pd_provider.ERROR_BODY_LOG_LIMIT == 512
         assert pd_provider._bounded_body(body) == expected
 
     def test_bounded_body_passes_none_through(self):
-        # 本文が無い応答(``exception_from_response`` が本文なしで作った
-        # エラー)では ``None`` が来る。``''`` に潰すと、ログ上で
-        # 「本文が空だった」と「本文が無かった」が区別できなくなる。
+        # An error built without a body yields ``None``.  Collapsing that to
+        # ``''`` would make "the body was empty" and "there was no body"
+        # indistinguishable in the log.
         assert pd_provider._bounded_body(None) is None
 
     def test_translate_upload_error_quota_logged_as_warning(self, provider, caplog):
@@ -2716,18 +2699,6 @@ class TestCRUD:
         # The connection was still released despite the read blowing up.
         assert resp.release.called
 
-    # 削除: ``test_chunked_upload_complete_notice_follows_status_class``
-    #
-    # 検証対象だった「4xx/5xx のステータスクラス規則」は廃止した。
-    # このテストは新しい規則を適用しても 4/4 合格してしまう —— パラメータが
-    # (403,'AccessDenied') (400,'InvalidPart') (500,'InternalError')
-    # (503,'SlowDown') と、ステータスクラス分類とコード分類が**たまたま
-    # 一致する**組み合わせだけで出来ているためである。
-    # 廃止済みの規則を検証しつつ緑であるテストは、落ちるテストより危険で、
-    # 将来の実装者に「この規則はまだ有効」と誤認させる。よって残さない。
-    # 代替は ``test_commit_notice_depends_only_on_the_observed_code``
-    # (全直積 24 セル)と ``test_commit_outcome_note_ignores_the_status_class``。
-
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_parts_connection_error_does_not_claim_a_commit(
@@ -2820,20 +2791,17 @@ class TestCRUD:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     @pytest.mark.parametrize('error_code', [
-        # 分類表にあるので抑止される。
+        # In the classification table, so the notice is suppressed.
         'AccessDenied', 'EntityTooLarge',
-        # 分類表には**無い**が、クォータ分岐が先に立つので抑止される
-        # 。以前はこれを表に載せていたが、実機 MinIO が
-        # commit 経路でクォータを強制しないことが実測で判明したため外した。
+        # Not in the table, but the quota branch runs first and suppresses it.
         'QuotaExceeded',
     ])
     async def test_complete_200_with_error_code_suppresses_the_notice(
             self, provider, file_stream, mock_time, error_code):
-        # 主張は「200 経路だから抑止される」ではなく
-        # 「**コードが分類表にある / クォータ分岐で抑止される**から」に改めた。
-        # 旧アサーションは ``_check_for_200_error`` が立てるマーカーを見ており、
-        # 経路が抑止していたのかコードが抑止していたのかを区別できなかった。
-        # 経路非依存であることは全直積テストが張る。
+        # The claim is that the *code* suppresses the notice -- a table hit or
+        # the quota branch -- not that the 200 transport does.  Asserting on
+        # the marker ``_check_for_200_error`` sets could not tell the two
+        # apart.  Transport independence is covered by the cartesian product.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -2866,10 +2834,9 @@ class TestCRUD:
     ])
     async def test_complete_200_without_an_error_code_still_warns(
             self, provider, file_stream, mock_time, body):
-        # 抑止が許されるのは、ストレージが実際に判定を下したときだけ。
-        # コードが読めなければ commit の成否は本当に分からないので、注記は
-        # 残さなければならない(``None`` は UNKNOWN)。注記の有無はステータス
-        # クラスではなくコード単独で決まる。
+        # Suppression is allowed only where the storage actually reached a
+        # verdict.  With no readable code the commit's outcome is genuinely
+        # unknown, so the notice stays (``None`` is UNKNOWN).
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -2895,11 +2862,10 @@ class TestCRUD:
     @pytest.mark.parametrize('error_code,expect_notice', COMMIT_CODE_CASES)
     async def test_commit_notice_depends_only_on_the_observed_code(
             self, provider, file_stream, mock_time, transport, error_code, expect_notice):
-        # 全直積の本体 24 セル。
-        #
-        # 「同じ操作文脈・同じ観測コードなら、経路が違っても同じ結果」を張る。
-        # 経路ごとに別のパラメータ集合を使っていたために、3周とも矛盾が
-        # 表に出なかった —— それがこの直積の存在理由である。
+        # The 24 observable cells: the same operation and the same observed
+        # code must give the same verdict on every transport.  Per-transport
+        # parameter sets cannot expose a contradiction between transports,
+        # which is why the product is taken in one place.
         assert file_stream.size == 6
         arrange_chunked_commit(provider)
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
@@ -2916,26 +2882,22 @@ class TestCRUD:
     @pytest.mark.parametrize('latent_code', [code for code, _ in COMMIT_CODE_CASES])
     async def test_commit_notice_when_the_code_cannot_be_observed(
             self, provider, file_stream, mock_time, transport, latent_code, monkeypatch):
-        # 全直積の残り 16 セル。
+        # The remaining 16 cells.  On a disconnect or a broken body
+        # ``_parse_s3_error_body`` returns no code, so whatever the storage
+        # meant to say, the verdict has to fall to UNKNOWN.
         #
-        # 接続断と破損 XML では ``_parse_s3_error_body`` がコードを返せない。
-        # ストレージが ``AccessDenied`` を言うつもりだったかどうかは
-        # WaterButler には分からないので、**意図したコードに関わらず**
-        # UNKNOWN(注記あり)に倒れなければならない。
-        #
-        # このセルが空振りでないことに注意: 接続断では S3 のエラー XML が
-        # 例外の ``message`` に、破損 XML ではコード文字列が本文中に、
-        # それぞれ *実在する*。コードを本文以外から拾ったり部分一致で拾う
-        # 実装は、確定拒否 3 コードのセルで注記を落として落ちる。
+        # These cells are not vacuous: the code string really is there -- in
+        # the exception's ``message`` on a disconnect, inside the truncated
+        # body on broken XML.  An implementation reading it from anywhere but
+        # a parsed body, or by substring, drops the notice and fails here.
         assert file_stream.size == 6
         arrange_chunked_commit(provider)
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         arrange_commit_failure(provider, transport, latent_code)
 
-        # 「観測できない」がこのセル群の前提そのものなので、結論(注記あり)
-        # だけでなく前提も直接見る。注記を無条件に出す実装でも結論の
-        # アサートは通ってしまうが、``_observed_error_code`` が本文中の
-        # コード文字列を拾い始めたらここで落ちる。
+        # "Not observable" is the premise of these cells, so the premise is
+        # asserted alongside the conclusion: an implementation emitting the
+        # notice unconditionally would satisfy the conclusion on its own.
         observed = []
         real_observed_error_code = pd_provider.S3CompatSigV4Provider._observed_error_code
 
@@ -2961,15 +2923,16 @@ class TestCRUD:
                                             'XMinioStorageFull'])
     async def test_quota_branch_suppresses_the_notice_on_every_transport(
             self, provider, file_stream, mock_time, transport, error_code):
-        # クォータコードは分類表には載せない(実機 MinIO は commit 経路で
-        # クォータを強制しないことが実測で判明したため、「未コミットの保証」と
-        # しては使えない)。代わりに**クォータ分岐が分類表より先に立ち**、
-        # 注記を抑止する。「容量が足りません」と「完了しているかもしれません」の
-        # 連結こそが、この PR が直しているバグの本体である。
+        # Quota codes are deliberately absent from the classification table:
+        # MinIO does not enforce quota on the commit path, so they are no
+        # guarantee that nothing was committed.  The quota branch runs ahead
+        # of the table instead and suppresses the notice -- "you are out of
+        # space" next to "it may have completed" is the contradiction this
+        # change exists to remove.
         #
-        # 200 経路だけを見ていると、その経路ではマーカー側ですでに注記が
-        # '' になっているため、クォータ分岐に注記を復活させても検出できない。
-        # 5xx 経路を直積に入れることで固定する。
+        # The 200 transport alone cannot pin this, because there the marker
+        # has already emptied the notice; the 5xx transports are what make a
+        # regression in the quota branch visible.
         assert file_stream.size == 6
         arrange_chunked_commit(provider)
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
@@ -2986,11 +2949,11 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_quota_507_without_a_body_suppresses_the_notice(self, provider, file_stream,
                                                                   mock_time):
-        # ``_is_quota_exhaustion`` は本文のコードに関係なく HTTP 507 を
-        # クォータ扱いする(ベンダ固有コードを網羅できないための意図的な
-        # フォールバック)。分類表はこの入力を知らないので、抑止を分類表側に
-        # 置くと 507 + 注記の矛盾文面が復活する —— 設計レビューの実測で
-        # クォータ判定 True の 4/5 が表に載らないことを確認している。
+        # ``_is_quota_exhaustion`` treats HTTP 507 as quota exhaustion whatever
+        # the body says -- a deliberate fallback, since vendor-specific codes
+        # cannot be enumerated.  The table knows nothing about this input, so
+        # moving the suppression into the table brings the "507 plus notice"
+        # contradiction straight back.
         assert file_stream.size == 6
         arrange_chunked_commit(provider)
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
@@ -3007,32 +2970,29 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     @pytest.mark.parametrize('transport', OBSERVED_TRANSPORTS)
     @pytest.mark.parametrize('error_code, expect_notice', [
-        # 前後の空白は除去してから照合する。XML の整形で
-        # ``<Code>\n  AccessDenied\n</Code>`` の形が現れうるため。
+        # Surrounding whitespace is stripped before matching: pretty-printed
+        # XML produces ``<Code>\n  AccessDenied\n</Code>``.
         ('\n  AccessDenied\n', False),
         (' AccessDenied ', False),
         ('\tEntityTooSmall  ', False),
-        # 大小文字は畳まない。S3 のエラーコードはベンダ間で大小文字まで
-        # 一致する識別子なので、畳むと別コードの誤一致を生む。
+        # Case is not folded: S3 error codes are identifiers that match down
+        # to the case across vendors, so folding would create false matches.
         ('accessdenied', True),
         ('ACCESSDENIED', True),
-        # 部分一致はしない。前方・後方のどちら向きにも。
+        # No substring matching, in either direction.
         ('AccessDeniedByPolicy', True),
         ('XAccessDenied', True),
-        # 内側の空白は識別子の一部ではないが、除去もしない —— 照合は
-        # 完全一致なので一致せず UNKNOWN に倒れる(安全側)。
+        # Inner whitespace is not part of the identifier and is not removed
+        # either: the match is exact, so this falls to UNKNOWN, the safe side.
         ('Access Denied', True),
     ])
     async def test_commit_notice_follows_the_code_matching_rules(
             self, provider, file_stream, mock_time, transport, error_code, expect_notice):
-        # コード照合の規則。4項目のうち ``None`` は全直積が持っているが、
-        # 残る3項目(大小文字を区別する / 前後の空白を除去する / 部分一致
-        # しない)は規則としてしか書かれておらず、``_parse_s3_error_body`` の
-        # ``code.strip()`` を削っても全件緑のまま通ってしまう。
-        #
-        # 規則を「実装の都合」ではなく「設計の要求」として直積で張る。
-        # ``.strip()`` が xmltodict の既定挙動と重複していても、その既定に
-        # 依存していることを固定する意味がある。
+        # The code-matching rules: case-sensitive, surrounding whitespace
+        # stripped, no substring match.  They are design requirements, not
+        # incidental behaviour, so they are pinned as a product even where the
+        # implementation happens to get them for free -- the point is to pin
+        # the dependency on that behaviour.
         assert file_stream.size == 6
         arrange_chunked_commit(provider)
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
@@ -3044,15 +3004,12 @@ class TestCRUD:
         assert (provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message) is expect_notice
 
     def test_the_xml_parser_is_what_strips_the_code(self, provider):
-        # ``_parse_s3_error_body`` の ``code.strip()`` は、xmltodict 0.9.0 が
-        # テキストノードを既定で strip するため現状**冗長**である(実測)。
-        # したがって ``.strip()`` を削っても挙動は変わらず、上の照合規則の
-        # テストでは検出できない —— 等価な変更として受け入れる。
-        #
-        # 受け入れられるのは「誰かが strip している」ことを監視できる場合に
-        # 限る。依存の更新で xmltodict が strip をやめれば照合の規則は
-        # ``.strip()`` だけが支えることになるので、その切り替わりをここで
-        # 検知する。このテストが落ちたら ``.strip()`` は冗長ではなくなる。
+        # xmltodict strips text nodes by default, which makes the ``.strip()``
+        # in ``_parse_s3_error_body`` redundant today, and therefore invisible
+        # to the matching-rule test above.  That is only acceptable while
+        # "somebody strips" stays observable: if a dependency bump stops
+        # xmltodict from stripping, this test fails and the ``.strip()`` is
+        # the only thing still holding the rule up.
         parsed = xmltodict.parse('<Error><Code>\n  AccessDenied\n</Code></Error>')
         assert parsed['Error']['Code'] == 'AccessDenied'
 
@@ -3062,17 +3019,11 @@ class TestCRUD:
         ('XQuotaExceededFoo', False),
     ])
     def test_quota_detection_follows_the_same_matching_rules(self, provider, raw, expected):
-        # 照合の規則はクォータ照合にも同じく適用される。分類表と設定値リストで
-        # 規則が食い違うと、片方だけが空白付きコードを取り違える。
+        # The same matching rules apply to the quota codes.  If the two lists
+        # diverge, only one of them mishandles a whitespace-padded code.
         err = storage_error({'response': commit_error_xml(raw)}, code=400)
         assert provider._is_quota_exhaustion(err) is expected
 
-    # 書き換え: ``test_commit_outcome_note_falls_back_to_the_status_class``
-    # → ``test_commit_outcome_note_ignores_the_status_class``
-    #
-    # ステータスクラス規則は廃止した。同じ規則を別の名前で検証し続ける
-    # テストは「廃止した規則を検証しつつ合格しているテスト」そのものに
-    # なるので、主張を反転させて置き換える。
     @pytest.mark.parametrize('code', [
         # No status at all: the connection dropped.
         #
@@ -3108,52 +3059,52 @@ class TestCRUD:
         assert (note == provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE) is not not_committed
 
     def test_the_definitive_rejection_table_is_exactly_the_designed_nine(self):
-        # 表の**内容**を独立に固定する。下のテストが個々の行を守り、これが
-        # 「行が増えていないこと」を守る。両方ないと、行を足す変異(過少注記
-        # 側=回復に管理者が要る方向)が誰にも見つからない。
+        # Pin the table's contents as a whole.  The test below guards each
+        # row; this one guards against rows being added, which suppresses a
+        # notice that should have been shown -- the direction that needs an
+        # administrator to recover.
         assert pd_provider.DEFINITIVE_REJECTION_CODES == frozenset(DEFINITIVE_REJECTION_CODES)
 
     @pytest.mark.parametrize('error_code', DEFINITIVE_REJECTION_CODES)
     def test_every_definitive_rejection_code_suppresses_the_notice(self, provider, error_code):
-        # 分類表の 9 コードそれぞれについて、1 コードを削除する変更が検出
-        # されること。全直積テストは代表 3 件しか流さないので、残り 6 件を
-        # 守るテストが無ければ「表に載せたが誰も見ていない行」が生まれる。
+        # All nine rows, so that deleting a single code is caught.  The
+        # cartesian product runs only three representatives; without this the
+        # other six would be rows nobody checks.
         #
-        # コードは**テスト側に書き写してある**。
-        # ``sorted(pd_provider.DEFINITIVE_REJECTION_CODES)`` からパラメータを生成すると、
-        # 表から行を消したときパラメータごと消えて検出できない ——
-        # 実装から生成したパラメータは実装を検証できない。
+        # The parameters come from the copy at the top of this file, not from
+        # ``pd_provider.DEFINITIVE_REJECTION_CODES``: parameters generated
+        # from the implementation cannot test the implementation.
         err = pd_provider._mark_commit_outcome_unknown(pd_provider._mark_storage_response(
             exceptions.UploadError({'response': commit_error_xml(error_code)}, code=400)))
         assert provider._commit_outcome_note(err) == ''
 
     @pytest.mark.parametrize('error_code', [
-        # 表から意図して外してあるもの。``NoSuchUpload`` は 1 回目の
-        # commit が成功した後の再送で返る(実機 MinIO で二重 Complete を実行し
-        # 確認済み)ので、未コミットの証拠にはならない。
+        # Deliberately left out of the table: ``NoSuchUpload`` also comes back
+        # from a resend after a *successful* first commit, so it is no
+        # evidence that nothing was committed.
         'NoSuchUpload',
-        # 表に無い実在の 4xx。過剰注記になるが、これは意図した方向である
-        # (表に無い 4xx は UNKNOWN 側へ倒す)。
+        # Real 4xx codes absent from the table.  Over-reporting the notice is
+        # the intended direction for anything the table does not name.
         'InvalidRequest', 'BadDigest', 'RequestTimeTooSkewed', 'NoSuchKey', 'TooManyParts',
-        # 不定コードと未知コード。
+        # Indeterminate and unknown codes.
         'InternalError', 'SlowDown', 'ServiceUnavailable', 'RequestTimeout', 'XVendorMystery',
-        # 大小違い・部分一致は表に載っていない扱い(照合の規則)。
+        # Wrong case and substrings count as absent, per the matching rules.
         'accessdenied', 'ACCESSDENIED', 'XAccessDeniedFoo', 'AccessDeniedExtra',
-        # コードが読めなかった。
+        # No code could be read.
         None,
     ])
     def test_codes_outside_the_table_keep_the_notice(self, provider, error_code):
-        # UNKNOWN 側への倒しを反転する変異を殺す。表に無いものは **すべて**
-        # 注記あり —— 表を伸ばし忘れたときに過少注記へ倒れないための向き。
+        # Everything outside the table keeps the notice, so that forgetting to
+        # extend the table errs towards over-reporting rather than silence.
         err = pd_provider._mark_commit_outcome_unknown(pd_provider._mark_storage_response(
             exceptions.UploadError({'response': commit_error_xml(error_code)}, code=400)))
         assert provider._commit_outcome_note(err) == provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
 
     def test_commit_outcome_note_does_not_read_a_code_off_a_connection_error(self, provider):
-        # ``_raw_error_body`` は本文が無いとき ``err.message`` に落ちる。
-        # aiohttp の接続エラーは自前の message を持つので、ゲートが無いと
-        # 「届かなかった応答」が分類表に口を利けてしまう。接続が切れた時点で
-        # 観測できたコードは無い、というのが唯一の正しい読みである。
+        # ``_raw_error_body`` falls back to ``err.message`` when there is no
+        # body, and aiohttp's connection errors carry a message of their own.
+        # Without the gate, a response that never arrived would get a say in
+        # the classification table.  A dropped connection observed no code.
         err = pd_provider._mark_commit_outcome_unknown(
             aiohttp.ServerDisconnectedError(commit_error_xml('AccessDenied')))
         assert pd_provider._is_storage_response(err) is False
@@ -3221,20 +3172,16 @@ class TestCRUD:
     ])
     async def test_commit_failure_does_not_chain_the_presigned_url(
             self, provider, file_stream, mock_time, failure, expected_code):
-        # ``_chunked_upload`` の ``raise ... from None`` は7箇所あるが、
-        # **commit で落ちたときに通る2箇所**(``CONNECTION_ERRORS`` 分岐と
-        # 500 分岐)は、削除しても他のテストが全件緑のまま通ってしまう。
+        # ``_chunked_upload`` has seven ``raise ... from None`` sites.  The two
+        # taken when the *commit* fails -- the ``CONNECTION_ERRORS`` arm and
+        # the 500 arm -- are guarded nowhere else:
+        # ``test_connection_error_log_does_not_leak_the_signature`` kills
+        # ``make_request`` outright and so never gets past
+        # ``_create_upload_session``.  This test reaches the commit.
         #
-        # 既存の
-        # ``test_connection_error_log_does_not_leak_the_signature`` は
-        # ``make_request`` そのものを潰すため、``_create_upload_session`` の段階で
-        # 落ちる —— 守っているのはセッション作成側の ``from None`` であって、
-        # commit 側ではない。ここでは commit まで到達させる。
-        #
-        # 漏れるのは presigned SigV4 URL の署名クエリで、それが
-        # ``__context__`` 経由でトレースバックへ入り、Sentry に保存される。
-        # 抑止は挙動を変えないが、等価な変更ではない
-        # —— ``__suppress_context__`` は観測できる。
+        # What leaks is the signature query of the presigned SigV4 URL,
+        # carried into the traceback through ``__context__`` and kept by
+        # Sentry.  Suppressing it is observable: ``__suppress_context__``.
         presigned = ('https://minio.example/bkt/key?X-Amz-Algorithm=AWS4-HMAC-SHA256'
                      '&X-Amz-Credential=AKIAEXAMPLE%2F20260913%2Fus-east-1%2Fs3%2Faws4_request'
                      '&X-Amz-Signature=1f2e3d4c5b6a7988SECRETSIG')
@@ -3242,7 +3189,7 @@ class TestCRUD:
             err = aiohttp.ClientOSError(
                 32, 'Can not write request body for {}'.format(presigned))
         else:
-            # ``UploadError`` でも ``CONNECTION_ERRORS`` でもない例外 = 500 分岐。
+            # Neither ``UploadError`` nor ``CONNECTION_ERRORS``: the 500 arm.
             err = ValueError('unexpected failure while committing to {}'.format(presigned))
 
         arrange_chunked_commit(provider)
@@ -3256,7 +3203,7 @@ class TestCRUD:
         assert exc.value.__cause__ is None
         assert exc.value.__suppress_context__ is True
         assert 'SECRETSIG' not in str(exc.value.message)
-        # 出口そのものは合っていること(分岐を取り違えたテストにしない)。
+        # Confirm the arm under test is the one that actually ran.
         assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message
 
     @pytest.mark.asyncio
@@ -3915,15 +3862,14 @@ class TestCRUD:
     @pytest.mark.parametrize('status', [408, 502, 503, 504])
     async def test_complete_multipart_upload_is_sent_exactly_once(
             self, provider, upload_parts_headers_list, mock_time, generate_url_helper, status):
-        # 注記の判定はコード単独で行い、そのコードは「唯一の試行の結果」で
-        # なければならない。core の既定 ``retry=2`` では、504 等を受けた再送で
-        # UploadId が消費済みになり、1回目の commit が成功していても2回目は
-        # ``NoSuchUpload`` が返る —— 観測コードが最後の試行の結果に化けた
-        # 時点で、分類表は意味を失う。
+        # The notice is decided on the code alone, and that code has to be the
+        # result of the *only* attempt.  Under core's default ``retry=2`` a
+        # resend after a 504 meets a consumed UploadId and gets
+        # ``NoSuchUpload`` even though the first commit succeeded; once the
+        # observed code is the last attempt's, the table is meaningless.
         #
-        # 「``retry=0`` と書いてあること」ではなく「**効いていること**」を
-        # 固定するために、実 HTTP を流して POST の本数を直接数える。
-        # 引数を渡す側だけを見るテストでは、書いてあることしか固定できない。
+        # Counting the POSTs over real HTTP pins that ``retry=0`` takes
+        # effect.  Inspecting the caller only pins that it is written down.
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         upload_id = 'EXAMPLEUPLOADID'
         params = {'uploadId': upload_id}
@@ -3953,8 +3899,8 @@ class TestCRUD:
         with pytest.raises(exceptions.UploadError):
             await provider._complete_multipart_upload(path, upload_id, headers_list)
 
-        # 再送対象そのものを固定する。core 側が ``retry_on`` を広げたときに、
-        # このパラメータ集合が監視として不足したことを知らせるため。
+        # Pin the retried statuses too, so that widening core's ``retry_on``
+        # reports this parameter set as no longer covering it.
         assert provider._retry_on == {408, 502, 503, 504}
         assert status in provider._retry_on
         assert len(aiohttpretty.calls) == 1
@@ -3963,19 +3909,16 @@ class TestCRUD:
     @pytest.mark.parametrize('redirect_status', [307, 308])
     async def test_complete_multipart_upload_does_not_follow_a_redirect(
             self, provider, upload_parts_headers_list, mock_time, redirect_status):
-        # ``retry=0`` は core の ``make_request`` の再送ループしか止めない。
-        # 307/308 は「メソッドと本文を保って再送せよ」という指示で、その追随は
-        # aiohttp 自身が ``allow_redirects`` の既定値 ``True`` で行う —— つまり
-        # core の再送予算をまったく使わずに commit の POST が2本出る。
-        # 2本目が消費済み UploadId や別ホスト向けの署名で弾かれると、
-        # 分類表が読む「観測コード」は1本目(実際の commit)ではなく2本目の
-        # 結果に化ける。1本目が成功していた場合、注記なしの確定拒否コードで
-        # 「何も保存されていない」と断言してしまう。
+        # ``retry=0`` stops only core's own retry loop in ``make_request``.  A
+        # 307/308 says "resend with the method and body intact", and aiohttp
+        # follows it itself under the default ``allow_redirects=True``, so two
+        # commit POSTs go out without spending any of core's retry budget.
+        # If the second is refused -- consumed UploadId, signature for another
+        # host -- the observed code becomes the second attempt's, and a
+        # definitive rejection there would claim nothing was stored even
+        # though the first commit succeeded.
         #
-        # ``aiohttpretty`` では固定できない。リダイレクト追随は aiohttp の
-        # ``ClientSession._request`` 内のループで起きるが、aiohttpretty は
-        # その *上* で応答を差し込むため、追随そのものが再現されない。
-        # 実サーバを立ててハンドラの呼び出し回数を数えるしかない。
+        # ``aiohttpretty`` cannot pin this; see ``commit_server``.
         calls = []
 
         async def first(request):
@@ -3985,10 +3928,10 @@ class TestCRUD:
                 if redirect_status == 307 else web.HTTPPermanentRedirect(location='/second')
 
         async def second(request):
-            # 追随してしまった2本目。実storageなら消費済み UploadId で
-            # ``NoSuchUpload``、別ホストなら署名不一致になる。ここでは
-            # 「注記なし」に落ちる確定拒否コードを返し、追随が起きた場合に
-            # 危険側へ倒れることを明示する。
+            # The second POST, reached only if the redirect were followed.  It
+            # answers with a definitive rejection code -- the "no notice"
+            # side -- so that following the redirect fails towards the
+            # dangerous verdict rather than a harmless one.
             await request.read()
             calls.append(request.path)
             return web.Response(
@@ -4014,30 +3957,29 @@ class TestCRUD:
                     await provider._complete_multipart_upload(
                         path, 'EXAMPLEUPLOADID', headers_list)
 
-        # commit の POST はちょうど1本。2本目が出ていれば ``/second`` が
-        # 記録されるので、失敗時に「どこまで行ったか」が読める。
+        # Exactly one commit POST.  A second one records ``/second``, so a
+        # failure here shows how far the request got.
         assert calls == ['/first']
 
     @pytest.mark.asyncio
     async def test_commit_answer_that_cannot_be_decoded_still_notices(
             self, provider, file_stream, mock_time):
-        # モック注入の 3 セルは「注入点が正しい」ことを前提にしている。
-        # この1本は前提ごと固定する —— ストレージが返した本文が UTF-8 として
-        # 読めないとき、core の ``exception_from_response`` は decode の途中で
-        # ``UnicodeDecodeError`` を出す。これは ``UploadError`` でも
-        # ``CONNECTION_ERRORS`` でもないので 500 分岐に落ちるが、commit は
-        # 既にソケットへ出ている = 組み立てが起きたかどうかは分からない。
-        # どの層でこの例外が生まれるかが core の変更で動いても、注記の有無は
-        # 動いてはならない。
+        # When the returned body is not valid UTF-8, core's
+        # ``exception_from_response`` raises ``UnicodeDecodeError`` mid-decode.
+        # That is neither ``UploadError`` nor a connection error, so it lands
+        # in the 500 arm -- but the commit is already on the socket, so
+        # whether assembly started is unknown.  Which layer produces the
+        # exception may move with core; the notice must not.
         #
-        # リダイレクトは関係しない。307 はこの出口への到達手段のひとつに
-        # すぎず、素の 403 でも同じ経路を通る。
+        # This runs over a real socket to pin, with a real ``ClientResponse``,
+        # the injection-point premise the mock-injection cells rely on.
+        # Redirects are incidental: a plain 403 takes the same path.
         calls = []
 
         async def first(request):
             await request.read()
             calls.append(request.path)
-            # 宣言は XML だが中身は UTF-8 として不正なバイト列。
+            # Declared as XML, but the bytes are not valid UTF-8.
             return web.Response(status=403, content_type='application/xml',
                                 body=b'\xff\xfe<Error><Code>AccessDenied</Code></Error>')
 
@@ -4053,11 +3995,11 @@ class TestCRUD:
                         file_stream, WaterButlerPath('/foobah', prepend=provider.prefix))
 
         assert calls == ['/first']
-        # ストレージ由来と断定できないので 500。本文のコードは読めていないので
-        # 分類表は関与せず、UNKNOWN に倒れて注記が付く。
+        # Not provably a storage verdict, so 500.  The code was never read, so
+        # the table does not apply and this falls to UNKNOWN with the notice.
         assert exc.value.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message
-        # 読めなかった本文の中身が、そのまま利用者へ出てはいけない。
+        # The unreadable body must not reach the user verbatim.
         assert 'AccessDenied' not in exc.value.message
 
     @pytest.mark.asyncio
@@ -4223,15 +4165,11 @@ class TestCRUD:
     @pytest.mark.parametrize('status', [408, 502, 503, 504])
     async def test_abort_confirmation_is_sent_exactly_once(
             self, provider, mock_time, generate_url_helper, status):
-        # 上のテストは
-        # ``_abort_confirmed_by_list_parts`` が ``retry=0`` を *渡している* ことしか
-        # 見ていない。その引数を受け取る ``_list_uploaded_chunks`` が
-        # ``**request_kwargs`` を ``make_request`` に流していなければ、渡した
-        # ``retry=0`` は途中で捨てられ core の既定 ``retry=2`` が効く —— 実際、
-        # その ``**request_kwargs`` を削っても全件緑のまま通ってしまう。
-        #
-        # 「伝播していること」ではなく「効いていること」を、実 core 経路で
-        # GET の本数を数えて固定する。
+        # The test above shows only that ``_abort_confirmed_by_list_parts``
+        # *passes* ``retry=0``.  If ``_list_uploaded_chunks`` stopped
+        # forwarding ``**request_kwargs`` to ``make_request``, the argument
+        # would be dropped and core's default ``retry=2`` would apply.
+        # Counting GETs through the real core path pins that it takes effect.
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         upload_id = 'EXAMPLEUPLOADID'
         params = {'uploadId': upload_id}
@@ -4243,7 +4181,8 @@ class TestCRUD:
         aiohttpretty.register_uri('GET', list_url, body=error_xml.encode('utf-8'), status=status)
 
         try:
-            # 確認が取れない = 主張は未確立のまま。呼び出し側の retry に落とす。
+            # No confirmation: the claim stays unestablished, so fall through
+            # to the caller's own retry.
             assert await provider._abort_confirmed_by_list_parts(path, upload_id) is False
         finally:
             for session in provider.session_list:
