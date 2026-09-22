@@ -640,11 +640,12 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         await resp.release()
 
     async def move(self, dest_provider, src_path, dest_path,
-                  rename=None, conflict='replace', handle_naming=True):
+                  rename=None, conflict='replace', handle_naming=True, file_size=None):
         """Override move to clean up orphaned S3 folder prefix objects after move."""
         result = await super().move(
             dest_provider, src_path, dest_path,
             rename=rename, conflict=conflict, handle_naming=handle_naming,
+            file_size=file_size,
         )
 
         # After moving a folder, clean up orphaned folder prefix object at source

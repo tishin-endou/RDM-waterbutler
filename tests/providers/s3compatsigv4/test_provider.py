@@ -2559,3 +2559,52 @@ class TestOperations:
 
     def test_can_duplicate_names(self, provider):
         assert provider.can_duplicate_names()
+
+    @pytest.mark.asyncio
+    async def test_move_accepts_and_forwards_file_size(self, provider):
+        """Issue #1 / Task 1 regression.
+
+        The OSFStorage bulk-mount path (osfstorage/_send_to_storage_provider) calls the
+        backend provider's ``move(..., file_size=file_size)``. The s3compatsigv4 override
+        previously declared an explicit signature without ``file_size``, which raised
+        ``TypeError: move() got an unexpected keyword argument 'file_size'``.
+
+        This test asserts that ``move()`` (a) accepts ``file_size`` without raising and
+        (b) forwards it unchanged to ``super().move()``.
+        """
+        src_path = WaterButlerPath('/source.txt', prepend=provider.prefix)
+        dest_path = WaterButlerPath('/dest.txt', prepend=provider.prefix)
+        expected = (mock.Mock(), True)
+
+        with mock.patch('waterbutler.core.provider.BaseProvider.move',
+                        new=MockCoroutine(return_value=expected)) as mock_super_move:
+            result = await provider.move(provider, src_path, dest_path, file_size=4096)
+
+        # No TypeError, and the result of super().move() is returned for a file move.
+        assert result == expected
+        mock_super_move.assert_awaited_once()
+        _, super_kwargs = mock_super_move.call_args
+        assert super_kwargs['file_size'] == 4096
+
+    @pytest.mark.asyncio
+    async def test_move_folder_forwards_file_size_and_cleans_prefix(self, provider):
+        """Issue #1 / Task 1 regression for the folder branch.
+
+        Moving a folder must still trigger the orphaned folder-prefix cleanup
+        (no regression) while also forwarding ``file_size`` to ``super().move()``.
+        """
+        src_path = WaterButlerPath('/folder/', folder=True, prepend=provider.prefix)
+        dest_path = WaterButlerPath('/moved/', folder=True, prepend=provider.prefix)
+        expected = (mock.Mock(), True)
+
+        provider._delete_folder_prefix = MockCoroutine()
+
+        with mock.patch('waterbutler.core.provider.BaseProvider.move',
+                        new=MockCoroutine(return_value=expected)) as mock_super_move:
+            result = await provider.move(provider, src_path, dest_path, file_size=8192)
+
+        assert result == expected
+        _, super_kwargs = mock_super_move.call_args
+        assert super_kwargs['file_size'] == 8192
+        # Folder-prefix cleanup must still run for a folder move (no regression).
+        provider._delete_folder_prefix.assert_awaited_once()

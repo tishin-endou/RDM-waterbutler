@@ -251,7 +251,13 @@ class OneDriveProvider(provider.BaseProvider):
         if path.api_identifier is None:  # TESTME
             raise exceptions.NotFoundError(str(path))
 
-        url = self._build_drive_url(*path.api_identifier, **{'$expand': 'children'})
+        # Only folders support expanding children.  Microsoft Graph seems to have started
+        # returning a 422 (getChildrenOnNonFolder) for ``$expand=children`` on non-folder
+        # items around 2026-03, so request the children expansion for folders only.
+        if path.is_dir:
+            url = self._build_drive_url(*path.api_identifier, **{'$expand': 'children'})
+        else:
+            url = self._build_drive_url(*path.api_identifier)
         logger.debug("metadata url::{}".format(repr(url)))
         resp = await self.make_request(
             'GET',
@@ -335,6 +341,11 @@ class OneDriveProvider(provider.BaseProvider):
             raise exceptions.DownloadError('"{}" not found'.format(str(path)), code=404)
 
         download_url = None
+        # The ``@microsoft.graph.downloadUrl`` in a file's metadata is a short-lived,
+        # pre-authenticated URL.  Sending our ``Authorization`` header alongside it makes some
+        # OneDrive hosts respond with a 401, so the header is dropped for those requests.  The
+        # ``/versions/{id}/content`` API endpoint still needs the header, so it is kept there.
+        no_auth_header = True
         if revision:
             # Fix OneDrive Business: download file by revisions
             items = await self._revisions_json(path)
@@ -351,6 +362,7 @@ class OneDriveProvider(provider.BaseProvider):
                         # Previous version: download file via API /drives/{drive-id}/items/{item-id}/versions/{version-id}/content
                         path_segments = (*path.api_identifier, 'versions', revision, 'content')
                         download_url = self._build_drive_url(*path_segments)
+                        no_auth_header = False
                     break
         else:
             metadata = await self.metadata(path, revision=revision)
@@ -369,6 +381,7 @@ class OneDriveProvider(provider.BaseProvider):
             range=range,
             expects=(200, 206),
             headers={'accept-encoding': ''},
+            no_auth_header=no_auth_header,
             # TODO: raise error if download folder including oneNote as zip
             # TODO: raise 401 error download empty file {"response": ""}
             throws=exceptions.DownloadError,

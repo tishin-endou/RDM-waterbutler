@@ -700,6 +700,7 @@ class TestUploads:
 
         provider, inner_provider = provider_and_mock_one
         inner_provider.metadata = utils.MockCoroutine(return_value=utils.MockFileMetadata())
+        inner_provider.upload = utils.MockCoroutine(return_value=(utils.MockFileMetadata(), True))
 
         url, _, params = provider.build_signed_url(
             'GET', '{}/api/v1/project/foo/creator_quota/'.format(wb_settings.OSF_URL))
@@ -738,6 +739,8 @@ class TestUploads:
 
         inner_provider.move.return_value = (utils.MockFileMetadata(), True)
         inner_provider.metadata.side_effect = exceptions.MetadataError('Boom!', code=404)
+        mock_file = utils.MockFileMetadata()
+        inner_provider.upload = utils.MockCoroutine(return_value=(mock_file, True))
 
         aiohttpretty.register_json_uri('POST', url, status=200, body=upload_response)
 
@@ -759,7 +762,7 @@ class TestUploads:
                                                       fetch_metadata=False)
         inner_provider.move.assert_called_once_with(inner_provider,
                                                     WaterButlerPath('/patched_path'),
-                                                    expected_path)
+                                                    expected_path, file_size=mock_file.size)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -767,6 +770,7 @@ class TestUploads:
                                                upload_path, mock_time):
         self.patch_uuid(monkeypatch)
         provider, inner_provider = provider_and_mock_one
+        inner_provider.upload = utils.MockCoroutine(return_value=(utils.MockFileMetadata(), True))
 
         url, _, params = provider.build_signed_url(
             'GET', '{}/api/v1/project/foo/creator_quota/'.format(wb_settings.OSF_URL))

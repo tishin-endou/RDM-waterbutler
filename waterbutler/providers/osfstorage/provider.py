@@ -525,8 +525,9 @@ class OSFStorageProvider(provider.BaseProvider):
         stream.add_writer('sha256', streams.HashStreamWriter(hashlib.sha256))
         stream.add_writer('sha512', streams.HashStreamWriter(hashlib.sha512))
 
-        await provider.upload(stream, remote_pending_path, check_created=False,
+        source_file_metadata, _ = await provider.upload(stream, remote_pending_path, check_created=False,
                               fetch_metadata=False, **kwargs)
+        file_size = int(source_file_metadata.size)
 
         complete_name = stream.writers['sha256'].hexdigest
         remote_complete_path = await provider.validate_path('/' + complete_name)
@@ -536,7 +537,7 @@ class OSFStorageProvider(provider.BaseProvider):
         except (exceptions.MetadataError, exceptions.NotFoundError) as e:
             if e.code != 404:
                 raise
-            metadata, _ = await provider.move(provider, remote_pending_path, remote_complete_path)
+            metadata, _ = await provider.move(provider, remote_pending_path, remote_complete_path, file_size=file_size)
         else:
             await provider.delete(remote_pending_path)
 

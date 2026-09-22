@@ -89,6 +89,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
     """
 
     BASE_URL = None
+    ACCEPTS_FILE_SIZE_FOR_INTRA = False
 
     def __init__(self, auth: dict,
                  credentials: dict,
@@ -357,7 +358,8 @@ class BaseProvider(metaclass=abc.ABCMeta):
                    dest_path: wb_path.WaterButlerPath,
                    rename: str=None,
                    conflict: str='replace',
-                   handle_naming: bool=True) -> typing.Tuple[wb_metadata.BaseMetadata, bool]:
+                   handle_naming: bool=True,
+                   file_size: int=None) -> typing.Tuple[wb_metadata.BaseMetadata, bool]:
         """Moves a file or folder from the current provider to the specified one
         Performs a copy and then a delete.
         Calls :func:`BaseProvider.intra_move` if possible.
@@ -368,6 +370,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
         :param rename: ( :class:`str` ) The desired name of the resulting path, may be incremented
         :param conflict: ( :class:`str` ) What to do in the event of a name conflict, ``replace`` or ``keep``
         :param handle_naming: ( :class:`bool` ) If a naming conflict is detected, should it be automatically handled?
+        :param file_size: ( :class:`int` ) The size of the file being moved, if want to try intra_move
         """
         args = (dest_provider, src_path, dest_path)
         kwargs = {'rename': rename, 'conflict': conflict}
@@ -396,7 +399,13 @@ class BaseProvider(metaclass=abc.ABCMeta):
             raise exceptions.OverwriteSelfError(src_path)
 
         self.provider_metrics.add('move.can_intra_move', False)
-        if self.can_intra_move(dest_provider, src_path):
+        can_intra_move = False
+        if self.ACCEPTS_FILE_SIZE_FOR_INTRA:
+            can_intra_move = self.can_intra_move(dest_provider, src_path, file_size=file_size)
+        else:
+            can_intra_move = self.can_intra_move(dest_provider, src_path)
+
+        if can_intra_move:
             self.provider_metrics.add('move.can_intra_move', True)
             return await self.intra_move(*args)
 
@@ -418,7 +427,8 @@ class BaseProvider(metaclass=abc.ABCMeta):
                    src_path: wb_path.WaterButlerPath,
                    dest_path: wb_path.WaterButlerPath,
                    rename: str=None, conflict: str='replace',
-                   handle_naming: bool=True, version=None) \
+                   handle_naming: bool=True, version=None,
+                   file_size: int=None) \
             -> typing.Tuple[wb_metadata.BaseMetadata, bool]:
         args = (dest_provider, src_path, dest_path)
         kwargs = {'rename': rename, 'conflict': conflict, 'handle_naming': handle_naming}
@@ -446,7 +456,12 @@ class BaseProvider(metaclass=abc.ABCMeta):
             raise exceptions.OverwriteSelfError(src_path)
 
         self.provider_metrics.add('copy.can_intra_copy', False)
-        if self.can_intra_copy(dest_provider, src_path):
+        can_intra_copy = False
+        if self.ACCEPTS_FILE_SIZE_FOR_INTRA:
+            can_intra_copy = self.can_intra_copy(dest_provider, src_path, file_size=file_size)
+        else:
+            can_intra_copy = self.can_intra_copy(dest_provider, src_path)
+        if can_intra_copy:
             self.provider_metrics.add('copy.can_intra_copy', True)
             return await self.intra_copy(*args)
 
@@ -574,7 +589,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
 
     def can_intra_copy(self,
                        other: 'BaseProvider',
-                       path: wb_path.WaterButlerPath=None) -> bool:
+                       path: wb_path.WaterButlerPath=None, file_size: int=None) -> bool:
         """Indicates if a quick copy can be performed between the current provider and `other`.
 
         .. note::
@@ -582,13 +597,14 @@ class BaseProvider(metaclass=abc.ABCMeta):
 
         :param other: ( :class:`.BaseProvider` ) The provider to check against
         :param  path: ( :class:`.WaterButlerPath` ) The path of the desired resource
+        :param file_size: ( :class:`int` ) The size of the file being copied
         :rtype: :class:`bool`
         """
         return False
 
     def can_intra_move(self,
                        other: 'BaseProvider',
-                       path: wb_path.WaterButlerPath=None) -> bool:
+                       path: wb_path.WaterButlerPath=None, file_size: int=None) -> bool:
         """Indicates if a quick move can be performed between the current provider and `other`.
 
         .. note::
@@ -596,6 +612,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
 
         :param other: ( :class:`.BaseProvider` ) The provider to check against
         :param path: ( :class:`.WaterButlerPath` ) The path of the desired resource
+        :param file_size: ( :class:`int` ) The size of the file being moved
         :rtype: :class:`bool`
         """
         return False

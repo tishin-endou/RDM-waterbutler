@@ -981,6 +981,32 @@ class TestOperations:
         # assert aiohttpretty.has_call(method='GET', uri=url, params=params)
         assert aiohttpretty.has_call(method='GET', uri=url)
 
-    async def test_equality(self, provider, mock_time):
-        assert provider.can_intra_copy(provider)
-        assert provider.can_intra_move(provider)
+    def test_can_intra_copy(self, provider):
+        file_path = WaterButlerPath('/my-image.jpg', prepend=provider.prefix)
+        folder_path = WaterButlerPath('/folder/', folder=True, prepend=provider.prefix)
+
+        assert provider.can_intra_copy(provider, file_path)
+        assert not provider.can_intra_copy(provider, folder_path)
+
+    def test_can_intra_move(self, provider):
+        file_path = WaterButlerPath('/my-image.jpg', prepend=provider.prefix)
+        folder_path = WaterButlerPath('/folder/', folder=True, prepend=provider.prefix)
+
+        assert provider.can_intra_move(provider, file_path)
+        assert not provider.can_intra_move(provider, folder_path)
+
+    def test_can_intra_copy_path_none(self, provider):
+        with pytest.raises(AttributeError):
+            provider.can_intra_copy(provider, path=None)
+
+    def test_can_intra_move_path_none(self, provider):
+        with pytest.raises(AttributeError):
+            provider.can_intra_move(provider, path=None)
+
+    def test_can_intra_copy_path_invalid_type(self, provider):
+        with pytest.raises(AttributeError):
+            provider.can_intra_copy(provider, path='not-a-path-object')
+
+    def test_can_intra_move_path_invalid_type(self, provider):
+        with pytest.raises(AttributeError):
+            provider.can_intra_move(provider, path='not-a-path-object')
