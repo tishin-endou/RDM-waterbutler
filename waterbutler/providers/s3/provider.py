@@ -141,35 +141,6 @@ class S3Provider(provider.BaseProvider):
             )
             return resp
 
-    # Todo:  the commented solution may be more stable than not commented
-    # async def get_folder_metadata(self, path, params):
-    #     try:
-    #         contents, prefixes = [], []
-    #         session = get_session()
-    #         region_name = {"region_name": self.region} if self.region else {}
-    #         async with session.create_client(
-    #                 's3',
-    #                 aws_secret_access_key=self.aws_secret_access_key,
-    #                 aws_access_key_id=self.aws_access_key_id,
-    #                 **region_name
-    #         ) as s3_client:
-    #             # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/get_paginator.html
-    #             # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_objects_v2.html#list-objects-v2
-    #             paginator = s3_client.get_paginator('list_objects_v2')
-    #             pages = paginator.paginate(
-    #                 Bucket=self.bucket_name,
-    #                 **params
-    #             )
-    #
-    #             # it may be added there some logic from make_request to be it similar f.e. self.provider_metrics.incr('requests.tally.ok')
-    #             async for page in pages:
-    #                 contents.extend(page.get('Contents', []))
-    #                 prefixes.extend(page.get('CommonPrefixes', []))
-    #
-    #         return contents, prefixes
-    #     except Exception as e:
-    #         raise exceptions.NotFoundError(f"{path} {e}")
-
     async def get_folder_metadata(self, path, params):
 
         contents, response_contents, response_prefixes = [], [], []
@@ -208,7 +179,6 @@ class S3Provider(provider.BaseProvider):
                     # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
                     # have tried yarl and furl but not see it to be helpful
                     # Todo: maybe there is a better approach (not confident all encoding is casted)
-                    #  or use commented 'get_folder_metadata' above where no cast is needed
                     key = key.replace('+', ' ')
                     content['Key'] = unquote(key)
                     response_contents.append(content)
@@ -285,8 +255,6 @@ class S3Provider(provider.BaseProvider):
             for index in range(0, len(delete_requests), 1000):
                 chunk = delete_requests[index:index + 1000]
                 try:
-                    # Todo: maybe it is good idea to add the some logic from make_request f.e. to keep it similar
-                    # self.provider_metrics.incr('requests.tally.ok')
                     await s3_client.delete_objects(
                         Bucket=self.bucket_name,
                         Delete={"Objects": chunk}
@@ -294,40 +262,6 @@ class S3Provider(provider.BaseProvider):
                 except Exception as e:
                     raise exceptions.DeleteError(f"{path} {e}")
 
-        # TODO: maybe there is a workaround for 'delete_objects' usage got the following for code below
-        # json.decoder.JSONDecodeError: Expecting value: line 1 column 1  on resp = await self.make_request call
-
-        # for index in range(0, len(delete_requests), 1000):
-        #     chunk = delete_requests[index:index + 1000]
-        #
-        #     async with session.create_client(
-        #             's3',
-        #             aws_access_key_id=self.aws_access_key_id,
-        #             aws_secret_access_key=self.aws_secret_access_key,
-        #             config=config,
-        #             **region_kwargs
-        #     ) as s3:
-        #         list_url = await s3.generate_presigned_url(
-        #             ClientMethod='delete_objects',
-        #             Params={'Bucket': self.bucket_name, 'Delete':{"Objects": chunk}},
-        #             ExpiresIn=settings.TEMP_URL_SECS
-        #         )
-        #
-        #         def _make_delete_xml(chunk):
-        #             items = "".join(f"<Object><Key>{o['Key']}</Key></Object>" for o in chunk)
-        #             return f"<?xml version='1.0' encoding='UTF-8'?><Delete>{items}</Delete>"
-        #
-        #         xml_body = _make_delete_xml(chunk)
-        #
-        #         resp = await self.make_request(
-        #             'POST',
-        #             list_url,
-        #             data=xml_body,
-        #             headers={'Content-Type': 'application/xml'},
-        #             expects=(200, 204,),
-        #             throws=exceptions.DeleteError,
-        #         )
-        #         await resp.release()
     async def get_object_versions(self, query_parameters):
 
         continuation_token = None
@@ -358,15 +292,13 @@ class S3Provider(provider.BaseProvider):
 
             if isinstance(versions, dict):
                 versions = [versions]
-            # import pydevd_pycharm
-            # pydevd_pycharm.settrace('host.docker.internal', port=1236, stdoutToServer=True, stderrToServer=True)
+
             for version in versions:
                 key = version.get('Key')
                 if key:
                     # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
                     # have tried yarl and furl but not see it to be helpful
                     # Todo: maybe there is a better approach (not confident all encoding is casted)
-                    #  or use commented 'get_folder_metadata' above where no cast is needed
                     key = key.replace('+', ' ')
                     version['Key'] = unquote(key)
                     versions_result.append(version)
@@ -378,27 +310,6 @@ class S3Provider(provider.BaseProvider):
                 break
 
         return versions_result
-
-        # try:
-        #     session = get_session()
-        #     region_name = {"region_name": self.region} if self.region else {}
-        #     async with session.create_client(
-        #             's3',
-        #             aws_secret_access_key=self.aws_secret_access_key,
-        #             aws_access_key_id=self.aws_access_key_id,
-        #             **region_name
-        #     ) as s3_client:
-        #         paginator = s3_client.get_paginator('list_object_versions')
-        #         pages = paginator.paginate(
-        #             Bucket=self.bucket_name,
-        #             **query_parameters
-        #         )
-        #         all_versions = []
-        #         async for page in pages:
-        #             all_versions.extend(page.get('Versions', []))
-        #         return all_versions
-        # except Exception as e:
-        #     raise exceptions.NotFoundError(f"Failed to fetch versions: {e}")
 
     async def validate_v1_path(self, path, **kwargs):
         await self._check_region()
@@ -473,35 +384,6 @@ class S3Provider(provider.BaseProvider):
                 raise exceptions.IntraCopyError(f"IntraCopyError {e}")
 
         return (await dest_provider.metadata(dest_path)), not exists
-
-        #
-        # # ensure no left slash when joining paths
-        #
-
-        # TODO:         # # TODO: 403, {"response": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-        #  \n<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does
-        # query_parameters = {'CopySource': f"{self.bucket_name}/{source_path.path}"
-        #
-        #     # {
-        #     #         'Bucket': self.bucket_name,
-        #     #         'Key': source_path.path,
-        #     # }
-        # }
-        #
-        # url = await self.generate_generic_presigned_url(dest_path.path, 'copy_object', query_parameters=query_parameters)
-        #
-        # resp = await self.make_request(
-        #     'PUT',
-        #     url,
-        #     headers={
-        #         # this must match exactly what you passed into generate_presigned_url
-        #         'x-amz-copy-source': f"/{self.bucket_name}/{source_path.path}"
-        #     },
-        #     skip_auto_headers={'CONTENT-TYPE'},
-        #     expects=(200, ),
-        #     throws=exceptions.DownloadError,
-        # )
-        # await resp.release()
 
     async def download(self, path, accept_url=False, revision=None, range=None, **kwargs):
         r"""Returns a ResponseWrapper (Stream) for the specified path
