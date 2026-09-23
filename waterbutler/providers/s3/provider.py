@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import logging
 
 from urllib.parse import unquote
+import aiohttp
 import xmltodict
 import xml.sax.saxutils
 from aiobotocore.config import AioConfig
@@ -242,6 +244,19 @@ class S3Provider(provider.BaseProvider):
             else:
                 break
 
+        await self.delete_objects_in_chunks(path, delete_requests)
+
+    async def delete_objects_in_chunks(self, path, delete_requests):
+        """Send ``delete_requests`` to DeleteObjects in batches of 1000, the API maximum.
+
+        :param str path: the path being deleted, used for error messages only
+        :param list delete_requests: ``{'Key': ...}`` or ``{'Key': ..., 'VersionId': ...}`` dicts
+        :raises: :class:`.DeleteError` if any object in any batch was not deleted
+        """
+        if not delete_requests:
+            # DeleteObjects rejects an empty object list.
+            return
+
         session = get_session()
         region_name = {"region_name": self.region} if self.region else {}
         endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
@@ -255,12 +270,28 @@ class S3Provider(provider.BaseProvider):
             for index in range(0, len(delete_requests), 1000):
                 chunk = delete_requests[index:index + 1000]
                 try:
-                    await s3_client.delete_objects(
+                    result = await s3_client.delete_objects(
                         Bucket=self.bucket_name,
-                        Delete={"Objects": chunk}
+                        # GRDM: Quiet=False so that per-object failures are reported back.
+                        Delete={"Objects": chunk, "Quiet": False}
                     )
                 except Exception as e:
                     raise exceptions.DeleteError(f"{path} {e}")
+
+                # GRDM: DeleteObjects answers 200 even when individual objects were refused.
+                # Fail closed, and name the survivors so the caller can retry them.
+                errors = (result or {}).get('Errors') or []
+                if errors:
+                    survivors = ', '.join(
+                        '{}({}) {}'.format(error.get('Key'),
+                                           error.get('VersionId') or 'null',
+                                           error.get('Code'))
+                        for error in errors
+                    )
+                    raise exceptions.DeleteError(
+                        'Failed to delete {} of {} objects under {}: {}'.format(
+                            len(errors), len(chunk), path, survivors)
+                    )
 
     async def get_object_versions(self, query_parameters, include_delete_markers=False):
         """List every version of the keys matched by ``query_parameters``.
@@ -730,19 +761,42 @@ class S3Provider(provider.BaseProvider):
                 )
 
         if path.is_file:
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
-            delete_url = await self.generate_generic_presigned_url(path.path, method='delete_object')
-
-            resp = await self.make_request(
-                'DELETE',
-                delete_url,
-                expects=(200, 204,),
-                throws=exceptions.DeleteError,
-            )
-
-            await resp.release()
+            # GRDM: purge every version of the key rather than issuing a plain DELETE.  On a
+            # versioned bucket a plain DELETE only writes a new delete marker, leaving all the
+            # previous versions -- and the storage they occupy -- behind.
+            await self._delete_file_versions(path)
         else:
             await self._delete_folder(path, **kwargs)
+
+    async def _delete_file_versions(self, path):
+        """GRDM: delete every version and delete marker of a single key.
+
+        :param *ProviderPath path: the file to purge
+        :raises: :class:`.DeleteError` if the versions cannot be listed or not all of them
+            could be deleted
+        """
+        try:
+            versions = await self.get_object_versions({'Prefix': path.path},
+                                                      include_delete_markers=True)
+        except exceptions.WaterButlerError as exc:
+            # Report the failure, not the provider's raw error document.
+            raise exceptions.DeleteError(
+                'Failed to list the versions of {}: {}'.format(path.path, type(exc).__name__),
+                code=exc.code
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise exceptions.DeleteError(
+                'Failed to list the versions of {}: {}'.format(path.path, type(exc).__name__)
+            )
+
+        # ``Prefix`` is a prefix match, so a listing for 'foo' also returns 'foo.bak'.
+        delete_requests = [
+            {'Key': version['Key'], 'VersionId': version['VersionId']}
+            for version in versions
+            if version.get('Key') == path.path and version.get('VersionId')
+        ]
+
+        await self.delete_objects_in_chunks(path.path, delete_requests)
 
     async def _delete_folder(self, path, **kwargs):
         """Query for recursive contents of folder and delete in batches of 1000
