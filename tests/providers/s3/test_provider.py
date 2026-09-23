@@ -8,6 +8,8 @@ import asyncio
 import hashlib
 import aiohttp
 import aiohttpretty
+import botocore.exceptions
+from aiobotocore import session as aiobotocore_session
 from http import client
 from urllib import parse
 from unittest import mock
@@ -20,6 +22,7 @@ from waterbutler.providers.s3 import S3Provider
 from waterbutler.core.path import WaterButlerPath
 from waterbutler.core import streams, metadata, exceptions
 from waterbutler.providers.s3 import settings as pd_settings
+from waterbutler.providers.s3.metadata import S3FileMetadataHeaders
 
 from tests.utils import MockCoroutine
 from tests.providers.s3.fixtures import (auth,
@@ -1786,6 +1789,358 @@ class TestOperations:
 
     def test_can_duplicate_names(self, provider):
         assert provider.can_duplicate_names()
+
+
+def make_client_error(code, message, status, operation='CopyObject'):
+    """Build the ``ClientError`` botocore raises for a failed S3 operation."""
+    return botocore.exceptions.ClientError(
+        {
+            'Error': {'Code': code, 'Message': message},
+            'ResponseMetadata': {'HTTPStatusCode': status, 'RequestId': 'a-request-id'},
+        },
+        operation,
+    )
+
+
+class _FakeHTTPResponse:
+    """The minimum surface ``aiobotocore.endpoint`` needs from an HTTP response.
+
+    ``convert_to_response_dict`` reads ``raw_headers``/``status_code`` and awaits ``read()``;
+    botocore's ``check_for_200_error`` reads ``content`` and *writes* ``status_code``.
+    """
+
+    def __init__(self, status, body):
+        self.status_code = status
+        self.content = body
+        self.raw_headers = ((b'Content-Type', b'application/xml'),)
+        self.raw = None
+
+    async def read(self):
+        return self.content
+
+
+def patch_session_with_before_send(monkeypatch, http_response_factory, operation='CopyObject'):
+    """Let the provider build a *real* aiobotocore client, but answer its HTTP request locally.
+
+    botocore offers a ``before-send.<service>.<Operation>`` event precisely so the transport can
+    be replaced without disturbing anything above it.  Injecting there means the request is still
+    signed, the response is still parsed by botocore's rest-xml parser, and the whole
+    ``needs-retry`` handler chain -- including S3's 200-with-error special case -- still runs.
+    Injecting at the aiobotocore client boundary instead would skip all of that, which is exactly
+    the behaviour K-3 needs to measure.
+
+    :return: the list of sent requests, in order
+    """
+    # botocore's legacy retry mode would replay the request four more times, and the backoff
+    # sleeps are real.  The retry count is irrelevant to what is being measured here.
+    monkeypatch.setenv('AWS_RETRY_MODE', 'standard')
+    monkeypatch.setenv('AWS_MAX_ATTEMPTS', '1')
+
+    sent = []
+
+    def before_send(request, **kwargs):
+        sent.append(request)
+        return http_response_factory()
+
+    def _get_session():
+        session = aiobotocore_session.get_session()
+        session.register('before-send.s3.{}'.format(operation), before_send)
+        return session
+
+    monkeypatch.setattr('waterbutler.providers.s3.provider.get_session', _get_session)
+    return sent
+
+
+COPY_OBJECT_SUCCESS_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<CopyObjectResult><ETag>"fba9dede5f27731c9771645a39863328"</ETag>'
+    b'<LastModified>2009-10-12T17:50:30.000Z</LastModified></CopyObjectResult>'
+)
+
+COPY_OBJECT_ERROR_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<Error><Code>InternalError</Code>'
+    b'<Message>We encountered an internal error. Please try again.</Message>'
+    b'<RequestId>656c76696e</RequestId></Error>'
+)
+
+COPY_OBJECT_EMPTY_ERROR_BODY = b'<?xml version="1.0" encoding="UTF-8"?>\n<Error/>'
+
+
+class TestIntraCopy:
+    """I-2〜I-5: the ``intra_copy`` contract and how it reports provider failures."""
+
+    def _dest_provider(self, provider, file_metadata_object, exists):
+        dest_provider = mock.Mock()
+        dest_provider.exists = MockCoroutine(return_value=exists)
+        dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
+        dest_provider.bucket_name = provider.bucket_name
+        return dest_provider
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_reports_created_when_dest_is_absent(self, provider,
+                                                                  file_metadata_object,
+                                                                  mock_time):
+        """I-5: ``(metadata, created)`` -- ``created`` is True only when nothing was overwritten."""
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
+        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+
+        with patcher:
+            metadata_result, created = await provider.intra_copy(
+                dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+
+        assert created is True
+        assert metadata_result is file_metadata_object
+        dest_provider.exists.assert_called_once_with(WaterButlerPath('/dest'))
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_reports_not_created_when_dest_exists(self, provider,
+                                                                   file_metadata_object,
+                                                                   mock_time):
+        """I-5: an overwrite reports ``created`` False."""
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=True)
+        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+
+        with patcher:
+            metadata_result, created = await provider.intra_copy(
+                dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+
+        assert created is False
+        assert metadata_result is file_metadata_object
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_converts_client_error(self, provider, file_metadata_object,
+                                                    mock_time):
+        """K-8: a botocore ``ClientError`` must become an ``IntraCopyError`` that carries the
+        provider's HTTP status, not a blanket 500.
+        """
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
+        error = make_client_error('AccessDenied', 'Access Denied', 403)
+        patcher, client = patch_aiobotocore_client(
+            copy_object=MockCoroutine(side_effect=error))
+
+        with patcher:
+            with pytest.raises(exceptions.IntraCopyError) as exc_info:
+                await provider.intra_copy(dest_provider, WaterButlerPath('/source'),
+                                          WaterButlerPath('/dest'))
+
+        assert exc_info.value.code == 403
+        assert 'ClientError' in exc_info.value.message
+        assert 'AccessDenied' in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_error_message_omits_provider_detail(self, provider,
+                                                                  file_metadata_object,
+                                                                  mock_time):
+        """K-9: the error surfaced to the user names the failure; it does not quote the provider's
+        own message, which is where request ids, bucket names and signed urls leak from.
+        """
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
+        error = make_client_error(
+            'AccessDenied',
+            'Access Denied for arn:aws:iam::123456789012:user/some-user',
+            403,
+        )
+        patcher, client = patch_aiobotocore_client(
+            copy_object=MockCoroutine(side_effect=error))
+
+        with patcher:
+            with pytest.raises(exceptions.IntraCopyError) as exc_info:
+                await provider.intra_copy(dest_provider, WaterButlerPath('/source'),
+                                          WaterButlerPath('/dest'))
+
+        message = exc_info.value.message
+        assert 'arn:aws:iam' not in message
+        assert 'An error occurred' not in message
+        assert provider.aws_secret_access_key not in message
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_succeeds_through_botocore(self, provider, file_metadata_object,
+                                                        monkeypatch, mock_time):
+        """K-3 control: the same real-botocore harness lets an ordinary 200 through, so a failure
+        in the sibling tests is attributable to the response body and not to the harness.
+        """
+        provider.region = 'us-east-1'
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
+        sent = patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
+
+        metadata_result, created = await provider.intra_copy(
+            dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+
+        assert created is True
+        assert metadata_result is file_metadata_object
+        assert len(sent) == 1
+        assert 'Signature=' in sent[0].headers['Authorization'].decode('utf-8') \
+            or 'AWS4-HMAC-SHA256' in sent[0].headers['Authorization'].decode('utf-8')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('body', [COPY_OBJECT_ERROR_BODY, COPY_OBJECT_EMPTY_ERROR_BODY])
+    async def test_intra_copy_200_with_error_body_fails_closed(self, provider,
+                                                               file_metadata_object,
+                                                               monkeypatch, mock_time, body):
+        """K-3: S3 can answer CopyObject with 200 and an ``<Error>`` body.  Measure whether
+        botocore's ``check_for_200_error`` catches it under aiobotocore, and make sure whatever
+        it produces reaches the caller as a failure -- never as a successful copy, and never with
+        a 2xx status code attached to the WaterButler error.
+        """
+        provider.region = 'us-east-1'
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
+        patch_session_with_before_send(monkeypatch, lambda: _FakeHTTPResponse(200, body))
+
+        with pytest.raises(exceptions.IntraCopyError) as exc_info:
+            await provider.intra_copy(dest_provider, WaterButlerPath('/source'),
+                                      WaterButlerPath('/dest'))
+
+        # botocore reports the *original* 200 in ResponseMetadata even after rewriting the
+        # response's status code, so a naive passthrough would hand a 2xx to the API layer.
+        assert exc_info.value.code == 500
+        assert 'ClientError' in exc_info.value.message
+        assert 'An error occurred' not in exc_info.value.message
+        assert dest_provider.metadata.called is False
+
+
+class TestIntraCopySizeLimit:
+    """I-3: core must not route an oversized file through ``intra_copy``."""
+
+    def _spy_on_intra(self, provider):
+        """Record calls without replacing the implementation, so an unexpected call still runs
+        (and fails loudly) instead of being silently swallowed by a mock.
+        """
+        calls = {'copy': [], 'move': []}
+        original_copy, original_move = provider.intra_copy, provider.intra_move
+
+        async def copy_spy(*args, **kwargs):
+            calls['copy'].append(args)
+            return await original_copy(*args, **kwargs)
+
+        async def move_spy(*args, **kwargs):
+            calls['move'].append(args)
+            return await original_move(*args, **kwargs)
+
+        provider.intra_copy, provider.intra_move = copy_spy, move_spy
+        return calls
+
+    def _register_copy_traffic(self, provider, file_content, file_header_metadata):
+        src_url = 'https://that-kerning.s3.amazonaws.com/source.txt'
+        dest_url = 'https://that-kerning.s3.amazonaws.com/dest.txt'
+        headers = dict(file_header_metadata)
+        headers['Content-Length'] = str(len(file_content))
+
+        aiohttpretty.register_uri('GET', src_url, body=file_content,
+                                  headers={'Content-Length': str(len(file_content))},
+                                  status=200, match_querystring=False)
+        aiohttpretty.register_uri('HEAD', dest_url,
+                                  responses=[{'status': 404}, {'headers': headers}],
+                                  match_querystring=False)
+        aiohttpretty.register_uri(
+            'PUT', dest_url, status=200,
+            headers={'ETag': '"{}"'.format(hashlib.md5(file_content).hexdigest())},
+            match_querystring=False)
+        return src_url, dest_url
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_copy_over_limit_falls_back_to_stream_copy(self, provider, file_content,
+                                                             file_header_metadata, mock_time):
+        calls = self._spy_on_intra(provider)
+        src_url, dest_url = self._register_copy_traffic(provider, file_content,
+                                                        file_header_metadata)
+
+        metadata_result, created = await provider.copy(
+            provider,
+            WaterButlerPath('/source.txt'),
+            WaterButlerPath('/dest.txt'),
+            handle_naming=False,
+            file_size=provider.FILE_SIZE_INTRA_COPY_LIMIT + 1,
+        )
+
+        assert calls['copy'] == []
+        assert created is True
+        assert metadata_result.kind == 'file'
+        assert aiohttpretty.has_call(method='GET', uri=src_url)
+        assert aiohttpretty.has_call(method='PUT', uri=dest_url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_move_over_limit_falls_back_to_copy_then_delete(self, provider, file_content,
+                                                                  file_header_metadata,
+                                                                  mock_time):
+        calls = self._spy_on_intra(provider)
+        src_url, dest_url = self._register_copy_traffic(provider, file_content,
+                                                        file_header_metadata)
+        # the source is deleted after the copy; it has a single version and no delete markers.
+        # the fixture's presigned-url stub drops query parameters, so the version listing lands
+        # on the bare bucket url rather than on the source key's url.
+        aiohttpretty.register_uri(
+            'GET', BUCKET_URL,
+            body=list_versions_response(versions=[('source.txt', 'v1')]), status=200,
+            match_querystring=False)
+        delete_patcher, delete_client = patch_aiobotocore_client(
+            delete_objects=MockCoroutine(return_value={'Deleted': [{'Key': 'source.txt'}]}))
+
+        with delete_patcher:
+            metadata_result, created = await provider.move(
+                provider,
+                WaterButlerPath('/source.txt'),
+                WaterButlerPath('/dest.txt'),
+                handle_naming=False,
+                file_size=provider.FILE_SIZE_INTRA_COPY_LIMIT + 1,
+            )
+
+        assert calls['move'] == []
+        assert calls['copy'] == []
+        assert created is True
+        assert metadata_result.kind == 'file'
+        assert delete_client.delete_objects.called
+
+
+class TestFileSizeSource:
+    """I-4: ``file_size`` comes from ``S3FileMetadataHeaders.size``, which has to survive both
+    spellings of the length header.  ``osfstorage`` feeds the result straight into ``int()``
+    (providers/osfstorage/provider.py), so a ``None`` here is a TypeError there.
+    """
+
+    @pytest.mark.parametrize('raw', [
+        {'ContentLength': 9001},      # botocore HeadObject response
+        {'ContentLength': '9001'},
+        {'Content-Length': '9001'},   # aiohttp HEAD response headers
+    ])
+    def test_size_is_usable_as_an_int(self, raw):
+        size = S3FileMetadataHeaders('test-path', raw).size
+
+        assert size is not None
+        assert int(size) == 9001
+
+    @pytest.mark.parametrize('raw', [
+        {'ContentLength': 9001},
+        {'Content-Length': '9001'},
+    ])
+    def test_size_as_int_is_an_int(self, raw):
+        size_as_int = S3FileMetadataHeaders('test-path', raw).size_as_int
+
+        assert isinstance(size_as_int, int)
+        assert size_as_int == 9001
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_metadata_file_reports_size_from_head_response(self, provider,
+                                                                 file_header_metadata,
+                                                                 mock_time):
+        """The real path: HEAD answers with ``Content-Length``, and the size survives to the
+        metadata object that ``can_intra_copy`` is handed.
+        """
+        path = WaterButlerPath('/my-image.jpg')
+        url = 'https://that-kerning.s3.amazonaws.com/my-image.jpg'
+        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata,
+                                  match_querystring=False)
+
+        result = await provider.metadata(path)
+
+        assert int(result.size) == 9001
+        assert result.size_as_int == 9001
+        assert provider.can_intra_copy(provider, path=path,
+                                       file_size=result.size_as_int) is True
 
 
 class TestObjectVersionsPaging:
