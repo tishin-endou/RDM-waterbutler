@@ -4,6 +4,7 @@ import logging
 
 from urllib.parse import unquote
 import aiohttp
+import botocore.exceptions
 import xmltodict
 import xml.sax.saxutils
 from aiobotocore.config import AioConfig
@@ -429,8 +430,23 @@ class S3Provider(provider.BaseProvider):
                     Key=dest_path.path,
                     CopySource=copy_source,
                 )
-            except Exception as e:
-                raise exceptions.IntraCopyError(f"IntraCopyError {e}")
+            except botocore.exceptions.ClientError as e:
+                # GRDM: report the failure without quoting S3's own message, which carries
+                # request ids, arns and bucket names, and keep the provider's status code
+                # instead of flattening everything to a 500.
+                response = e.response or {}
+                error_code = response.get('Error', {}).get('Code') or 'unknown'
+                status = response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+                if not isinstance(status, int) or status < 400:
+                    # S3 answers CopyObject with 200 and an <Error> body when the copy fails
+                    # part way through.  botocore rewrites the response's status code to 500 so
+                    # that the call raises, but leaves the original 200 in ResponseMetadata.
+                    # Passing that on would report a successful copy to the caller.
+                    status = 500
+                raise exceptions.IntraCopyError(
+                    'CopyObject failed: {} {}'.format(type(e).__name__, error_code),
+                    code=status
+                )
 
         return (await dest_provider.metadata(dest_path)), not exists
 
