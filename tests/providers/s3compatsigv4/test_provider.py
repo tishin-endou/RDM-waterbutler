@@ -2337,8 +2337,8 @@ class TestCRUD:
         # Every other assertion in this file spells the expected text as
         # ``provider.<CONSTANT>``, so changing a constant changes the assertion
         # with it.  Setting one to ``''`` makes ``'' in message`` vacuously true
-        # and deletes the assertion outright -- measured: emptying
-        # QUOTA_EXCEEDED_MESSAGE killed zero tests.
+        # and so deletes every positive-form assertion that names it, without
+        # failing any of them.
         #
         # Pinning the wording once, here, is what gives those assertions teeth.
         # It is deliberately partial (phrases, not the full string) so that
@@ -3172,7 +3172,7 @@ class TestCRUD:
     ])
     async def test_commit_failure_does_not_chain_the_presigned_url(
             self, provider, file_stream, mock_time, failure, expected_code):
-        # ``_chunked_upload`` has seven ``raise ... from None`` sites.  The two
+        # ``_chunked_upload`` has five ``raise ... from None`` sites.  The two
         # taken when the *commit* fails -- the ``CONNECTION_ERRORS`` arm and
         # the 500 arm -- are guarded nowhere else:
         # ``test_connection_error_log_does_not_leak_the_signature`` kills
@@ -3464,7 +3464,8 @@ class TestCRUD:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_create_upload_session_releases_when_read_fails(self, provider, mock_time):
-        # Same defect ``_complete_multipart_upload`` had, 300 lines earlier: a
+        # Same defect ``_complete_multipart_upload`` had -- see
+        # ``test_complete_multipart_upload_always_releases`` above: a
         # storage running out of room drops the connection while the body is
         # being read, and without a ``finally`` the connection leaks -- on the
         # path that is by definition already under pressure.
