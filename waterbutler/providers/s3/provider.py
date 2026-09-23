@@ -262,18 +262,22 @@ class S3Provider(provider.BaseProvider):
                 except Exception as e:
                     raise exceptions.DeleteError(f"{path} {e}")
 
-    async def get_object_versions(self, query_parameters):
+    async def get_object_versions(self, query_parameters, include_delete_markers=False):
+        """List every version of the keys matched by ``query_parameters``.
 
-        continuation_token = None
+        :param dict query_parameters: ListObjectVersions parameters, e.g. ``Prefix``
+        :param bool include_delete_markers: also return the ``DeleteMarker`` entries.  Off by
+            default so that :func:`revisions` keeps returning real revisions only; a delete
+            marker is not something a user can restore or download.
+        :rtype: list of dict
+        """
         query_parameters = dict(query_parameters)
         query_parameters.setdefault('Bucket', self.bucket_name)
 
         versions_result = []
         while True:
 
-            if continuation_token:
-                query_parameters['ContinuationToken'] = continuation_token
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_objects_v2.html
+            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_object_versions.html
             list_url = await self.generate_generic_presigned_url(
                 '', 'list_object_versions', query_parameters=query_parameters, default_params=False
             )
@@ -288,26 +292,40 @@ class S3Provider(provider.BaseProvider):
 
             result = doc.get('ListVersionsResult', {})
 
-            versions = result.get('Version') or []
+            element_names = ['Version', 'DeleteMarker'] if include_delete_markers else ['Version']
+            for element_name in element_names:
+                entries = result.get(element_name) or []
 
-            if isinstance(versions, dict):
-                versions = [versions]
+                if isinstance(entries, dict):
+                    entries = [entries]
 
-            for version in versions:
-                key = version.get('Key')
-                if key:
-                    # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
-                    # have tried yarl and furl but not see it to be helpful
-                    # Todo: maybe there is a better approach (not confident all encoding is casted)
-                    key = key.replace('+', ' ')
-                    version['Key'] = unquote(key)
-                    versions_result.append(version)
+                for entry in entries:
+                    key = entry.get('Key')
+                    if key:
+                        # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
+                        # have tried yarl and furl but not see it to be helpful
+                        # Todo: maybe there is a better approach (not confident all encoding is casted)
+                        key = key.replace('+', ' ')
+                        entry['Key'] = unquote(key)
+                        versions_result.append(entry)
 
-            # handle pagination
-            if result.get('IsTruncated') == 'true':
-                continuation_token = result.get('NextContinuationToken')
-            else:
+            # handle pagination.  ListObjectVersions does not use the ListObjectsV2
+            # continuation token; it resumes from the last key *and* version id reported.
+            if result.get('IsTruncated') != 'true':
                 break
+
+            next_key_marker = result.get('NextKeyMarker')
+            next_version_id_marker = result.get('NextVersionIdMarker')
+            if not next_key_marker:
+                # Truncated but no marker to resume from: repeating the request would return
+                # this same page forever.  Stop rather than loop.
+                break
+
+            query_parameters['KeyMarker'] = next_key_marker
+            if next_version_id_marker:
+                query_parameters['VersionIdMarker'] = next_version_id_marker
+            else:
+                query_parameters.pop('VersionIdMarker', None)
 
         return versions_result
 
