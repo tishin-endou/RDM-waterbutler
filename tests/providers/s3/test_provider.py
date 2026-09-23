@@ -191,6 +191,74 @@ def list_upload_chunks_body(parts_metadata):
 def build_folder_params(path):
     return {'prefix': path.path, 'delimiter': '/'}
 
+
+BUCKET_URL = 'https://that-kerning.s3.amazonaws.com/'
+
+
+def install_query_encoding_presigned_url(provider):
+    """Replace the ``provider`` fixture's presigned-URL stub with one that encodes the query
+    parameters into the URL, which is what a real presigned URL does.  The default stub throws
+    the parameters away, so every page of a paged listing would collapse onto a single URL and
+    aiohttpretty would be unable to tell one page request from the next.
+
+    :return: the list of query-parameter dicts, one per call, in call order
+    """
+    calls = []
+
+    async def _gen_presigned(path, method='head_object', query_parameters=None,
+                             default_params=True):
+        params = dict(query_parameters or {})
+        calls.append(params)
+        url = BUCKET_URL + (path or '').lstrip('/')
+        if params:
+            url += '?' + parse.urlencode(sorted(params.items()))
+        return url
+
+    provider.generate_generic_presigned_url = _gen_presigned
+    return calls
+
+
+def versions_url(**params):
+    """The URL that :func:`install_query_encoding_presigned_url` produces for a
+    ``list_object_versions`` call made with ``params``."""
+    return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
+
+
+def list_versions_response(versions=(), delete_markers=(), is_truncated=False,
+                           next_key_marker=None, next_version_id_marker=None):
+    """Build a ListObjectVersions response body.
+
+    ``versions`` and ``delete_markers`` are iterables of ``(key, version_id)`` pairs.
+    """
+    body = '<?xml version="1.0" encoding="UTF-8"?>'
+    body += '<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    body += '<Name>that-kerning</Name>'
+    body += '<IsTruncated>{}</IsTruncated>'.format('true' if is_truncated else 'false')
+    if next_key_marker is not None:
+        body += f'<NextKeyMarker>{next_key_marker}</NextKeyMarker>'
+    if next_version_id_marker is not None:
+        body += f'<NextVersionIdMarker>{next_version_id_marker}</NextVersionIdMarker>'
+    for key, version_id in versions:
+        body += ('<Version>'
+                 f'<Key>{key}</Key>'
+                 f'<VersionId>{version_id}</VersionId>'
+                 '<IsLatest>false</IsLatest>'
+                 '<LastModified>2016-02-05T14:28:50.000Z</LastModified>'
+                 '<ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag>'
+                 '<Size>1234</Size>'
+                 '<StorageClass>STANDARD</StorageClass>'
+                 '</Version>')
+    for key, version_id in delete_markers:
+        body += ('<DeleteMarker>'
+                 f'<Key>{key}</Key>'
+                 f'<VersionId>{version_id}</VersionId>'
+                 '<IsLatest>true</IsLatest>'
+                 '<LastModified>2016-02-05T14:28:50.000Z</LastModified>'
+                 '</DeleteMarker>')
+    body += '</ListVersionsResult>'
+    return body.encode('utf-8')
+
+
 class TestRegionDetection:
 
     @pytest.mark.asyncio
@@ -1353,3 +1421,86 @@ class TestOperations:
 
     def test_can_duplicate_names(self, provider):
         assert provider.can_duplicate_names()
+
+
+class TestObjectVersionsPaging:
+    """U-1: ``get_object_versions`` drives the ListObjectVersions API, but pages it with the
+    ListObjectsV2 continuation contract (``NextContinuationToken``/``ContinuationToken``).
+    ListObjectVersions never returns a ``NextContinuationToken``; it continues with
+    ``NextKeyMarker``/``NextVersionIdMarker``.  It also reports deleted objects in separate
+    ``DeleteMarker`` elements, which the current collector ignores entirely.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_pages_with_key_marker(self, provider, mock_time):
+        """A truncated first page must be continued with KeyMarker/VersionIdMarker.
+
+        The first page is registered as a two-element response list rather than as a single
+        response on purpose: it caps how many times that page can be served.  Code that cannot
+        advance past a truncated page re-requests the very same URL forever, so without the cap
+        this test would hang instead of fail.  With the cap, the third request raises
+        aiohttpretty's "No responses left." and the test fails in bounded time.
+        """
+        install_query_encoding_presigned_url(provider)
+
+        page_one_url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
+        page_two_url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg',
+                                    KeyMarker='my-image.jpg', VersionIdMarker='version-one')
+
+        page_one_body = list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                               is_truncated=True,
+                                               next_key_marker='my-image.jpg',
+                                               next_version_id_marker='version-one')
+        aiohttpretty.register_uri(
+            'GET', page_one_url,
+            responses=[{'body': page_one_body, 'status': 200},
+                       {'body': page_one_body, 'status': 200}],
+        )
+        aiohttpretty.register_uri(
+            'GET', page_two_url,
+            body=list_versions_response(versions=[('my-image.jpg', 'version-two')]),
+            status=200,
+        )
+
+        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+
+        assert [item['VersionId'] for item in versions] == ['version-one', 'version-two']
+        assert aiohttpretty.has_call(method='GET', uri=page_two_url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_collects_delete_markers(self, provider, mock_time):
+        """Delete markers are versions too and must be collectable for a full purge."""
+        install_query_encoding_presigned_url(provider)
+
+        url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
+        aiohttpretty.register_uri(
+            'GET', url,
+            body=list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                        delete_markers=[('my-image.jpg', 'marker-one')]),
+            status=200,
+        )
+
+        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'},
+                                                      include_delete_markers=True)
+
+        assert sorted(item['VersionId'] for item in versions) == ['marker-one', 'version-one']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_omits_delete_markers_by_default(self, provider, mock_time):
+        """revisions() must not grow delete markers as a side effect of the fix."""
+        install_query_encoding_presigned_url(provider)
+
+        url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
+        aiohttpretty.register_uri(
+            'GET', url,
+            body=list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                        delete_markers=[('my-image.jpg', 'marker-one')]),
+            status=200,
+        )
+
+        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+
+        assert [item['VersionId'] for item in versions] == ['version-one']
