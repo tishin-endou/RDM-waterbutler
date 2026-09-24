@@ -24,6 +24,7 @@ from waterbutler.providers.s3 import S3Provider
 from waterbutler.core.path import WaterButlerPath
 from waterbutler.core import streams, metadata, exceptions
 from waterbutler.providers.s3 import settings as pd_settings
+from waterbutler.providers.s3 import provider as pd_provider
 from waterbutler.providers.s3.metadata import S3FileMetadataHeaders
 
 from tests.utils import MockCoroutine
@@ -2663,6 +2664,103 @@ class commit_server:
         return False
 
 
+# K-4 / 決定-13.  The commit's outcome is one of three things: it succeeded, it definitely
+# did not happen, or nobody knows.  The third one is the one that needs saying out loud.
+#
+# An unknown code and a missing code both fall to UNKNOWN.  That is the fail-safe direction:
+# an over-reported notice costs the user a re-check, an under-reported one silently claims
+# nothing was stored -- and the user uploads again, at double the storage.
+COMMIT_CODE_CASES = [
+    ('AccessDenied', False),
+    ('InvalidPart', False),
+    ('EntityTooSmall', False),
+    ('InternalError', True),
+    ('SlowDown', True),
+    ('RequestTimeout', True),
+    ('XVendorMystery', True),
+    (None, True),
+]
+
+# The classification table, written out independently of the implementation's
+# ``DEFINITIVE_REJECTION_CODES``.  Generating it from the implementation would let a deleted
+# row delete its own parameter, leaving that row unguarded -- which is exactly how PR #98's
+# ``NoSuchUpload`` mistake survived a mutation run.
+EXPECTED_DEFINITIVE_REJECTION_CODES = [
+    'AccessDenied',
+    'InvalidPart',
+    'InvalidPartOrder',
+    'EntityTooSmall',
+    'EntityTooLarge',
+    'MalformedXML',
+    'SignatureDoesNotMatch',
+    'InvalidAccessKeyId',
+    'NoSuchBucket',
+]
+
+# Transports where the code is observable.
+OBSERVED_TRANSPORTS = ['direct_4xx', 'direct_5xx', 'complete_200_error']
+# Transports where it is not: whatever the storage meant to say never reaches WaterButler,
+# so the verdict is UNKNOWN regardless.
+LATENT_TRANSPORTS = ['disconnect', 'broken_xml']
+
+
+def commit_error_xml(error_code):
+    """An S3 error body for CompleteMultipartUpload.
+
+    An ``error_code`` of ``None`` yields a body with no ``<Code>`` element: the "missing
+    code" cell, parsable but carrying no verdict.
+    """
+    if error_code is None:
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<Error><Message>boom</Message></Error>')
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<Error><Code>{}</Code><Message>boom</Message></Error>'.format(error_code))
+
+
+def arrange_chunked_commit(provider, aborted=True):
+    """Set up ``_chunked_upload`` so that only the commit fails.
+
+    ``_complete_multipart_upload`` itself is deliberately left real:
+    NOTE_SEMANTICS_DESIGN v2.2 §4-2d -- a test that judges the notice must not mock any of
+    the code that decides it.  The injection goes to the boundary below (``make_request``).
+    """
+    provider._create_upload_session = MockCoroutine(return_value='SESSION')
+    provider._upload_parts = MockCoroutine(return_value=[{'ETAG': 'abc'}])
+    provider._abort_chunked_upload = MockCoroutine(return_value=aborted)
+    provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
+
+
+def arrange_commit_failure(provider, transport, error_code):
+    """Fail only the commit request, in the shape of ``transport``."""
+    if transport == 'direct_4xx':
+        provider.make_request = MockCoroutine(side_effect=exceptions.UploadError(
+            {'response': commit_error_xml(error_code)}, code=400))
+    elif transport == 'direct_5xx':
+        # The status class must not decide anything: S3 answers a failed commit with 200 and
+        # an ``<Error>`` body, so "5xx" and "the storage was definite" are unrelated.
+        provider.make_request = MockCoroutine(side_effect=exceptions.UploadError(
+            {'response': commit_error_xml(error_code)}, code=500))
+    elif transport == 'complete_200_error':
+        resp = mock.Mock()
+        resp.status = 200
+        resp.read = MockCoroutine(return_value=commit_error_xml(error_code).encode('utf-8'))
+        resp.release = MockCoroutine()
+        provider.make_request = MockCoroutine(return_value=resp)
+    elif transport == 'disconnect':
+        # No response arrived, so no code is observable.  The S3 error XML goes into the
+        # exception's ``message`` on purpose: an implementation that reads a code from there
+        # rather than from a response body has to fail here.
+        provider.make_request = MockCoroutine(
+            side_effect=aiohttp.ServerDisconnectedError(commit_error_xml(error_code)))
+    elif transport == 'broken_xml':
+        # The body arrived but is truncated.  The code string is present in it yet cannot be
+        # parsed, so it is not observed -- a substring match must never pick it up.
+        provider.make_request = MockCoroutine(side_effect=exceptions.UploadError(
+            {'response': commit_error_xml(error_code)[:-12]}, code=400))
+    else:  # pragma: no cover - a mistyped parameter must not pass silently
+        raise AssertionError('unknown transport: {}'.format(transport))
+
+
 class TestErrorReporting:
     """K-2 / K-7 / K-8 / K-9: what the six aiobotocore call sites do with a failure."""
 
@@ -3091,3 +3189,260 @@ class TestCommitPreconditions:
         source = inspect.getsource(getattr(S3Provider, method_name))
         assert 'retry=' not in source
         assert 'allow_redirects' not in source
+
+
+class TestCommitOutcome:
+    """K-4 / 決定-13: what the user is told when a multi-part commit fails.
+
+    Ported from PR #98 (``tests/providers/s3compatsigv4/test_provider.py``); the design is
+    ``S3CompatSigv4-quota-handling/NOTE_SEMANTICS_DESIGN.md`` v2.2 §2-2 / §3-2〜3-4 / §4-1 /
+    §4-2d.  The outcome has three values -- success, NOT_COMMITTED, UNKNOWN -- and the
+    difference that matters is the last two: "the file was not saved" tells the user to
+    upload again, and saying it when the object is in fact on the storage costs a second
+    copy that only an administrator can remove.
+
+    The verdict is taken from the S3 error **code** alone.  The HTTP status class cannot
+    carry it: a failed CompleteMultipartUpload arrives as 200 with an ``<Error>`` body, and
+    ``_check_for_200_error``-style handling rewrites that to 5xx, so the status says "server
+    error" for answers the storage was perfectly definite about.
+
+    Two deviations from #98, both recorded in PHASE_TK2_REPORT:
+
+    * the quota-suppression branch is **not** ported -- K-11 established that the ``s3``
+      provider has no quota mechanism at all (absent from ``ADDON_METHOD_PROVIDER`` and from
+      ``website/util/quota.py``'s ``PROVIDERS``), so there is no quota response to suppress;
+    * K-1's abort-outcome wording is kept and the notice is combined with it, rather than
+      replacing it as #98 does.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('aborted', [True, False])
+    @pytest.mark.parametrize('transport', OBSERVED_TRANSPORTS)
+    @pytest.mark.parametrize('error_code,expect_notice', COMMIT_CODE_CASES)
+    async def test_commit_notice_depends_only_on_the_observed_code(
+            self, auth, credentials, settings, mock_time,
+            transport, error_code, expect_notice, aborted):
+        """The observable cells: the same operation and the same observed code must give the
+        same verdict on every transport and whatever the abort did.  Per-transport parameter
+        sets cannot expose a contradiction *between* transports, which is why the product is
+        taken in one place -- all three previous review rounds missed the contradiction for
+        exactly that reason."""
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider, aborted=aborted)
+        arrange_commit_failure(provider, transport, error_code)
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert (S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message) is expect_notice
+        assert_no_secrets(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('aborted', [True, False])
+    @pytest.mark.parametrize('transport', LATENT_TRANSPORTS)
+    @pytest.mark.parametrize('latent_code', [code for code, _ in COMMIT_CODE_CASES])
+    async def test_commit_notice_when_the_code_cannot_be_observed(
+            self, auth, credentials, settings, mock_time, monkeypatch,
+            transport, latent_code, aborted):
+        """The latent cells.  On a disconnect or a truncated body no code can be read, so
+        whatever the storage meant to say, the verdict falls to UNKNOWN.
+
+        These cells are not vacuous: the code string really is there -- in the exception's
+        ``message`` on a disconnect, inside the truncated body on broken XML.  An
+        implementation reading it from anywhere but a parsed response body, or by substring,
+        drops the notice and fails here.
+
+        "Not observable" is the premise, so the premise is asserted alongside the
+        conclusion: an implementation emitting the notice unconditionally would satisfy the
+        conclusion on its own."""
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider, aborted=aborted)
+        arrange_commit_failure(provider, transport, latent_code)
+
+        observed = []
+        real_observed = S3Provider._observed_error_code.__func__
+
+        def spy(cls, err):
+            code = real_observed(cls, err)
+            observed.append(code)
+            return code
+
+        monkeypatch.setattr(S3Provider, '_observed_error_code', classmethod(spy))
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message
+        assert observed and all(code is None for code in observed)
+        assert_no_secrets(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('aborted,abort_message', [
+        (True, ' The upload is aborted.'),
+        (False, 'manually remove them'),
+    ])
+    async def test_the_notice_is_combined_with_the_abort_outcome(
+            self, auth, credentials, settings, mock_time, aborted, abort_message):
+        """K-1's two abort messages stay, and the K-4 notice goes *between* the failure
+        sentence and them.  The two answer different questions -- "is the object there?" and
+        "is there rubbish left behind?" -- and dropping either leaves the user without the
+        half they need to act on."""
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider, aborted=aborted)
+        arrange_commit_failure(provider, 'direct_5xx', 'InternalError')
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        message = e.value.message
+        notice = S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+        assert notice in message
+        assert abort_message in message
+        assert message.index(notice) < message.index(abort_message)
+        assert message.index('An unexpected error has occurred') < message.index(notice)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('aborted,abort_message', [
+        (True, ' The upload is aborted.'),
+        (False, 'manually remove them'),
+    ])
+    async def test_a_definitive_rejection_leaves_the_abort_outcome_alone(
+            self, auth, credentials, settings, mock_time, aborted, abort_message):
+        """The other half of the combination table: suppressing the notice must not take the
+        abort outcome with it."""
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider, aborted=aborted)
+        arrange_commit_failure(provider, 'direct_5xx', 'AccessDenied')
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE not in e.value.message
+        assert abort_message in e.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_failure_before_the_commit_does_not_claim_one(self, auth, credentials,
+                                                                  settings, mock_time):
+        """NOTE_SEMANTICS_DESIGN v2.2 §3-3: "sent" begins at the commit ``await``.  A part
+        that fails never gets there, so the notice must not appear -- it would send the user
+        looking for a file that was never assembled."""
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider)
+        provider._upload_parts = MockCoroutine(
+            side_effect=exceptions.UploadError({'response': commit_error_xml('InternalError')},
+                                               code=500))
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE not in e.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('where', ['commit-request', 'commit-read'])
+    async def test_a_general_exception_inside_the_commit_claims_one(
+            self, auth, credentials, settings, mock_time, where):
+        """NOTE_SEMANTICS_DESIGN v2.2 §4-2d: the mark has to be applied to *any* exception
+        that escapes the commit, not only to the ones WaterButler recognises.
+
+        Both injection points sit on the boundary -- the request and the response read --
+        with the real ``_complete_multipart_upload`` in between.  Replacing that method with
+        a mock that pre-marks its exception would pin the exit while leaving the ``except``
+        clauses that reach it completely unguarded; PR #98 measured two mutations surviving
+        360 tests that way."""
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider)
+
+        if where == 'commit-request':
+            provider.make_request = MockCoroutine(side_effect=RuntimeError('boom'))
+        else:
+            resp = mock.Mock()
+            resp.status = 200
+            resp.read = MockCoroutine(side_effect=RuntimeError('boom'))
+            resp.release = MockCoroutine()
+            provider.make_request = MockCoroutine(return_value=resp)
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message
+
+    @pytest.mark.parametrize('error_code', EXPECTED_DEFINITIVE_REJECTION_CODES)
+    def test_every_definitive_rejection_code_suppresses_the_notice(self, auth, credentials,
+                                                                   settings, error_code):
+        """One parameter per row of the classification table.  Without this, deleting a row
+        also deletes the test that would have caught the deletion -- measured in PR #98,
+        where 4 of 6 row-deleting mutations survived."""
+        provider = raw_provider(auth, credentials, settings)
+        err = pd_provider._mark_commit_outcome_unknown(
+            exceptions.UploadError({'response': commit_error_xml(error_code)}, code=400))
+
+        assert provider._commit_outcome_note(err) == ''
+
+    @pytest.mark.parametrize('error_code', [
+        'NoSuchUpload',       # a second commit meets a consumed UploadId -- the first may
+                              # well have succeeded, so this is the opposite of definitive
+        'InternalError', 'SlowDown', 'RequestTimeout', 'ServiceUnavailable',
+        'accessdenied',       # codes are identifiers: case is not folded
+        'XAccessDenied',      # and a substring must not pass for the code
+        None,
+    ])
+    def test_codes_outside_the_table_keep_the_notice(self, auth, credentials, settings,
+                                                     error_code):
+        provider = raw_provider(auth, credentials, settings)
+        err = pd_provider._mark_commit_outcome_unknown(
+            exceptions.UploadError({'response': commit_error_xml(error_code)}, code=400))
+
+        assert provider._commit_outcome_note(err) == provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+
+    @pytest.mark.parametrize('status', [400, 500, 502, 200])
+    @pytest.mark.parametrize('error_code,suppressed', [('AccessDenied', True),
+                                                       ('InternalError', False)])
+    def test_the_note_ignores_the_status_class(self, auth, credentials, settings, status,
+                                               error_code, suppressed):
+        """決定-13's central claim, isolated from the transports: the status contributes
+        nothing.  It cannot -- a failed commit's own status is 200."""
+        provider = raw_provider(auth, credentials, settings)
+        err = pd_provider._mark_commit_outcome_unknown(
+            exceptions.UploadError({'response': commit_error_xml(error_code)}, code=status))
+
+        assert (provider._commit_outcome_note(err) == '') is suppressed
+
+    def test_the_note_does_not_read_a_code_off_a_connection_error(self, auth, credentials,
+                                                                  settings):
+        """A dropped connection is precisely the case where nothing was observed.  Its
+        message is attacker-shaped only by accident here, but the rule is the point: only a
+        response body may speak for the storage."""
+        provider = raw_provider(auth, credentials, settings)
+        err = pd_provider._mark_commit_outcome_unknown(
+            aiohttp.ServerDisconnectedError(commit_error_xml('AccessDenied')))
+
+        assert provider._observed_error_code(err) is None
+        assert provider._commit_outcome_note(err) == provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+
+    def test_the_note_needs_the_mark(self, auth, credentials, settings):
+        """Without the mark the failure did not come from the commit, so there is no commit
+        whose outcome could be unknown."""
+        provider = raw_provider(auth, credentials, settings)
+        err = exceptions.UploadError({'response': commit_error_xml('InternalError')}, code=500)
+
+        assert provider._commit_outcome_note(err) == ''
+
+    @pytest.mark.parametrize('error_code,expected', [('AccessDenied', 'AccessDenied'),
+                                                     (None, None)])
+    def test_observed_error_code_reads_a_botocore_client_error(self, auth, credentials,
+                                                               settings, error_code, expected):
+        """``generate_generic_presigned_url`` and the other aiobotocore call sites raise
+        ``ClientError``, whose code lives in ``response['Error']['Code']`` rather than in a
+        body WaterButler read itself."""
+        provider = raw_provider(auth, credentials, settings)
+        err = pd_provider._mark_commit_outcome_unknown(
+            s3_client_error(error_code, 403, operation='CompleteMultipartUpload'))
+
+        assert provider._observed_error_code(err) == expected
+
+    def test_the_table_is_what_the_design_says_it_is(self, auth, credentials, settings):
+        """The table is transcribed from MinIO measurements in NOTE_SEMANTICS_DESIGN v2.2
+        §2-2 and is not verified against AWS S3 -- TEST_SPEC E-1 reconciles it.  Pinning the
+        exact set here means an addition has to be argued for, not slipped in."""
+        assert pd_provider.DEFINITIVE_REJECTION_CODES == frozenset(
+            EXPECTED_DEFINITIVE_REJECTION_CODES)
