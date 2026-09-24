@@ -144,10 +144,28 @@ class S3Provider(provider.BaseProvider):
             )
             return resp
 
-    async def get_folder_metadata(self, path, params):
+    async def get_folder_metadata(self, path, params, next_token=None):
+        """List the keys and common prefixes under ``params['Prefix']``.
 
+        :param str path: the prefix being listed, used for error messages only
+        :param dict params: the ListObjectsV2 query parameters
+        :param str next_token: GRDM: when not ``None``, return a single page starting at this
+            continuation token (``''`` for the first page) instead of draining the listing.
+            ``None`` keeps the default behaviour of returning everything.
+        :return: ``(contents, prefixes, continuation_token)``.  The token is the one to ask for
+            the next page with, or ``''`` when there is no next page.
+        """
         contents, response_contents, response_prefixes = [], [], []
         continuation_token = None
+
+        # GRDM: the file browser pages through a folder, so one page has to be a bounded
+        # request the UI can resume from.  Everyone else -- BaseProvider._folder_file_op,
+        # BaseProvider.zip, ZipStreamGenerator -- wants the whole listing in one call.
+        single_page = next_token is not None
+        if single_page:
+            params['MaxKeys'] = '1000'
+            if next_token:
+                params['ContinuationToken'] = next_token
 
         while True:
             if continuation_token:
@@ -197,9 +215,13 @@ class S3Provider(provider.BaseProvider):
             if result.get('IsTruncated') == 'true':
                 continuation_token = result.get('NextContinuationToken')
             else:
+                continuation_token = None
                 break
 
-        return response_contents, response_prefixes
+            if single_page:
+                break
+
+        return response_contents, response_prefixes, continuation_token or ''
 
     async def delete_s3_bucket_folder_objects(self, path):
         continuation_token = None
@@ -861,14 +883,39 @@ class S3Provider(provider.BaseProvider):
         await self._check_region()
 
         if path.is_dir:
-            metadata = await self._metadata_folder(path)
+            # GRDM: only the API layer asks for a page at a time, and it always passes
+            # `next_token` (None for the first page).  A caller that does not name the keyword
+            # -- `BaseProvider._folder_file_op`, `BaseProvider.zip`, `ZipStreamGenerator` --
+            # gets the complete listing, because those read `.name` off every element and a
+            # continuation token among them would raise part way through a copy or a download.
+            if 'next_token' in kwargs:
+                metadata = await self._metadata_folder(path, next_token=kwargs['next_token'] or '')
+            else:
+                metadata = await self._metadata_folder(path)
             for item in metadata:
+                if isinstance(item, str):
+                    # the trailing continuation token, which has no `raw`
+                    continue
                 item.raw['base_folder'] = self.base_folder
         else:
             metadata = await self._metadata_file(path, revision=revision)
             metadata.raw['base_folder'] = self.base_folder
 
         return metadata
+
+    def handle_data(self, data):
+        """GRDM: split the continuation token off a paged folder listing.
+
+        ``server.api.v1.provider.metadata`` calls this with whatever ``metadata()`` returned,
+        which is either a single file's metadata or a listing that may end with a token.
+
+        :return: ``(data, token)``, with ``token`` empty when the listing is complete
+        """
+        token = None
+        if isinstance(data, list) and data and isinstance(data[-1], str):
+            token = data.pop()
+
+        return data, token or ''
 
     async def create_folder(self, path, folder_precheck=True, **kwargs):
         """
@@ -909,13 +956,14 @@ class S3Provider(provider.BaseProvider):
         await resp.release()
         return S3FileMetadataHeaders(path.path, resp.headers)
 
-    async def _metadata_folder(self, path):
+    async def _metadata_folder(self, path, next_token=None):
         await self._check_region()
 
         path_prefix = path.path
         params = {'Prefix': path_prefix, 'Delimiter': '/', 'Bucket': self.bucket_name}
 
-        contents, prefixes = await self.get_folder_metadata(path_prefix, params)
+        contents, prefixes, continuation_token = await self.get_folder_metadata(
+            path_prefix, params, next_token=next_token)
 
         if not contents and not prefixes and not path.is_root:
             # If contents and prefixes are empty then this "folder"
@@ -942,6 +990,12 @@ class S3Provider(provider.BaseProvider):
                 items.append(S3FolderKeyMetadata(content))
             else:
                 items.append(S3FileMetadata(content))
+
+        # GRDM: the continuation token rides along as the last element so that a single
+        # metadata response can carry both a page and the cursor for the next one.
+        # `handle_data` splits it back off before the listing reaches the API layer.
+        if continuation_token:
+            items.append(continuation_token)
 
         return items
 
