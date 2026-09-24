@@ -506,6 +506,24 @@ class TestValidatePath:
         assert path.is_dir
         assert not path.is_root
 
+    @pytest.mark.asyncio
+    async def test_root(self, auth, credentials, settings, mock_time):
+        """T-2: a connection made at the bucket root resolves ``/`` to the root path.
+
+        The shared ``provider`` fixture is scoped to ``/my-subfolder/`` (see ``test_subfolder``)
+        because GRDM lets a node connect to a folder inside the bucket, so this case needs a
+        provider whose ``id`` carries no base folder.
+        """
+        root_provider = S3Provider(auth, credentials, dict(settings, id='that-kerning:/'))
+
+        path = await root_provider.validate_path('/')
+
+        assert path.name == ''
+        assert not path.is_file
+        assert path.is_dir
+        assert path.is_root
+
+
 class TestCRUD:
 
     @pytest.mark.asyncio
@@ -1379,6 +1397,15 @@ class TestMetadata:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_handle_data(self, provider):
+        """P-3: the trailing continuation token is split off the listing."""
+        data = ['txt001.txt', 'abc']
+        result, token = provider.handle_data(data)
+        assert token == 'abc'
+        assert result == ['txt001.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_metadata_folder(self, provider, folder_metadata, mock_time):
         path = WaterButlerPath('/darp/')
         url = 'https://that-kerning.s3.amazonaws.com/'
@@ -1388,6 +1415,43 @@ class TestMetadata:
                                   match_querystring=False)
 
         result = await provider.metadata(path)
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        assert result[0].name == 'photos'
+        assert result[1].name == 'my-image.jpg'
+        assert result[2].extra['md5'] == '1b2cf535f27731c974343645a3985328'
+        assert result[2].extra['hashes']['md5'] == '1b2cf535f27731c974343645a3985328'
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_metadata_have_next_token(self, provider, folder_metadata, mock_time):
+        """P-1: ``metadata()`` accepts ``next_token`` instead of dropping it into ``**kwargs``."""
+        path = WaterButlerPath('/darp/')
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+                                  headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
+
+        result = await provider.metadata(path, revision=None, next_token='')
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        assert result[0].name == 'photos'
+        assert result[1].name == 'my-image.jpg'
+        assert result[2].extra['md5'] == '1b2cf535f27731c974343645a3985328'
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_metadata_folder_have_next_token(self, provider, folder_metadata, mock_time):
+        """P-1: ``_metadata_folder()`` takes the token positionally as well."""
+        path = WaterButlerPath('/darp/')
+        url = 'https://that-kerning.s3.amazonaws.com/'
+        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+                                  headers={'Content-Type': 'application/xml'},
+                                  match_querystring=False)
+
+        result = await provider._metadata_folder(path, next_token='')
 
         assert isinstance(result, list)
         assert len(result) == 3
@@ -1550,6 +1614,122 @@ class TestMetadata:
 
         assert aiohttpretty.has_call(method='PUT', uri=url)
         assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
+
+
+class TestFolderListingPaging:
+    """P-1〜P-5: one page at a time for the UI, the whole listing for everyone else.
+
+    The GRDM file browser walks a folder page by page, so ``metadata()`` has to be able to
+    stop after one page and hand back a token for the next one.  Every other caller of
+    ``metadata()`` -- ``BaseProvider._folder_file_op``, ``BaseProvider.zip``,
+    ``ZipStreamGenerator`` -- wants the complete listing and would choke on a token mixed in
+    among the metadata objects, so the two behaviours are told apart by whether the caller
+    passed a ``next_token`` keyword at all.
+    """
+
+    PREFIX = 'darp/'
+
+    def _register_page(self, url, keys, is_truncated=False, next_continuation_token=None):
+        aiohttpretty.register_uri(
+            'GET', url,
+            body=list_objects_v2_response(keys, is_truncated=is_truncated,
+                                          next_continuation_token=next_continuation_token),
+            headers={'Content-Type': 'application/xml'},
+        )
+
+    def _page_url(self, **extra):
+        params = {'Bucket': 'that-kerning', 'Prefix': self.PREFIX, 'Delimiter': '/'}
+        params.update(extra)
+        return objects_url(**params)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_page_ends_with_the_continuation_token(self, provider, mock_time):
+        """P-2: a truncated page is returned as-is with the token appended as a bare str."""
+        calls = install_query_encoding_presigned_url(provider)
+        self._register_page(self._page_url(MaxKeys='1000'),
+                            ['darp/a.txt', 'darp/b.txt'],
+                            is_truncated=True, next_continuation_token='page-2-token')
+
+        result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert [item.name for item in result[:-1]] == ['a.txt', 'b.txt']
+        assert result[-1] == 'page-2-token'
+        # One page means one request -- the provider must not drain the listing here.
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_page_asks_for_at_most_1000_keys(self, provider, mock_time):
+        """P-2: the page size is pinned so the token round trip stays bounded."""
+        calls = install_query_encoding_presigned_url(provider)
+        self._register_page(self._page_url(MaxKeys='1000'), ['darp/a.txt'])
+
+        await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert calls[0]['MaxKeys'] == '1000'
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_last_page_has_no_trailing_token(self, provider, mock_time):
+        """P-4: ``IsTruncated`` false means the caller must not see a str at the end."""
+        install_query_encoding_presigned_url(provider)
+        self._register_page(self._page_url(MaxKeys='1000'), ['darp/a.txt', 'darp/b.txt'])
+
+        result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert not isinstance(result[-1], str)
+        assert [item.name for item in result] == ['a.txt', 'b.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_token_is_sent_back_as_the_continuation_token(self, provider, mock_time):
+        """P-5: the token the UI received comes back unchanged and selects the next page."""
+        calls = install_query_encoding_presigned_url(provider)
+        self._register_page(self._page_url(MaxKeys='1000', ContinuationToken='page-2-token'),
+                            ['darp/c.txt'])
+
+        result = await provider.metadata(WaterButlerPath('/darp/'), next_token='page-2-token')
+
+        assert calls[0]['ContinuationToken'] == 'page-2-token'
+        assert [item.name for item in result] == ['c.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_listing_without_next_token_returns_every_page(self, provider, mock_time):
+        """Regression guard: ``metadata(path)`` with no ``next_token`` keyword must return the
+        complete listing and nothing but metadata objects.
+
+        ``BaseProvider._folder_file_op`` reads ``item.name`` off every element and
+        ``ZipStreamGenerator`` feeds every element to ``path_from_metadata``; a str token among
+        them raises ``AttributeError`` mid-copy or mid-download.
+        """
+        install_query_encoding_presigned_url(provider)
+        self._register_page(self._page_url(), ['darp/a.txt'],
+                            is_truncated=True, next_continuation_token='page-2-token')
+        self._register_page(self._page_url(ContinuationToken='page-2-token'), ['darp/b.txt'])
+
+        result = await provider.metadata(WaterButlerPath('/darp/'))
+
+        assert [item.name for item in result] == ['a.txt', 'b.txt']
+        assert not any(isinstance(item, str) for item in result)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_handle_data_leaves_a_single_file_alone(self, provider, file_header_metadata,
+                                                          mock_time):
+        """P-3: a file's metadata is not a listing, so nothing may be popped off it."""
+        path = WaterButlerPath('/Foo/Bar/my-image.jpg')
+        aiohttpretty.register_uri('HEAD',
+                                  f'https://that-kerning.s3.amazonaws.com/{path.path}',
+                                  headers=file_header_metadata, match_querystring=False)
+
+        file_metadata = await provider.metadata(path)
+        data, token = provider.handle_data(file_metadata)
+
+        assert isinstance(data, S3FileMetadataHeaders)
+        assert data is file_metadata
+        assert token == ''
 
 
 class TestCreateFolder:
