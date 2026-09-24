@@ -1194,8 +1194,9 @@ class TestCRUD:
         install_query_encoding_presigned_url(provider)
 
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix=''),
-            body=list_objects_v2_response(['some-folder/', 'some-folder/file.txt']),
+            'GET', versions_url(Bucket='that-kerning', Prefix=''),
+            body=list_versions_response(
+                versions=[('some-folder/', 'v1'), ('some-folder/file.txt', 'v2')]),
             status=200,
         )
 
@@ -1211,19 +1212,28 @@ class TestCRUD:
 
         s3_client.delete_objects.assert_called_once_with(
             Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-folder/'}, {'Key': 'some-folder/file.txt'}],
+            Delete={'Objects': [{'Key': 'some-folder/', 'VersionId': 'v1'},
+                                {'Key': 'some-folder/file.txt', 'VersionId': 'v2'}],
                     'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_delete(self, provider, mock_time):
-        path = WaterButlerPath('/some-folder/')
+    async def test_delete_folder_with_versions(self, provider, mock_time):
+        """V-6: deleting a folder purges every version and every delete marker under the
+        prefix.  Deleting only the live keys leaves the folder's whole history -- and the
+        storage it occupies -- behind on a versioned bucket.
+        """
+        path = WaterButlerPath('/folder-to-delete/')
         install_query_encoding_presigned_url(provider)
 
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix='some-folder/'),
-            body=list_objects_v2_response(['some-folder/', 'some-folder/my-image.jpg']),
+            'GET', versions_url(Bucket='that-kerning', Prefix='folder-to-delete/'),
+            body=list_versions_response(
+                versions=[('folder-to-delete/file1.txt', '111'),
+                          ('folder-to-delete/file1.txt', '222')],
+                delete_markers=[('folder-to-delete/file2.txt', '333')],
+            ),
             status=200,
         )
 
@@ -1234,7 +1244,9 @@ class TestCRUD:
 
         s3_client.delete_objects.assert_called_once_with(
             Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-folder/'}, {'Key': 'some-folder/my-image.jpg'}],
+            Delete={'Objects': [{'Key': 'folder-to-delete/file1.txt', 'VersionId': '111'},
+                                {'Key': 'folder-to-delete/file1.txt', 'VersionId': '222'},
+                                {'Key': 'folder-to-delete/file2.txt', 'VersionId': '333'}],
                     'Quiet': False},
         )
 
@@ -1245,8 +1257,8 @@ class TestCRUD:
         install_query_encoding_presigned_url(provider)
 
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix='single-thing-folder/'),
-            body=list_objects_v2_response(['single-thing-folder/item']),
+            'GET', versions_url(Bucket='that-kerning', Prefix='single-thing-folder/'),
+            body=list_versions_response(versions=[('single-thing-folder/item', 'v1')]),
             status=200,
         )
 
@@ -1257,18 +1269,22 @@ class TestCRUD:
 
         s3_client.delete_objects.assert_called_once_with(
             Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'single-thing-folder/item'}], 'Quiet': False},
+            Delete={'Objects': [{'Key': 'single-thing-folder/item', 'VersionId': 'v1'}],
+                    'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_empty_folder_delete(self, provider, mock_time):
+        """V-6: an empty folder still exists as the 0-byte ``prefix/`` key, which is one
+        version of its own.  Deleting it must remove that key, not report the folder missing.
+        """
         path = WaterButlerPath('/empty-folder/')
         install_query_encoding_presigned_url(provider)
 
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix='empty-folder/'),
-            body=list_objects_v2_response([]),
+            'GET', versions_url(Bucket='that-kerning', Prefix='empty-folder/'),
+            body=list_versions_response(versions=[('empty-folder/', 'v1')]),
             status=200,
         )
 
@@ -1277,7 +1293,57 @@ class TestCRUD:
         with patcher:
             await provider.delete(path)
 
+        s3_client.delete_objects.assert_called_once_with(
+            Bucket='that-kerning',
+            Delete={'Objects': [{'Key': 'empty-folder/', 'VersionId': 'v1'}], 'Quiet': False},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_delete_folder_not_found(self, provider, mock_time):
+        """V-6: a prefix with neither a version nor a delete marker under it is a folder that
+        does not exist, and must not be reported as a successful delete."""
+        path = WaterButlerPath('/not-found-folder/')
+        install_query_encoding_presigned_url(provider)
+
+        aiohttpretty.register_uri(
+            'GET', versions_url(Bucket='that-kerning', Prefix='not-found-folder/'),
+            body=list_versions_response(),
+            status=200,
+        )
+
+        patcher, s3_client = patch_aiobotocore_client(
+            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
+        with patcher:
+            with pytest.raises(exceptions.NotFoundError):
+                await provider.delete(path)
+
         assert s3_client.delete_objects.called is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_delete_folder_of_delete_markers_only(self, provider, mock_time):
+        """V-6: a folder whose keys have all been delete-marked still has versions to purge."""
+        path = WaterButlerPath('/tombstone-folder/')
+        install_query_encoding_presigned_url(provider)
+
+        aiohttpretty.register_uri(
+            'GET', versions_url(Bucket='that-kerning', Prefix='tombstone-folder/'),
+            body=list_versions_response(
+                delete_markers=[('tombstone-folder/file1.txt', '111')]),
+            status=200,
+        )
+
+        patcher, s3_client = patch_aiobotocore_client(
+            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
+        with patcher:
+            await provider.delete(path)
+
+        s3_client.delete_objects.assert_called_once_with(
+            Bucket='that-kerning',
+            Delete={'Objects': [{'Key': 'tombstone-folder/file1.txt', 'VersionId': '111'}],
+                    'Quiet': False},
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -1288,8 +1354,8 @@ class TestCRUD:
 
         keys = [f'some-folder/file-{index:05d}' for index in range(1001)]
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix='some-folder/'),
-            body=list_objects_v2_response(keys),
+            'GET', versions_url(Bucket='that-kerning', Prefix='some-folder/'),
+            body=list_versions_response(versions=[(key, 'v1') for key in keys]),
             status=200,
         )
 
@@ -1304,25 +1370,29 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_delete_truncated_listing(self, provider, mock_time):
-        """A folder holding more than one page of keys must be listed to the end before any of
-        it is deleted, otherwise the tail of the folder silently survives."""
+    async def test_delete_folder_truncated_response(self, provider, mock_time):
+        """V-6: a folder holding more than one page of versions must be listed to the end
+        before any of it is deleted, otherwise the tail of the folder silently survives.
+        ListObjectVersions resumes from the last key *and* version id, not a continuation
+        token."""
         path = WaterButlerPath('/large-folder/')
         install_query_encoding_presigned_url(provider)
 
-        page_one_url = objects_url(Bucket='that-kerning', Prefix='large-folder/')
-        page_two_url = objects_url(Bucket='that-kerning', Prefix='large-folder/',
-                                   ContinuationToken='token-for-page-two')
+        page_one_url = versions_url(Bucket='that-kerning', Prefix='large-folder/')
+        page_two_url = versions_url(Bucket='that-kerning', Prefix='large-folder/',
+                                    KeyMarker='large-folder/file2.txt', VersionIdMarker='222')
 
         aiohttpretty.register_uri(
             'GET', page_one_url,
-            body=list_objects_v2_response(['large-folder/file1.txt'], is_truncated=True,
-                                          next_continuation_token='token-for-page-two'),
+            body=list_versions_response(versions=[('large-folder/file1.txt', '111')],
+                                        is_truncated=True,
+                                        next_key_marker='large-folder/file2.txt',
+                                        next_version_id_marker='222'),
             status=200,
         )
         aiohttpretty.register_uri(
             'GET', page_two_url,
-            body=list_objects_v2_response(['large-folder/file2.txt']),
+            body=list_versions_response(versions=[('large-folder/file2.txt', '222')]),
             status=200,
         )
 
@@ -1334,8 +1404,8 @@ class TestCRUD:
         assert aiohttpretty.has_call(method='GET', uri=page_two_url)
         s3_client.delete_objects.assert_called_once_with(
             Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'large-folder/file1.txt'},
-                                {'Key': 'large-folder/file2.txt'}],
+            Delete={'Objects': [{'Key': 'large-folder/file1.txt', 'VersionId': '111'},
+                                {'Key': 'large-folder/file2.txt', 'VersionId': '222'}],
                     'Quiet': False},
         )
 
@@ -1347,15 +1417,16 @@ class TestCRUD:
         install_query_encoding_presigned_url(provider)
 
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix='error-folder/'),
-            body=list_objects_v2_response(['error-folder/file1.txt', 'error-folder/file2.txt']),
+            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
+            body=list_versions_response(versions=[('error-folder/file1.txt', '111'),
+                                                  ('error-folder/file2.txt', '222')]),
             status=200,
         )
 
         delete_result = {
-            'Deleted': [{'Key': 'error-folder/file1.txt'}],
-            'Errors': [{'Key': 'error-folder/file2.txt', 'Code': 'AccessDenied',
-                        'Message': 'Access Denied'}],
+            'Deleted': [{'Key': 'error-folder/file1.txt', 'VersionId': '111'}],
+            'Errors': [{'Key': 'error-folder/file2.txt', 'VersionId': '222',
+                        'Code': 'AccessDenied', 'Message': 'Access Denied'}],
         }
         patcher, _ = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value=delete_result))
@@ -1368,12 +1439,31 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_delete_folder_delete_error(self, provider, mock_time):
+        """V-6: a refused DeleteObjects call surfaces as a DeleteError."""
+        path = WaterButlerPath('/error-folder/')
+        install_query_encoding_presigned_url(provider)
+
+        aiohttpretty.register_uri(
+            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
+            body=list_versions_response(versions=[('error-folder/file1.txt', '111')]),
+            status=200,
+        )
+
+        patcher, _ = patch_aiobotocore_client(
+            delete_objects=MockCoroutine(side_effect=Exception('AccessDenied')))
+        with patcher:
+            with pytest.raises(exceptions.DeleteError):
+                await provider.delete(path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_folder_delete_listing_error(self, provider, mock_time):
         path = WaterButlerPath('/error-folder/')
         install_query_encoding_presigned_url(provider)
 
         aiohttpretty.register_uri(
-            'GET', objects_url(Bucket='that-kerning', Prefix='error-folder/'),
+            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
             body=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code></Error>',
             status=403,
         )
