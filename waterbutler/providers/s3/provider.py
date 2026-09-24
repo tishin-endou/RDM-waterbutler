@@ -223,52 +223,6 @@ class S3Provider(provider.BaseProvider):
 
         return response_contents, response_prefixes, continuation_token or ''
 
-    async def delete_s3_bucket_folder_objects(self, path):
-        continuation_token = None
-        delete_requests = []
-        while True:
-            list_params = {
-                'Bucket': self.bucket_name,
-                'Prefix': path,
-            }
-            if continuation_token:
-                list_params['ContinuationToken'] = continuation_token
-
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_objects_v2.html
-            list_url = await self.generate_generic_presigned_url(
-                '', 'list_objects_v2', query_parameters=list_params, default_params=False
-            )
-
-            resp = await self.make_request(
-                'GET', list_url,
-                expects=(200, 206),
-                throws=exceptions.DownloadError
-            )
-            xml_body = await resp.text()
-            doc = xmltodict.parse(xml_body)
-            result = doc.get('ListBucketResult', {})
-
-            contents = result.get('Contents') or []
-
-            if isinstance(contents, dict):
-                contents = [contents]
-            for content in contents:
-                key = content['Key']
-                if key:
-                    # on testing it was seen that folders with name xml encoding are not deleted (though files are)
-                    # so casting is needed on using xml approach with aiobotocore
-                    key = key.replace('+', ' ')
-                    content['Key'] = unquote(key)
-                    delete_requests.append({"Key": content['Key']})
-
-            # handle pagination
-            if result.get('IsTruncated') == 'true':
-                continuation_token = result.get('NextContinuationToken')
-            else:
-                break
-
-        await self.delete_objects_in_chunks(path, delete_requests)
-
     async def delete_objects_in_chunks(self, path, delete_requests):
         """Send ``delete_requests`` to DeleteObjects in batches of 1000, the API maximum.
 
@@ -844,6 +798,7 @@ class S3Provider(provider.BaseProvider):
         Calls: func: self._check_region
 
         :param *ProviderPath path: Path to be deleted
+        :raises: :class:`.NotFoundError` if nothing at all is stored under the prefix
 
         On S3, folders are not first-class objects, but are instead inferred
         from the names of their children.  A regular DELETE request issued
@@ -851,9 +806,30 @@ class S3Provider(provider.BaseProvider):
         To fully delete an occupied folder, we must delete all of the comprising
         objects.  Amazon provides a bulk delete operation to simplify this.
         # docs https://boto3.amazonaws.com/v1/documentation/api/1.28.0/reference/services/s3/client/delete_objects.html#delete-objects
+
+        GRDM: every version and delete marker under the prefix has to go, not just the live
+        keys.  On a versioned bucket a listing of live keys misses both the superseded
+        versions and the keys that are already delete-marked, so deleting a folder that way
+        leaves its whole history -- and the storage it occupies -- behind.
         """
         await self._check_region()
-        await self.delete_s3_bucket_folder_objects(path.path)
+
+        versions = await self.get_object_versions({'Prefix': path.path},
+                                                  include_delete_markers=True)
+
+        # Neither a version nor a delete marker under the prefix: the folder does not exist.
+        # An empty folder is not this case -- S3 stores it as a 0-byte 'prefix/' key, which is
+        # one version of its own.
+        if not versions:
+            raise exceptions.NotFoundError(str(path))
+
+        delete_requests = [
+            {'Key': version['Key'], 'VersionId': version['VersionId']}
+            for version in versions
+            if version.get('Key') and version.get('VersionId')
+        ]
+
+        await self.delete_objects_in_chunks(path.path, delete_requests)
 
     async def revisions(self, path, **kwargs):
         """Get past versions of the requested key
