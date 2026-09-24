@@ -2507,3 +2507,356 @@ class TestObjectVersionsPaging:
         versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
 
         assert [item['VersionId'] for item in versions] == ['version-one']
+
+
+# A presigned SigV4 URL carries the access key id in ``X-Amz-Credential`` and the signature in
+# ``X-Amz-Signature``.  Neither may reach a response body or a log line.
+SIGNED_URL = (
+    'https://that-kerning.s3.amazonaws.com/my-subfolder/thefile.txt'
+    '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+    '&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20160205%2Fus-east-1%2Fs3%2Faws4_request'
+    '&X-Amz-Signature=deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef'
+)
+
+SECRET_MARKERS = ('X-Amz-Signature', 'X-Amz-Credential', 'AKIAIOSFODNN7EXAMPLE')
+
+
+def s3_client_error(code, status, operation='HeadObject'):
+    """A botocore ``ClientError`` shaped like the one aiobotocore raises for ``code``."""
+    return botocore.exceptions.ClientError(
+        {
+            'Error': {'Code': code, 'Message': 'S3 prose naming the bucket and the request'},
+            'ResponseMetadata': {'HTTPStatusCode': status,
+                                 'RequestId': 'REQ123', 'HostId': 'HOST456'},
+        },
+        operation,
+    )
+
+
+def assert_no_secrets(exc):
+    blob = '{!r} {!s} {}'.format(exc, exc, getattr(exc, 'message', ''))
+    leaked = [marker for marker in SECRET_MARKERS if marker in blob]
+    assert leaked == [], 'exception exposes {}'.format(leaked)
+
+
+def raw_provider(auth, credentials, settings):
+    """A provider with only the region lookup stubbed, so that the real
+    ``generate_generic_presigned_url`` and ``check_key_existence`` run."""
+    prov = S3Provider(auth, credentials, settings)
+    prov._check_region = MockCoroutine()
+    prov.region = 'us-east-1'
+    return prov
+
+
+class TestErrorReporting:
+    """K-2 / K-7 / K-8 / K-9: what the six aiobotocore call sites do with a failure."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_check_key_existence_does_not_expose_the_presigned_url(self, auth, credentials,
+                                                                        settings, mock_time):
+        """K-8/K-9: core builds its message out of the request URL
+        (``exceptions.DEFAULT_ERROR_MSG``), and ``waterbutler.server.api.v1.core.write_error``
+        hands ``exc.message`` straight to the client.  Re-wrapping that message verbatim puts the
+        signature and the access key id in a 404 body."""
+        provider = raw_provider(auth, credentials, settings)
+        patcher, _ = patch_aiobotocore_client(
+            generate_presigned_url=MockCoroutine(return_value=SIGNED_URL))
+        aiohttpretty.register_uri('HEAD', SIGNED_URL, status=403)
+
+        with patcher:
+            with pytest.raises(exceptions.NotFoundError) as e:
+                await provider.check_key_existence('my-subfolder/thefile.txt')
+
+        assert_no_secrets(e.value)
+        assert 'my-subfolder/thefile.txt' in e.value.message
+
+    @pytest.mark.asyncio
+    async def test_generate_presigned_url_reports_the_code_not_s3_prose(self, auth, credentials,
+                                                                       settings, mock_time):
+        """K-2: name the failure by type and S3 error code.  botocore's own message quotes S3's
+        prose, which carries the request id and the host id."""
+        provider = raw_provider(auth, credentials, settings)
+        patcher, _ = patch_aiobotocore_client(
+            generate_presigned_url=MockCoroutine(
+                side_effect=s3_client_error('AccessDenied', 403)))
+
+        with patcher:
+            with pytest.raises(exceptions.NotFoundError) as e:
+                await provider.generate_generic_presigned_url('/my-subfolder/thefile.txt')
+
+        assert 'AccessDenied' in e.value.message
+        assert 'REQ123' not in e.value.message
+        assert 'HOST456' not in e.value.message
+
+    @pytest.mark.asyncio
+    async def test_get_bucket_location_converts_a_client_error(self, auth, credentials, settings,
+                                                               mock_time):
+        """K-2: this site has no handler at all, so a botocore ``ClientError`` escapes the
+        provider as itself and the API layer can only answer 500 with no code."""
+        provider = raw_provider(auth, credentials, settings)
+        patcher, _ = patch_aiobotocore_client(
+            generate_presigned_url=MockCoroutine(
+                side_effect=s3_client_error('AccessDenied', 403, 'GetBucketLocation')))
+
+        with patcher:
+            with pytest.raises(exceptions.MetadataError) as e:
+                await provider.get_s3_bucket_object_location()
+
+        assert e.value.code == 403
+        assert 'AccessDenied' in e.value.message
+
+    @pytest.mark.asyncio
+    async def test_delete_objects_reports_the_code_not_s3_prose(self, auth, credentials, settings,
+                                                                mock_time):
+        """K-2: keep S3's status rather than flattening every refusal to 500."""
+        provider = raw_provider(auth, credentials, settings)
+        patcher, _ = patch_aiobotocore_client(
+            delete_objects=MockCoroutine(
+                side_effect=s3_client_error('AccessDenied', 403, 'DeleteObjects')))
+
+        with patcher:
+            with pytest.raises(exceptions.DeleteError) as e:
+                await provider.delete_objects_in_chunks(
+                    '/my-subfolder/', [{'Key': 'a', 'VersionId': 'v'}])
+
+        assert e.value.code == 403
+        assert 'AccessDenied' in e.value.message
+        assert 'REQ123' not in e.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('site,method,call', [
+        ('generate_generic_presigned_url', 'generate_presigned_url',
+         lambda p: p.generate_generic_presigned_url('/my-subfolder/thefile.txt')),
+        ('delete_objects_in_chunks', 'delete_objects',
+         lambda p: p.delete_objects_in_chunks('/my-subfolder/',
+                                              [{'Key': 'a', 'VersionId': 'v'}])),
+    ])
+    async def test_cancellation_is_not_swallowed(self, auth, credentials, settings, mock_time,
+                                                 site, method, call):
+        """K-7: Python 3.6 derives ``asyncio.CancelledError`` from ``Exception``, so the broad
+        ``except Exception`` around each of these calls catches it.  Reporting a cancelled request
+        as a provider failure stops the cancellation from propagating, and the task never ends."""
+        provider = raw_provider(auth, credentials, settings)
+        patcher, _ = patch_aiobotocore_client(
+            **{method: MockCoroutine(side_effect=asyncio.CancelledError())})
+
+        with patcher:
+            with pytest.raises(asyncio.CancelledError):
+                await call(provider)
+
+    @pytest.mark.asyncio
+    async def test_chunked_upload_cancellation_is_not_swallowed(self, auth, credentials, settings,
+                                                                mock_time):
+        """K-7: same for the multi-part upload's handler, which additionally fires off an abort."""
+        provider = raw_provider(auth, credentials, settings)
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(side_effect=asyncio.CancelledError())
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+    @pytest.mark.asyncio
+    async def test_chunked_upload_does_not_log_the_presigned_url(self, auth, credentials, settings,
+                                                                 mock_time, caplog):
+        """K-8/K-9: the handler logs ``repr()`` of whatever was raised.  Everything raised out of
+        ``make_request`` reprs to the request URL, so the signature and the access key id land in
+        the log of every failed multi-part upload."""
+        provider = raw_provider(auth, credentials, settings)
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(return_value=[])
+        provider._complete_multipart_upload = MockCoroutine(side_effect=exceptions.UploadError(
+            'An error occurred while making a POST request to {}'.format(SIGNED_URL), code=403))
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with pytest.raises(exceptions.UploadError):
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        logged = ' '.join(record.getMessage() for record in caplog.records)
+        leaked = [marker for marker in SECRET_MARKERS if marker in logged]
+        assert leaked == [], 'log exposes {}'.format(leaked)
+        assert 'UploadError' in logged
+        assert 'SESSION' in logged
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_error_reporting_is_unchanged(self, auth, credentials, settings,
+                                                           mock_time):
+        """I-2 folded into the shared helper: same message, same status."""
+        provider = raw_provider(auth, credentials, settings)
+        dest = raw_provider(auth, credentials, settings)
+        dest.exists = MockCoroutine(return_value=False)
+        dest.metadata = MockCoroutine(return_value='META')
+        patcher, _ = patch_aiobotocore_client(
+            copy_object=MockCoroutine(
+                side_effect=s3_client_error('InternalError', 200, 'CopyObject')))
+
+        with patcher:
+            with pytest.raises(exceptions.IntraCopyError) as e:
+                await provider.intra_copy(dest, WaterButlerPath('/a.txt'),
+                                          WaterButlerPath('/b.txt'))
+
+        assert e.value.message == 'CopyObject failed: ClientError InternalError'
+        assert e.value.code == 500
+
+
+class TestResponseParsing:
+    """K-10: what each XML shape the provider can be handed turns into."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_folder_listing_rejects_an_unrecognised_root_element(self, provider, mock_time):
+        """K-10: ``doc.get('ListBucketResult', {})`` answers ``{}`` for any body whose root
+        element is not spelled exactly that -- a namespace-prefixed one, say -- and an empty
+        listing is indistinguishable from an empty folder.  Fail closed instead."""
+        install_query_encoding_presigned_url(provider)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<s3:ListBucketResult xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">'
+                '<s3:IsTruncated>false</s3:IsTruncated>'
+                '<s3:Contents><s3:Key>my-subfolder/thefile.txt</s3:Key></s3:Contents>'
+                '</s3:ListBucketResult>').encode('utf-8')
+        aiohttpretty.register_uri('GET', objects_url(Prefix='my-subfolder/'), body=body,
+                                  status=200)
+
+        with pytest.raises(exceptions.DownloadError):
+            await provider.get_folder_metadata('my-subfolder/', {'Prefix': 'my-subfolder/'})
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_version_listing_rejects_an_unrecognised_root_element(self, provider, mock_time):
+        """K-10: the same shape on the versions listing decides what a delete purges.  An empty
+        list means "nothing to delete", so a delete would report success having removed nothing."""
+        install_query_encoding_presigned_url(provider)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<s3:ListVersionsResult xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">'
+                '<s3:IsTruncated>false</s3:IsTruncated>'
+                '</s3:ListVersionsResult>').encode('utf-8')
+        aiohttpretty.register_uri('GET', versions_url(Bucket='that-kerning',
+                                                      Prefix='my-image.jpg'),
+                                  body=body, status=200)
+
+        with pytest.raises(exceptions.DownloadError):
+            await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_folder_listing_accepts_a_whitespace_formatted_body(self, provider, mock_time):
+        """K-10: indentation between the elements must not change the result."""
+        install_query_encoding_presigned_url(provider)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n'
+                '  <IsTruncated>false</IsTruncated>\n'
+                '  <Contents>\n    <Key>my-subfolder/thefile.txt</Key>\n  </Contents>\n'
+                '</ListBucketResult>\n').encode('utf-8')
+        aiohttpretty.register_uri('GET', objects_url(Prefix='my-subfolder/'), body=body,
+                                  status=200)
+
+        contents, prefixes, token = await provider.get_folder_metadata(
+            'my-subfolder/', {'Prefix': 'my-subfolder/'})
+
+        assert [item['Key'] for item in contents] == ['my-subfolder/thefile.txt']
+        assert token == ''
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_folder_listing_accepts_a_single_contents_element(self, provider, mock_time):
+        """K-10: xmltodict collapses a lone repeated element to a dict rather than a
+        one-element list."""
+        install_query_encoding_presigned_url(provider)
+        aiohttpretty.register_uri(
+            'GET', objects_url(Prefix='my-subfolder/'),
+            body=list_objects_v2_response(['my-subfolder/thefile.txt']), status=200)
+
+        contents, prefixes, token = await provider.get_folder_metadata(
+            'my-subfolder/', {'Prefix': 'my-subfolder/'})
+
+        assert [item['Key'] for item in contents] == ['my-subfolder/thefile.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_folder_listing_rejects_an_empty_body(self, provider, mock_time):
+        """K-10: an empty 200 must not read as an empty folder."""
+        install_query_encoding_presigned_url(provider)
+        aiohttpretty.register_uri('GET', objects_url(Prefix='my-subfolder/'), body=b'', status=200)
+
+        with pytest.raises(exceptions.DownloadError):
+            await provider.get_folder_metadata('my-subfolder/', {'Prefix': 'my-subfolder/'})
+
+
+class TestCompleteMultipartUpload:
+    """K-1 / K-3: committing a multi-part upload."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_complete_rejects_a_200_carrying_an_error(self, auth, credentials, settings,
+                                                            mock_time):
+        """K-3: S3 answers CompleteMultipartUpload with 200 and an ``<Error>`` body when the
+        assembly fails part way through, because the status line is already on the wire by then.
+        ``expects=(200, 201)`` reads that as a completed upload."""
+        provider = raw_provider(auth, credentials, settings)
+        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<Error><Code>InternalError</Code>'
+                '<Message>We encountered an internal error. Please try again.</Message>'
+                '</Error>').encode('utf-8')
+        aiohttpretty.register_uri('POST', SIGNED_URL, body=body, status=200)
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._complete_multipart_upload(
+                WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+
+        assert 'InternalError' in e.value.message
+        assert_no_secrets(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_complete_accepts_a_200_carrying_a_result(self, auth, credentials, settings,
+                                                            mock_time):
+        """K-3: the success body must still be accepted."""
+        provider = raw_provider(auth, credentials, settings)
+        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<CompleteMultipartUploadResult>'
+                '<Location>https://that-kerning.s3.amazonaws.com/my-subfolder/thefile.txt</Location>'
+                '<Bucket>that-kerning</Bucket><Key>my-subfolder/thefile.txt</Key>'
+                '<ETag>&quot;abc&quot;</ETag>'
+                '</CompleteMultipartUploadResult>').encode('utf-8')
+        aiohttpretty.register_uri('POST', SIGNED_URL, body=body, status=200)
+
+        await provider._complete_multipart_upload(
+            WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+
+    @pytest.mark.asyncio
+    async def test_chunked_upload_says_so_when_the_abort_succeeded(self, auth, credentials,
+                                                                   settings, mock_time):
+        """K-1: pin the ``if not aborted:`` branch.  The two messages differ in whether the user
+        is told to go and clean up the leftover parts by hand."""
+        provider = raw_provider(auth, credentials, settings)
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(return_value=[])
+        provider._complete_multipart_upload = MockCoroutine(
+            side_effect=exceptions.UploadError('nope', code=500))
+        provider._abort_chunked_upload = MockCoroutine(return_value=True)
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert 'The upload is aborted.' in e.value.message
+        assert 'manually remove them' not in e.value.message
+
+    @pytest.mark.asyncio
+    async def test_chunked_upload_says_so_when_the_abort_failed(self, auth, credentials, settings,
+                                                                mock_time):
+        """K-1: the other side of the same branch."""
+        provider = raw_provider(auth, credentials, settings)
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(return_value=[])
+        provider._complete_multipart_upload = MockCoroutine(
+            side_effect=exceptions.UploadError('nope', code=500))
+        provider._abort_chunked_upload = MockCoroutine(return_value=False)
+
+        with pytest.raises(exceptions.UploadError) as e:
+            await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert 'manually remove them' in e.value.message
+        assert 'The upload is aborted.' not in e.value.message
