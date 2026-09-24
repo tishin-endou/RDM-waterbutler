@@ -1206,7 +1206,7 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     @pytest.mark.parametrize('transport_error', [aiohttp.ClientError, asyncio.TimeoutError])
     async def test_delete_file_versions_listing_transport_error(self, provider, transport_error,
-                                                                monkeypatch, mock_time):
+                                                                mock_time):
         """V-5: transport failures are not WaterButlerErrors and would otherwise escape
         delete() unconverted."""
         path = WaterButlerPath('/some-file')
@@ -1215,10 +1215,15 @@ class TestCRUD:
         async def _fail(*args, **kwargs):
             raise transport_error()
 
-        monkeypatch.setattr(aiohttp.ClientSession, '_request', _fail)
-
-        with pytest.raises(exceptions.DeleteError) as exc_info:
-            await provider.delete(path)
+        # Restore inside the test body, not at teardown.  ``aiohttpretty`` has already
+        # replaced ``ClientSession._request`` by the time this runs, so whatever saves the
+        # attribute here saves *its* fake.  ``monkeypatch`` undoes at teardown, and the
+        # conftest hook that deactivates aiohttpretty runs first -- so the undo would put
+        # the fake back after the real method had been restored, and every later test that
+        # needs a real socket would be answered by a deactivated aiohttpretty.
+        with mock.patch.object(aiohttp.ClientSession, '_request', _fail):
+            with pytest.raises(exceptions.DeleteError) as exc_info:
+                await provider.delete(path)
 
         assert transport_error.__name__ in exc_info.value.message
 

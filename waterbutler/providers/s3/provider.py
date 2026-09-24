@@ -820,6 +820,16 @@ class S3Provider(provider.BaseProvider):
             },
             expects=(200, 201,),
             throws=exceptions.UploadError,
+            # GRDM: the commit is sent exactly once.  CompleteMultipartUpload is not
+            # idempotent -- a re-send after the first attempt succeeded meets a consumed
+            # UploadId and comes back `NoSuchUpload`, so the code that reaches the caller
+            # belongs to the last attempt and says nothing about the upload.  Two different
+            # mechanisms re-send it and each needs its own stop: `retry=0` for core's loop
+            # in `make_request` (`retry_on` covers 408/502/503/504), `allow_redirects=False`
+            # for aiohttp following a 307/308 below that loop.  Both are scoped to this
+            # request; the part transfers and the session creation keep the defaults.
+            retry=0,
+            allow_redirects=False,
         )
 
         # GRDM: S3 sends the status line before it starts assembling the parts, so a failure
