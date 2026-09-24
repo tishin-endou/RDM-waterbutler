@@ -2410,6 +2410,27 @@ class TestIntraCopySizeLimit:
         assert metadata_result.kind == 'file'
         assert delete_client.delete_objects.called
 
+    @pytest.mark.parametrize('method_name', ['can_intra_copy', 'can_intra_move'])
+    @pytest.mark.parametrize('offset,expected', [
+        (-1, True),
+        (0, True),    # a file of exactly the limit is still copied server side
+        (1, False),
+    ])
+    def test_size_limit_boundary(self, provider, method_name, offset, expected):
+        """The limit is inclusive.  The fallback tests above only exercise limit + 1, which
+        leaves ``>`` and ``>=`` indistinguishable; this pins which one it is.
+        """
+        decide = getattr(provider, method_name)
+        file_size = provider.FILE_SIZE_INTRA_COPY_LIMIT + offset
+
+        assert decide(provider, WaterButlerPath('/source.txt'), file_size) is expected
+
+    @pytest.mark.parametrize('method_name', ['can_intra_copy', 'can_intra_move'])
+    def test_unknown_size_is_not_copied_server_side(self, provider, method_name):
+        decide = getattr(provider, method_name)
+
+        assert decide(provider, WaterButlerPath('/source.txt'), None) is False
+
 
 class TestFileSizeSource:
     """I-4: ``file_size`` comes from ``S3FileMetadataHeaders.size``, which has to survive both
