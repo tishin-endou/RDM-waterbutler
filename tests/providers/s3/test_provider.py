@@ -6,9 +6,11 @@ import time
 import base64
 import asyncio
 import hashlib
+import inspect
 import aiohttp
 import aiohttpretty
 import botocore.exceptions
+from aiohttp import web
 from aiobotocore import session as aiobotocore_session
 from http import client
 from urllib import parse
@@ -2602,6 +2604,60 @@ def raw_provider(auth, credentials, settings):
     return prov
 
 
+class commit_server:
+    """An ``aiohttp.web`` server that accepts a single commit.
+
+    Ported from ``tests/providers/s3compatsigv4/test_provider.py`` (PR #98).
+    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so the redirect
+    following that happens *inside* that call cannot be reproduced with it, and pinning it
+    needs a real socket.
+
+    Startup and teardown are owned here.  With ``runner.setup()`` through URL assembly left
+    outside the ``finally``, a failure after the server started would carry a listening
+    socket and the provider's sessions into the next test.
+    """
+
+    def __init__(self, provider, app):
+        self.provider = provider
+        self.app = app
+        self.runner = web.AppRunner(app)
+        self.url = None
+
+    async def __aenter__(self):
+        await self.runner.setup()
+        try:
+            site = web.TCPSite(self.runner, '127.0.0.1', 0)
+            await site.start()
+            # aiohttp 3.6.2 exposes the bound port only here.  If this private attribute
+            # disappears the AttributeError is deliberate: a test that visibly breaks beats
+            # one that quietly skips.
+            sockets = site._server.sockets
+            assert sockets, 'the test server bound no socket'
+            self.url = 'http://127.0.0.1:{}/first'.format(sockets[0].getsockname()[1])
+        except Exception:
+            # ``__aexit__`` is not called when ``__aenter__`` raises.
+            await self.runner.cleanup()
+            raise
+        return self
+
+    async def __aexit__(self, *exc_info):
+        first = None
+        try:
+            # One failing close must not strand the rest: letting the loop raise would leave
+            # every later session open and carry it into the next test.
+            for session in self.provider.session_list:
+                try:
+                    await session.close()
+                except Exception as err:
+                    first = first if first is not None else err
+        finally:
+            # The listening socket comes down even if a session close fails.
+            await self.runner.cleanup()
+        if first is not None:
+            raise first
+        return False
+
+
 class TestErrorReporting:
     """K-2 / K-7 / K-8 / K-9: what the six aiobotocore call sites do with a failure."""
 
@@ -2914,3 +2970,119 @@ class TestCompleteMultipartUpload:
 
         assert 'manually remove them' in e.value.message
         assert 'The upload is aborted.' not in e.value.message
+
+
+class TestCommitPreconditions:
+    """K-5 / 決定-12: the commit has to be sent exactly once.
+
+    CompleteMultipartUpload is not idempotent.  A re-send after the first attempt succeeded
+    meets a consumed ``UploadId`` and comes back ``NoSuchUpload``, so whatever code is
+    observed belongs to the *last* attempt and says nothing about the upload.  Two different
+    mechanisms can re-send it, and they need separate stops: ``retry=0`` for WaterButler's
+    own loop in ``make_request``, ``allow_redirects=False`` for aiohttp following a 307/308.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('status', [408, 502, 503, 504])
+    async def test_commit_is_sent_exactly_once(self, auth, credentials, settings, mock_time,
+                                               status):
+        """Counting the POSTs pins that ``retry=0`` takes effect.  Inspecting the caller only
+        pins that it is written down."""
+        provider = raw_provider(auth, credentials, settings)
+        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
+        error_body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                      '<Error><Code>SlowDown</Code>'
+                      '<Message>Please reduce your request rate.</Message></Error>')
+        aiohttpretty.register_uri('POST', SIGNED_URL, status=status,
+                                  body=error_body.encode('utf-8'))
+
+        with pytest.raises(exceptions.UploadError):
+            await provider._complete_multipart_upload(
+                WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+
+        # Pin the retried statuses too, so that widening core's ``retry_on`` reports this
+        # parameter set as no longer covering it.
+        assert provider._retry_on == {408, 502, 503, 504}
+        assert status in provider._retry_on
+        assert len(aiohttpretty.calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('redirect_status', [307, 308])
+    async def test_commit_does_not_follow_a_redirect(self, auth, credentials, settings,
+                                                     mock_time, redirect_status):
+        """``retry=0`` stops only core's own retry loop.  A 307/308 says "resend with the
+        method and body intact", and aiohttp follows it itself under the default
+        ``allow_redirects=True``, so two commit POSTs go out without spending any of core's
+        retry budget.
+
+        ``aiohttpretty`` cannot pin this; see ``commit_server``."""
+        calls = []
+
+        async def first(request):
+            await request.read()
+            calls.append(request.path)
+            raise web.HTTPTemporaryRedirect(location='/second') \
+                if redirect_status == 307 else web.HTTPPermanentRedirect(location='/second')
+
+        async def second(request):
+            # Reached only if the redirect were followed.  It answers with a definitive
+            # rejection code, so that following the redirect fails towards the dangerous
+            # verdict rather than a harmless one.
+            await request.read()
+            calls.append(request.path)
+            return web.Response(
+                status=403, content_type='application/xml',
+                text='<?xml version="1.0" encoding="UTF-8"?><Error>'
+                     '<Code>SignatureDoesNotMatch</Code>'
+                     '<Message>The request signature we calculated does not match.</Message>'
+                     '</Error>')
+
+        app = web.Application()
+        app.router.add_post('/first', first)
+        app.router.add_post('/second', second)
+
+        provider = raw_provider(auth, credentials, settings)
+        async with commit_server(provider, app) as server:
+            provider.generate_generic_presigned_url = MockCoroutine(return_value=server.url)
+            with pytest.raises(exceptions.UploadError):
+                await provider._complete_multipart_upload(
+                    WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+
+        # Exactly one commit POST.  A second one records ``/second``, so a failure here shows
+        # how far the request got.
+        assert calls == ['/first']
+
+    @pytest.mark.asyncio
+    async def test_commit_request_states_both_preconditions(self, auth, credentials, settings,
+                                                            mock_time):
+        """NOTE_SEMANTICS_DESIGN v2.2 §4-2b: watch the preconditions directly, not only
+        through their effect.  The two counting tests above go through aiohttp, so a future
+        change that keeps the observable single-send by accident -- core dropping the retry
+        loop, say -- would leave them green while the commit stopped declaring what it needs.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
+        provider.make_request = MockCoroutine(
+            side_effect=exceptions.UploadError('nope', code=500))
+
+        with pytest.raises(exceptions.UploadError):
+            await provider._complete_multipart_upload(
+                WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+
+        _, kwargs = provider.make_request.call_args
+        assert kwargs.get('retry') == 0
+        assert kwargs.get('allow_redirects') is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('method_name', ['_create_upload_session', '_upload_part',
+                                             '_abort_chunked_upload'])
+    async def test_the_other_upload_requests_keep_the_defaults(self, auth, credentials,
+                                                               settings, method_name):
+        """決定-12 scopes the two keywords to the commit.  Part transfers and session
+        creation are idempotent enough that a re-send changes nothing the notice depends on,
+        and turning core's retry off for them would trade a recoverable blip for a failed
+        upload."""
+        source = inspect.getsource(getattr(S3Provider, method_name))
+        assert 'retry=' not in source
+        assert 'allow_redirects' not in source
