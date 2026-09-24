@@ -1854,6 +1854,19 @@ class TestCreateFolder:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_create_folder_with_folder_precheck_is_false(self, provider, mock_time):
+        """T-2: skipping the "does it already exist" check does not skip the check that the
+        path names a folder at all, so no request is made for a path that cannot be created."""
+        path = WaterButlerPath('/alreadyexists')
+
+        with pytest.raises(exceptions.CreateFolderError) as e:
+            await provider.create_folder(path, folder_precheck=False)
+
+        assert e.value.code == 400
+        assert e.value.message == 'Path must be a directory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_errors_out(self, provider, mock_time):
         path = WaterButlerPath('/alreadyexists/')
         url = 'https://that-kerning.s3.amazonaws.com/'
