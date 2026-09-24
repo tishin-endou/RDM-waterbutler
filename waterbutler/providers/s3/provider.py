@@ -25,6 +25,61 @@ from waterbutler.providers.s3.metadata import (S3Revision,
 logger = logging.getLogger(__name__)
 
 
+# GRDM (K-4 / 決定-13): the S3 error codes that prove CompleteMultipartUpload did not
+# assemble anything.  Everything else -- including every code absent from this table, and
+# the case where no code could be read at all -- leaves the commit's outcome UNKNOWN.
+#
+# The asymmetry is deliberate.  Over-reporting "it may have completed" costs the user a look
+# at the file list.  Under-reporting it tells the user nothing was stored, so they upload
+# again: the object is now on the storage twice, counted twice against their quota, and only
+# an administrator can undo that.  A hand-maintained table will eventually be out of date,
+# and it has to be out of date in the direction that stays recoverable.
+#
+# Provenance: transcribed from the MinIO measurements in
+# ``S3CompatSigv4-quota-handling/NOTE_SEMANTICS_DESIGN.md`` v2.2 §2-2, by way of PR #98.
+# **Not verified against AWS S3** -- only ``EntityTooSmall`` was actually observed on a
+# CompleteMultipartUpload (MinIO returned it and the object was absent afterwards); the
+# other eight rest on the S3 specification and on MinIO's own error definitions.  TEST_SPEC
+# E-1 reconciles the table against AWS S3.
+#
+# ``NoSuchUpload`` is *not* here: a second commit meets a consumed ``UploadId`` and gets that
+# answer even when the first one succeeded, so it is the opposite of definitive.
+DEFINITIVE_REJECTION_CODES = frozenset({
+    'AccessDenied',           # no permission, so the commit never started
+    'InvalidPart',            # the part set does not add up; nothing to assemble
+    'InvalidPartOrder',       # likewise, out of order
+    'EntityTooSmall',         # a non-final part is under the minimum
+    'EntityTooLarge',         # over the size limit; the storage refused it
+    'MalformedXML',           # the commit body was unreadable
+    'SignatureDoesNotMatch',  # rejected at signature verification
+    'InvalidAccessKeyId',     # likewise, at authentication
+    'NoSuchBucket',           # there is nowhere for the object to exist
+})
+
+# The failure happened after the commit request went out, so the object may exist on the
+# storage even though the upload is being reported as failed.
+_COMMIT_OUTCOME_UNKNOWN_FLAG = '_wb_commit_outcome_unknown'
+
+# The S3 error code read out of a response body that WaterButler itself parsed.  Used where
+# the provider builds the exception rather than ``exception_from_response`` -- a 200 carrying
+# an ``<Error>`` body, whose code would otherwise only survive inside a prose message.
+_OBSERVED_ERROR_CODE_FLAG = '_wb_observed_error_code'
+
+
+def _mark_commit_outcome_unknown(err):
+    setattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, True)
+    return err
+
+
+def _is_commit_outcome_unknown(err):
+    return getattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, False)
+
+
+def _mark_observed_error_code(err, error_code):
+    setattr(err, _OBSERVED_ERROR_CODE_FLAG, error_code)
+    return err
+
+
 class S3Provider(provider.BaseProvider):
     """Provider for Amazon's S3 cloud storage service.
 
@@ -46,6 +101,13 @@ class S3Provider(provider.BaseProvider):
     CHUNK_SIZE = settings.CHUNK_SIZE
     CONTIGUOUS_UPLOAD_SIZE_LIMIT = settings.CONTIGUOUS_UPLOAD_SIZE_LIMIT
     FILE_SIZE_INTRA_COPY_LIMIT = settings.FILE_SIZE_INTRA_COPY_LIMIT
+
+    # GRDM (K-4): appended to an upload failure when the commit's outcome is UNKNOWN.  The
+    # wording is PR #98's, unchanged, so that the two providers say the same thing.
+    UPLOAD_MAY_HAVE_COMPLETED_MESSAGE = (
+        '  The upload may in fact have completed; please check the file list before '
+        'uploading the file again.'
+    )
 
     def __init__(self, auth, credentials, settings, **kwargs):
         """
@@ -71,6 +133,112 @@ class S3Provider(provider.BaseProvider):
     def _get_base_folder(provider_settings):
         _, separator, base_folder = (provider_settings.get('id') or ':/').partition(':/')
         return base_folder if separator else ''
+
+    @staticmethod
+    def _error_code_of(error_element):
+        """GRDM (K-4): the ``<Code>`` of a parsed S3 ``<Error>``, or ``None``.
+
+        Case is not folded and nothing is matched as a substring.  S3 error codes are
+        identifiers that agree between vendors down to the case, and a substring match would
+        let ``XAccessDeniedFoo`` pass for ``AccessDenied``.
+        """
+        code = error_element.get('Code')
+        if not isinstance(code, str):
+            return None
+        return code.strip() or None
+
+    @classmethod
+    def _error_code_from_body(cls, body):
+        """GRDM (K-4): the S3 error code in ``body``, or ``None`` when it cannot be read.
+
+        A body that does not parse, or parses to something that is not an ``<Error>``, is no
+        code at all.  The storage said *something* went wrong but not what, which is UNKNOWN.
+        """
+        if not body:
+            return None
+        try:
+            doc = xmltodict.parse(body)
+        except Exception:
+            return None
+        error = doc.get('Error')
+        if not isinstance(error, dict):
+            return None
+        return cls._error_code_of(error)
+
+    @classmethod
+    def _observed_error_code(cls, err):
+        """GRDM (K-4): the S3 error code WaterButler actually *saw*, or ``None``.
+
+        Only a response body may speak for the storage.  That gate is the point of this
+        helper: a dropped connection carries an aiohttp message of its own, and without the
+        gate an exception whose message happened to contain S3-looking XML would be
+        classified as if the storage had answered.  A disconnect is exactly the case where
+        nothing was observed.
+
+        Three sources, in order:
+
+        1. a code the provider parsed out of a body itself -- see
+           :data:`_OBSERVED_ERROR_CODE_FLAG`;
+        2. botocore's ``ClientError``, which carries the code in ``response['Error']``;
+        3. ``exception_from_response``'s ``data``, which is a ``dict`` only when a response
+           body was actually read.  Anything else -- a plain string message, a connection
+           error with no ``data`` at all -- yields ``None``.
+        """
+        explicit = getattr(err, _OBSERVED_ERROR_CODE_FLAG, None)
+        if explicit is not None:
+            return explicit
+
+        if isinstance(err, botocore.exceptions.ClientError):
+            response = getattr(err, 'response', None)
+            if not isinstance(response, dict):
+                return None
+            return response.get('Error', {}).get('Code') or None
+
+        data = getattr(err, 'data', None)
+        if not isinstance(data, dict):
+            return None
+        return cls._error_code_from_body(data.get('response'))
+
+    @classmethod
+    def _commit_outcome(cls, error_code):
+        """GRDM (K-4): whether ``error_code`` proves the commit did not happen.
+
+        ``None`` -- no code, or none that could be read -- is UNKNOWN, as is any code
+        outside :data:`DEFINITIVE_REJECTION_CODES`.
+
+        The two outcomes are named NOT_COMMITTED and UNKNOWN.  The ``bool`` here is those two
+        names spelled ``True`` and ``False``; it stays a ``bool`` because the only caller
+        uses it as a condition, and a string would have to be compared against a constant
+        that a typo could silently defeat.
+        """
+        return error_code is not None and error_code in DEFINITIVE_REJECTION_CODES
+
+    @classmethod
+    def _commit_outcome_note(cls, err):
+        """GRDM (K-4): the notice to append when the commit's outcome is genuinely unknown.
+
+        The decision is made from the storage's error code alone.  The HTTP status class is
+        deliberately *not* consulted: S3 sends the status line before it starts assembling
+        the parts, so a failed CompleteMultipartUpload arrives as **200** with an ``<Error>``
+        body, and the 502 this provider substitutes for it says "server error" about a
+        response the storage was quite definite about.
+
+        This is sound only because the commit is sent exactly once (決定-12, in
+        ``_complete_multipart_upload``).  Under a re-send the observed code belongs to the
+        *last* attempt, and a first attempt that succeeded comes back ``NoSuchUpload`` --
+        at which point classifying by code says nothing about the upload.
+
+        PR #98 suppresses the notice for quota exhaustion ahead of the table, because "you
+        are out of space" and "it may have completed" contradict each other.  That branch is
+        **not** ported: K-11 established that this provider has no quota mechanism at all --
+        ``s3`` is in neither ``settings.ADDON_METHOD_PROVIDER`` nor ``website/util/quota.py``'s
+        ``PROVIDERS`` -- so there is no quota response here to suppress.
+        """
+        if not _is_commit_outcome_unknown(err):
+            return ''
+        if cls._commit_outcome(cls._observed_error_code(err)):
+            return ''
+        return cls.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
 
     @staticmethod
     def _raise_from_client_error(exc, context, error_class, code=None):
@@ -614,13 +782,18 @@ class S3Provider(provider.BaseProvider):
             # carrying `X-Amz-Credential` -- the access key id -- and `X-Amz-Signature`.
             logger.error('{} upload_id={} error={} {}'.format(
                 msg, session_upload_id, type(err).__name__, getattr(err, 'code', '')))
+            # GRDM (K-4): whether the object is on the storage, and whether rubbish was left
+            # behind, are two different questions.  The notice goes between the failure
+            # sentence and the abort outcome so that both reach the user.
+            note = self._commit_outcome_note(err)
             aborted = await self._abort_chunked_upload(path, session_upload_id)
             if not aborted:
-                msg += '  The abort action failed to clean up the temporary file parts generated ' \
-                       'during the upload process.  Please manually remove them.'
+                abort_message = '  The abort action failed to clean up the temporary file ' \
+                                'parts generated during the upload process.  Please ' \
+                                'manually remove them.'
             else:
-                msg += ' The upload is aborted.'
-            raise exceptions.UploadError(msg)
+                abort_message = ' The upload is aborted.'
+            raise exceptions.UploadError('{}{}{}'.format(msg, note, abort_message))
 
     async def _create_upload_session(self, path):
         """This operation initiates a multipart upload and returns an upload ID. This upload ID is
@@ -810,33 +983,51 @@ class S3Provider(provider.BaseProvider):
             path.path, method='complete_multipart_upload', query_parameters={'UploadId': session_upload_id}
         )
 
-        resp = await self.make_request(
-            'POST',
-            complete_url,
-            data=payload,
-            headers={
-                'Content-Type': 'application/xml',
-                'Content-Length': str(len(payload)),
-            },
-            expects=(200, 201,),
-            throws=exceptions.UploadError,
-            # GRDM: the commit is sent exactly once.  CompleteMultipartUpload is not
-            # idempotent -- a re-send after the first attempt succeeded meets a consumed
-            # UploadId and comes back `NoSuchUpload`, so the code that reaches the caller
-            # belongs to the last attempt and says nothing about the upload.  Two different
-            # mechanisms re-send it and each needs its own stop: `retry=0` for core's loop
-            # in `make_request` (`retry_on` covers 408/502/503/504), `allow_redirects=False`
-            # for aiohttp following a 307/308 below that loop.  Both are scoped to this
-            # request; the part transfers and the session creation keep the defaults.
-            retry=0,
-            allow_redirects=False,
-        )
+        # GRDM (K-4): everything from here on belongs to a commit that has been sent.  Every
+        # exception that escapes gets marked, whatever its type -- NOTE_SEMANTICS_DESIGN
+        # v2.2 §3-3 draws the "sent" line at entering this ``await``, and narrowing the
+        # ``except`` to the exception types WaterButler recognises drops the notice on the
+        # rest.  A connection failure after entering the await may in fact never have put
+        # anything on the wire; that is not distinguishable here, so it goes to UNKNOWN,
+        # which is the recoverable side.
+        try:
+            resp = await self.make_request(
+                'POST',
+                complete_url,
+                data=payload,
+                headers={
+                    'Content-Type': 'application/xml',
+                    'Content-Length': str(len(payload)),
+                },
+                expects=(200, 201,),
+                throws=exceptions.UploadError,
+                # GRDM: the commit is sent exactly once.  CompleteMultipartUpload is not
+                # idempotent -- a re-send after the first attempt succeeded meets a consumed
+                # UploadId and comes back `NoSuchUpload`, so the code that reaches the caller
+                # belongs to the last attempt and says nothing about the upload.  Two
+                # different mechanisms re-send it and each needs its own stop: `retry=0` for
+                # core's loop in `make_request` (`retry_on` covers 408/502/503/504),
+                # `allow_redirects=False` for aiohttp following a 307/308 below that loop.
+                # Both are scoped to this request; the part transfers and the session
+                # creation keep the defaults.
+                retry=0,
+                allow_redirects=False,
+            )
+        except Exception as err:
+            _mark_commit_outcome_unknown(err)
+            raise
 
         # GRDM: S3 sends the status line before it starts assembling the parts, so a failure
         # part way through arrives as 200 with an <Error> body.  `expects` only looks at the
         # status, so without reading the body a failed commit reads as a completed upload.
-        body = await resp.read()
-        await resp.release()
+        try:
+            body = await resp.read()
+            await resp.release()
+        except Exception as err:
+            # GRDM (K-4): the request went out and the storage may well have acted on it.
+            # Failing to read the answer says nothing about what the answer was.
+            _mark_commit_outcome_unknown(err)
+            raise
 
         try:
             parsed = xmltodict.parse(body)
@@ -845,11 +1036,19 @@ class S3Provider(provider.BaseProvider):
 
         error = parsed.get('Error')
         if isinstance(error, dict):
-            raise exceptions.UploadError(
-                'CompleteMultipartUpload answered {} with an error: {}'.format(
-                    resp.status, error.get('Code') or 'unknown'),
-                code=HTTPStatus.BAD_GATEWAY
-            )
+            # GRDM (K-4): carry the parsed code on the exception.  This is the one place the
+            # provider reads a code itself, so it is the one place `exception_from_response`'s
+            # `data` is not there to hold it -- and recovering it from the prose below would
+            # be a substring match on a message that also names the status.
+            error_code = self._error_code_of(error)
+            raise _mark_commit_outcome_unknown(_mark_observed_error_code(
+                exceptions.UploadError(
+                    'CompleteMultipartUpload answered {} with an error: {}'.format(
+                        resp.status, error_code or 'unknown'),
+                    code=HTTPStatus.BAD_GATEWAY
+                ),
+                error_code,
+            ))
 
     async def delete(self, path, confirm_delete=0, **kwargs):
         """Deletes the key at the specified path
