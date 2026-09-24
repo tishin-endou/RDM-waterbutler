@@ -326,7 +326,7 @@ class TestRegionDetection:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     @pytest.mark.parametrize("region_name,expected_region", [
-        # ('',               's3.amazonaws.com'),
+        ('',               ''),
         ('EU',             'eu-west-1'),
         ('us-east-2',      'us-east-2'),
         ('us-west-1',      'us-west-1'),
@@ -371,12 +371,45 @@ class TestRegionDetection:
         # await provider._check_region()
         # assert provider.connection.host == host
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('region,expected_host,expected_scope', [
+        # A bucket in us-east-1 answers GetBucketLocation with an empty LocationConstraint,
+        # so `region` is falsy for the whole of that bucket's traffic and the endpoint keeps
+        # the global host.  botocore then signs for us-east-1 by default.
+        (None,             's3.amazonaws.com',                'us-east-1'),
+        ('',               's3.amazonaws.com',                'us-east-1'),
+        ('us-east-1',      's3.us-east-1.amazonaws.com',      'us-east-1'),
+        ('ap-northeast-1', 's3.ap-northeast-1.amazonaws.com', 'ap-northeast-1'),
+        # `_check_region` rewrites the legacy 'EU' constraint to 'eu-west-1' before it can
+        # reach the endpoint, which is what keeps 's3.EU.amazonaws.com' from being signed.
+        ('eu-west-1',      's3.eu-west-1.amazonaws.com',      'eu-west-1'),
+    ])
+    async def test_signing_target_follows_the_region(self, auth, credentials, settings,
+                                                     region, expected_host, expected_scope):
+        provider = S3Provider(auth, credentials, settings)
+        provider.region = region
+
+        url = await provider.generate_generic_presigned_url('my-subfolder/thefile.txt')
+
+        base, _, query = url.partition('?')
+        assert base == 'https://{}/{}/my-subfolder/thefile.txt'.format(expected_host,
+                                                                       settings['bucket'])
+
+        credential = [part for part in query.split('&')
+                      if part.startswith('X-Amz-Credential=')]
+        assert len(credential) == 1
+        assert '%2F{}%2Fs3%2Faws4_request'.format(expected_scope) in credential[0]
+
 
 class TestInitialization:
 
     @pytest.mark.parametrize(('provider_settings', 'expected_base_folder'), [
+        # The three shapes `addons.s3.models.NodeSettings.serialize_waterbutler_settings`
+        # sends: a prefixed folder, a bare bucket left over from before the prefix feature,
+        # and a bucket selected with no prefix.
         ({'id': 'that-kerning:/my-subfolder/'}, 'my-subfolder/'),
         ({'id': 'that-kerning'}, ''),
+        ({'id': 'that-kerning:/'}, ''),
         ({'id': None}, ''),
     ])
     def test_base_folder_parsing(self, auth, credentials, settings, provider_settings, expected_base_folder):
