@@ -422,7 +422,9 @@ class S3Provider(provider.BaseProvider):
         # BaseProvider.zip, ZipStreamGenerator -- wants the whole listing in one call.
         single_page = next_token is not None
         if single_page:
-            params['MaxKeys'] = '1000'
+            # An int, not a string: botocore validates the parameter types before it signs, so
+            # a string here raises ParamValidationError and the page never reaches S3.
+            params['MaxKeys'] = 1000
             if next_token:
                 params['ContinuationToken'] = next_token
 
