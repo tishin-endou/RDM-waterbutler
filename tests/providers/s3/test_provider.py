@@ -26,6 +26,7 @@ import pytest
 
 from waterbutler.providers.s3 import S3Provider
 from waterbutler.core.path import WaterButlerPath
+from waterbutler.core.utils import make_disposition
 from waterbutler.core import streams, metadata, exceptions
 from waterbutler.providers.s3 import settings as pd_settings
 from waterbutler.providers.s3 import provider as pd_provider
@@ -1597,13 +1598,59 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_accepts_url(self, provider, mock_time):
+    @pytest.mark.parametrize('revision,display_name,expected_name', [
+        (None, None, 'my-image'),
+        ('latest', 'meow.txt', 'meow.txt'),
+        ('someversion', None, 'my-image'),
+    ])
+    async def test_download_accept_url_answers_with_the_signed_url(
+            self, auth, credentials, settings, mock_time, revision, display_name, expected_name):
+        """G-10 / 決定-19: ``accept_url=True`` hands back the presigned URL to redirect to.
+
+        This is the default on every download the API serves --
+        ``waterbutler.server.api.v1.provider.metadata`` passes ``'direct' not in query`` -- and
+        it redirects whenever ``download`` answers with a ``str``.  develop returns the URL here,
+        so the file goes from S3 to the browser directly; losing it routed every byte of every
+        download through WaterButler instead, which is a change to GRDM's default behaviour and
+        not one anybody asked for.
+
+        The URL is compared against what the presigner produces for the same call rather than
+        against a pattern, because what makes it usable is that it is signed over exactly the
+        parameters the streaming path would have used: the version being asked for and the
+        ``Content-Disposition`` that gives the download its filename.
+
+        T-1 / CX1-11: the real presigner produces both sides of the comparison.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        path = WaterButlerPath('/my-subfolder/my-image')
+        query_parameters = {'ResponseContentDisposition': make_disposition(expected_name)}
+        if revision == 'someversion':
+            query_parameters['VersionId'] = revision
+
+        with frozen_signing_clock():
+            expected = await provider.generate_generic_presigned_url(
+                path.path, 'get_object', query_parameters=query_parameters)
+            url = await provider.download(path, accept_url=True, revision=revision,
+                                          display_name=display_name)
+
+        assert isinstance(url, str), 'download streamed instead of answering with a URL'
+        assert url == expected
+        # Nothing was fetched: the point of the redirect is that WaterButler does not carry the
+        # bytes.  A request here would mean the file was downloaded once to be handed over.
+        assert aiohttpretty.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_download_without_accept_url_still_streams(self, provider, mock_time):
+        """G-10: ``?direct`` -- the one case where the server asks for the bytes -- is unchanged."""
         path = WaterButlerPath('/my-image')
         url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         aiohttpretty.register_uri('GET', url, body=b'content', auto_length=True,
                                   match_querystring=False)
-        result = await provider.download(path)
+
+        result = await provider.download(path, accept_url=False)
         content = await result.read()
+
         assert content == b'content'
 
 
