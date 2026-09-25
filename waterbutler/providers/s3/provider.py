@@ -131,6 +131,14 @@ class S3Provider(provider.BaseProvider):
 
     @staticmethod
     def _get_base_folder(provider_settings):
+        """GRDM: the sub-folder part of the addon's ``id``, which is ``<bucket>:/<folder>``.
+
+        Every path this provider handles is built by prefixing this, so it decides which keys
+        the request can reach at all.  An ``id`` that is missing, or that does not carry the
+        ``:/`` separator, is answered with ``''`` -- the bucket root -- rather than being
+        guessed at from whatever the string happens to contain: a wrong prefix here does not
+        fail, it silently addresses a different part of the bucket.
+        """
         _, separator, base_folder = (provider_settings.get('id') or ':/').partition(':/')
         return base_folder if separator else ''
 
@@ -300,6 +308,14 @@ class S3Provider(provider.BaseProvider):
         try:
             session = get_session()
             region_name = {'region_name': self.region} if self.region else {}
+            # GRDM: the endpoint is pinned to the regional host rather than left to botocore.
+            # SigV4 signs over the host, so the host that is signed has to be the host the
+            # request is sent to; botocore's default `s3.amazonaws.com` answers a bucket outside
+            # us-east-1 with a 301 redirect, and following that to the regional host invalidates
+            # the signature.  Before `_check_region` has run `self.region` is None and the global
+            # endpoint is all there is to sign against -- which is why GetBucketLocation, the
+            # call that fills it in, is the one operation that works from either host.
+            # The same reasoning applies at the other three `create_client` sites.
             endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
             config = AioConfig(signature_version='s3v4')
 
@@ -327,6 +343,7 @@ class S3Provider(provider.BaseProvider):
         try:
             session = get_session()
             region_name = {"region_name": self.region} if self.region else {}
+            # GRDM: pinned to the regional endpoint -- see `generate_generic_presigned_url`.
             endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
             config = AioConfig(signature_version='s3v4')
             query_parameters = query_parameters or {}
@@ -380,8 +397,13 @@ class S3Provider(provider.BaseProvider):
             # error here surfaces as a bare 500 with nothing in it the caller can act on.
             self._raise_from_client_error(e, 'GetBucketLocation', exceptions.MetadataError)
 
-    @staticmethod
-    def _parse_listing(xml_body, root_element, path):
+    #: GRDM: the elements a listing repeats.  xmltodict renders a repeated element as a list,
+    #: a single occurrence as a dict, and an element with only text in it as a string -- so the
+    #: shape has to be settled once, where the body is read, rather than at each use of it.
+    _LISTING_ENTRY_ELEMENTS = ('Contents', 'CommonPrefixes', 'Version', 'DeleteMarker')
+
+    @classmethod
+    def _parse_listing(cls, xml_body, root_element, path):
         """GRDM: read ``root_element`` out of a listing response, or fail.
 
         ``xmltodict`` keys elements by the name as written, so a body that spells its root
@@ -390,11 +412,18 @@ class S3Provider(provider.BaseProvider):
         gives, and nothing downstream can tell the two apart: a folder would list as empty, and
         a delete would report success having found no version to remove.
 
+        The entries inside it are checked for the same reason (CX1-10).  ``<Contents>a</Contents>``
+        parses to a string, and iterating a string yields its characters, so the first
+        ``'a'.get('Key')`` leaves the provider as an ``AttributeError`` -- a bare 500 that names
+        neither the bucket nor what was wrong with its answer.  A body nobody can read is a
+        failed listing, which is what the root-element check already says; this says it one level
+        further in.
+
         :param str xml_body: the response body
         :param str root_element: the element the listing is expected to be wrapped in
         :param str path: the prefix being listed, used for error messages only
         :rtype: dict
-        :raises: :class:`.DownloadError` if the body does not carry ``root_element``
+        :raises: :class:`.DownloadError` if the body does not carry a readable ``root_element``
         """
         try:
             doc = xmltodict.parse(xml_body)
@@ -408,7 +437,49 @@ class S3Provider(provider.BaseProvider):
                 code=HTTPStatus.BAD_GATEWAY
             )
 
+        for element in cls._LISTING_ENTRY_ELEMENTS:
+            entries = result.get(element)
+            if entries is None:
+                continue
+            if isinstance(entries, dict):
+                entries = [entries]
+            if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+                raise exceptions.DownloadError(
+                    'Could not read the {} entries out of the listing of {}'.format(element, path),
+                    code=HTTPStatus.BAD_GATEWAY
+                )
+            result[element] = entries
+
         return result
+
+    @staticmethod
+    def _next_marker(result, marker_element, path):
+        """GRDM: the value to resume a truncated listing from, or ``None`` when it ended.
+
+        A listing that says it is truncated and then gives nothing to resume from is
+        unresumable, and neither way of carrying on is safe: repeating the request sends the
+        identical one for ever, and stopping hands back a first page that every caller takes for
+        the whole folder -- ``_delete_folder`` would purge that page and report the folder
+        deleted with the rest of it still there.
+
+        :param dict result: the parsed listing
+        :param str marker_element: ``NextContinuationToken`` or ``NextKeyMarker``
+        :param str path: the prefix being listed, used for error messages only
+        :return: the marker, or ``None`` when this was the last page
+        :raises: :class:`.DownloadError` when truncated with no marker
+        """
+        if result.get('IsTruncated') != 'true':
+            return None
+
+        marker = result.get(marker_element)
+        if not marker:
+            raise exceptions.DownloadError(
+                'The listing of {} is truncated but carries no {}, so the rest of it cannot '
+                'be read'.format(path, marker_element),
+                code=HTTPStatus.BAD_GATEWAY
+            )
+
+        return marker
 
     @staticmethod
     def _decoder_for(result):
@@ -477,11 +548,6 @@ class S3Provider(provider.BaseProvider):
             contents = result.get('Contents') or []
             common_prefixes = result.get('CommonPrefixes') or []
 
-            if isinstance(contents, dict):
-                contents = [contents]
-            if isinstance(common_prefixes, dict):
-                common_prefixes = [common_prefixes]
-
             decode = self._decoder_for(result)
 
             for content in contents:
@@ -497,10 +563,8 @@ class S3Provider(provider.BaseProvider):
                     response_prefixes.append(common_prefix)
 
             # handle pagination
-            if result.get('IsTruncated') == 'true':
-                continuation_token = result.get('NextContinuationToken')
-            else:
-                continuation_token = None
+            continuation_token = self._next_marker(result, 'NextContinuationToken', path)
+            if continuation_token is None:
                 break
 
             if single_page:
@@ -521,6 +585,7 @@ class S3Provider(provider.BaseProvider):
 
         session = get_session()
         region_name = {"region_name": self.region} if self.region else {}
+        # GRDM: pinned to the regional endpoint -- see `generate_generic_presigned_url`.
         endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
         async with session.create_client(
                 's3',
@@ -564,6 +629,12 @@ class S3Provider(provider.BaseProvider):
             marker is not something a user can restore or download.
         :rtype: list of dict
         """
+        # GRDM: a copy, and a `Bucket` the caller does not have to remember to supply.
+        # ListObjectVersions is signed over its parameters, so a missing `Bucket` is not a
+        # default that botocore fills in -- the call fails to sign.  `setdefault` rather than an
+        # assignment because :func:`_delete_folder` and :func:`revisions` pass only a `Prefix`
+        # while the paging tests pass a whole parameter set, and the copy is so that the markers
+        # this method writes while paging do not leak back into the caller's dict.
         query_parameters = dict(query_parameters)
         query_parameters.setdefault('Bucket', self.bucket_name)
 
@@ -590,27 +661,26 @@ class S3Provider(provider.BaseProvider):
             for element_name in element_names:
                 entries = result.get(element_name) or []
 
-                if isinstance(entries, dict):
-                    entries = [entries]
-
                 for entry in entries:
                     key = entry.get('Key')
                     if key:
                         entry['Key'] = decode(key)
                         versions_result.append(entry)
 
-            # handle pagination.  ListObjectVersions does not use the ListObjectsV2
-            # continuation token; it resumes from the last key *and* version id reported.
-            if result.get('IsTruncated') != 'true':
+            # GRDM: ListObjectVersions does not page with the ListObjectsV2 continuation token.
+            # It resumes from the last key *and* the last version id, because one key can hold
+            # more pages of versions than fit in a response -- a page boundary can fall in the
+            # middle of a key's history, and `KeyMarker` alone would restart that key from its
+            # newest version and loop over the same page.  `VersionIdMarker` is removed rather
+            # than left behind when the response does not carry one: S3 rejects it without a
+            # `KeyMarker` of the same page, and a stale one asks to resume from a version that
+            # belongs to the key before this one.
+            next_key_marker = self._next_marker(result, 'NextKeyMarker',
+                                                query_parameters.get('Prefix', ''))
+            if next_key_marker is None:
                 break
 
-            next_key_marker = result.get('NextKeyMarker')
             next_version_id_marker = result.get('NextVersionIdMarker')
-            if not next_key_marker:
-                # Truncated but no marker to resume from: repeating the request would return
-                # this same page forever.  Stop rather than loop.
-                break
-
             query_parameters['KeyMarker'] = decode(next_key_marker)
             if next_version_id_marker:
                 query_parameters['VersionIdMarker'] = decode(next_version_id_marker)
@@ -652,11 +722,23 @@ class S3Provider(provider.BaseProvider):
         return True
 
     def can_intra_copy(self, dest_provider, path=None, file_size=None):
+        """GRDM: server-side copy only while the size is known and within CopyObject's limit.
+
+        CopyObject is capped at 5 GB; above that S3 requires the multi-part copy API, which this
+        provider does not implement, so the call would fail after the user had been told the copy
+        was under way.  An unknown size is refused for the same reason -- it may be over the cap
+        -- and the caller falls back to streaming the file through WaterButler, which always
+        works.  ``ACCEPTS_FILE_SIZE_FOR_INTRA`` is what makes core offer ``file_size`` here.
+        """
         if file_size is None or file_size > self.FILE_SIZE_INTRA_COPY_LIMIT:
             return False
         return type(self) == type(dest_provider) and not path.is_dir
 
     def can_intra_move(self, dest_provider, path=None, file_size=None):
+        """GRDM: an intra move is a CopyObject followed by a delete, so it has the same cap.
+
+        See :func:`can_intra_copy`.
+        """
         if file_size is None or file_size > self.FILE_SIZE_INTRA_COPY_LIMIT:
             return False
         return type(self) == type(dest_provider) and not path.is_dir
@@ -668,6 +750,7 @@ class S3Provider(provider.BaseProvider):
         await self._check_region()
         exists = await dest_provider.exists(dest_path)
         region_name = {"region_name": self.region} if self.region else {}
+        # GRDM: pinned to the regional endpoint -- see `generate_generic_presigned_url`.
         endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
 
         session = get_session()
@@ -688,10 +771,18 @@ class S3Provider(provider.BaseProvider):
                     Key=dest_path.path,
                     CopySource=copy_source,
                 )
-            except botocore.exceptions.ClientError as e:
+            except Exception as e:
                 # GRDM (I-2): report the failure without quoting S3's own message, which carries
                 # request ids, arns and bucket names, and keep the provider's status code
                 # instead of flattening everything to a 500.
+                #
+                # GRDM (CX1-8): `Exception`, not `ClientError`.  `ClientError` is only what S3
+                # answered with; the ways this call fails without an answer -- the endpoint not
+                # resolving, the read timing out, a parameter botocore refuses to sign, a
+                # response body that ends early -- are separate botocore and aiohttp types, and
+                # each of them used to leave the provider unconverted.  This is the one of the
+                # six aiobotocore call sites that was still narrow.  `_raise_from_client_error`
+                # re-raises a cancellation itself (K-7).
                 self._raise_from_client_error(e, 'CopyObject failed', exceptions.IntraCopyError)
 
         return (await dest_provider.metadata(dest_path)), not exists
@@ -873,7 +964,6 @@ class S3Provider(provider.BaseProvider):
     async def _upload_parts(self, stream, path, session_upload_id):
         """Uploads all parts/chunks of the given stream to S3 one by one.
         """
-        logger.error('_upload_parts')
         metadata = []
         parts = [self.CHUNK_SIZE for i in range(0, stream.size // self.CHUNK_SIZE)]
         if stream.size % self.CHUNK_SIZE:
@@ -1190,8 +1280,18 @@ class S3Provider(provider.BaseProvider):
         """
         await self._check_region()
 
-        versions = await self.get_object_versions({'Prefix': path.path},
-                                                  include_delete_markers=True)
+        try:
+            versions = await self.get_object_versions({'Prefix': path.path},
+                                                      include_delete_markers=True)
+        except Exception as e:
+            # GRDM (CX1-13 / K-12): the listing is made with `throws=DownloadError`, and the
+            # user who asked to delete a folder was being told a download went wrong -- with a
+            # status borrowed from an operation they did not ask for.  K-12's "core reports this
+            # safely" holds only while the error carries no `data`; S3 answers a refused listing
+            # with a readable XML body, so `exception_from_response` puts its prose -- request id
+            # and host id included -- into `message`, and core hands that back unchanged.
+            self._raise_from_client_error(e, 'Could not list {} to delete it'.format(path.path),
+                                          exceptions.DeleteError)
 
         # Neither a version nor a delete marker under the prefix: the folder does not exist.
         # An empty folder is not this case -- S3 stores it as a 0-byte 'prefix/' key, which is

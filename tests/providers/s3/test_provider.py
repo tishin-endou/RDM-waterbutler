@@ -1590,20 +1590,10 @@ class TestCRUD:
             with pytest.raises(exceptions.DeleteError):
                 await provider.delete(path)
 
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_folder_delete_listing_error(self, provider, mock_time):
-        path = WaterButlerPath('/error-folder/')
-        install_query_encoding_presigned_url(provider)
-
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
-            body=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code></Error>',
-            status=403,
-        )
-
-        with pytest.raises(exceptions.DownloadError):
-            await provider.delete(path)
+    # CX1-13: a folder delete whose listing fails is asserted by
+    # `TestErrorReporting.test_delete_folder_reports_a_failed_listing_as_a_delete_failure`,
+    # which expects the `DeleteError` this now raises rather than the `DownloadError` that used
+    # to reach the caller, and runs through the real presigner (T-1 / CX1-11).
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
