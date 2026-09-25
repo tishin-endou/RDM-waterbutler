@@ -3800,3 +3800,81 @@ class TestCommitOutcome:
         exact set here means an addition has to be argued for, not slipped in."""
         assert pd_provider.DEFINITIVE_REJECTION_CODES == frozenset(
             EXPECTED_DEFINITIVE_REJECTION_CODES)
+
+
+class TestAbortFailureKeepsTheCommitNotice:
+    """CX1-5 / K-1 × K-4: the abort raising must not take the commit's verdict with it.
+
+    ``_abort_chunked_upload`` returns ``False`` only when it got answers it could read and
+    parts were still there.  Every other way it goes wrong -- the DELETE answering 404, 403 or
+    500, the LIST PARTS answering anything outside ``(200, 201, 404)`` -- comes back out as an
+    exception from ``make_request``.  Raised where the notice has just been computed and not
+    yet used, that exception discards both the failure sentence and the notice, and the user
+    is told only that the cleanup failed.
+
+    404 ``NoSuchUpload`` on the abort is the worst cell of the table and a real answer: it is
+    what S3 says when the ``UploadId`` is already consumed, which is exactly the case where
+    the commit did succeed and the user most needs to be told to go and look.
+    """
+
+    @staticmethod
+    async def arrange(provider, abort_status, commit_error_code):
+        """Fail the commit with ``commit_error_code`` and the abort with ``abort_status``.
+
+        Both requests go out to the URL the real presigner produced, so the abort really does
+        travel through ``make_request`` and raise the way it would against S3.
+        """
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(return_value=[{'ETAG': 'abc'}])
+
+        await register_commit(provider, commit_error_xml(commit_error_code).encode('utf-8'))
+        await register_presigned(
+            provider, 'DELETE', 'abort_multipart_upload', path=COMMIT_PATH.path,
+            query_parameters={'UploadId': 'SESSION'}, default_params=True,
+            body=commit_error_xml('NoSuchUpload').encode('utf-8'), status=abort_status)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('abort_status', [404, 403, 500])
+    @pytest.mark.parametrize('commit_error_code,expect_notice', [
+        ('InternalError', True),     # UNKNOWN -- the notice is the whole point
+        ('AccessDenied', False),     # NOT_COMMITTED -- and it must stay suppressed
+    ])
+    async def test_the_upload_failure_survives_an_abort_that_raises(
+            self, auth, credentials, settings, mock_time,
+            abort_status, commit_error_code, expect_notice):
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self.arrange(provider, abort_status, commit_error_code)
+
+            with pytest.raises(exceptions.UploadError) as e:
+                await provider._chunked_upload(None, COMMIT_PATH)
+
+        message = e.value.message
+        assert 'An unexpected error has occurred' in message
+        assert (S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in message) is expect_notice
+        # An abort that raised cleaned nothing up, so the user is told to do it by hand.
+        assert 'manually remove them' in message
+        assert 'The upload is aborted.' not in message
+        assert_no_secrets(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_a_cancellation_from_the_abort_still_propagates(self, auth, credentials,
+                                                                   settings, mock_time):
+        """Catching the abort's failures must not catch a cancellation with them: swallowing
+        it and raising ``UploadError`` instead stops the cancellation propagating and the task
+        never ends.  Python 3.6 derives ``CancelledError`` from ``Exception``, so a bare
+        ``except Exception`` does catch it."""
+        provider = raw_provider(auth, credentials, settings)
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(return_value=[{'ETAG': 'abc'}])
+        provider._abort_chunked_upload = MockCoroutine(side_effect=asyncio.CancelledError())
+
+        with frozen_signing_clock():
+            await register_commit(provider,
+                                  commit_error_xml('InternalError').encode('utf-8'))
+
+            with pytest.raises(asyncio.CancelledError):
+                await provider._chunked_upload(None, COMMIT_PATH)
