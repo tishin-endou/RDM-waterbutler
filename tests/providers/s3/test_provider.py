@@ -1517,6 +1517,44 @@ class TestCRUD:
         assert [entry['Key'] for batch in batches for entry in batch] == keys
 
     @pytest.mark.asyncio
+    async def test_a_refusal_in_a_later_batch_is_reported(self, auth, credentials, settings,
+                                                          monkeypatch, mock_time):
+        """CX2-2 / V-4: every batch's body is read, not just the first one's.
+
+        DeleteObjects answers 200 and lists the refusals inside the body, so the check belongs
+        to each call rather than to the loop's outcome.  The partial-failure tests above use a
+        single batch, where "the last response" and "every response" cannot be told apart --
+        code that checked only the first, or only the last, or that broke out of the loop after
+        the first success would pass them all.  This sends 1001 objects so that the loop runs
+        twice and puts the refusal in the *second* answer.
+
+        The responses are injected at ``before-send``, so botocore serialises the 1001-object
+        request, signs it and parses the XML back into the ``Errors`` list the provider reads.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        delete_requests = [{'Key': 'some-folder/file-{:05d}'.format(index), 'VersionId': 'v1'}
+                           for index in range(1001)]
+        sent = patch_session_with_before_send(
+            monkeypatch,
+            serve_in_order(
+                _FakeHTTPResponse(200, delete_objects_response(
+                    deleted=[(entry['Key'], 'v1') for entry in delete_requests[:1000]])),
+                _FakeHTTPResponse(200, delete_objects_response(
+                    errors=[('some-folder/file-01000', 'v1', 'AccessDenied')])),
+            ),
+            operation='DeleteObjects')
+
+        with pytest.raises(exceptions.DeleteError) as exc_info:
+            await provider.delete_objects_in_chunks('/some-folder/', delete_requests)
+
+        assert len(sent) == 2
+        assert 'some-folder/file-01000' in exc_info.value.message
+        assert 'AccessDenied' in exc_info.value.message
+        # The count names the batch, not the whole listing: "1 of 1" says the survivor is the
+        # only object in the second batch.
+        assert '1 of 1 objects' in exc_info.value.message
+
+    @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_delete_folder_truncated_response(self, provider, mock_time):
         """V-6: a folder holding more than one page of versions must be listed to the end
@@ -2408,6 +2446,43 @@ COPY_OBJECT_ERROR_BODY = (
 COPY_OBJECT_EMPTY_ERROR_BODY = b'<?xml version="1.0" encoding="UTF-8"?>\n<Error/>'
 
 
+def delete_objects_response(deleted=(), errors=()):
+    """Build a DeleteObjects response body.
+
+    ``deleted`` is an iterable of ``(key, version_id)``; ``errors`` one of
+    ``(key, version_id, code)``.  ``Quiet`` is false on every call the provider makes, so a
+    successful delete is reported element by element rather than by an empty body.
+    """
+    body = '<?xml version="1.0" encoding="UTF-8"?>'
+    body += '<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    for key, version_id in deleted:
+        body += ('<Deleted><Key>{}</Key><VersionId>{}</VersionId>'
+                 '</Deleted>'.format(key, version_id))
+    for key, version_id, code in errors:
+        body += ('<Error><Key>{}</Key><VersionId>{}</VersionId><Code>{}</Code>'
+                 '<Message>The operation was refused.</Message>'
+                 '</Error>'.format(key, version_id, code))
+    body += '</DeleteResult>'
+    return body.encode('utf-8')
+
+
+def serve_in_order(*responses):
+    """A ``before-send`` factory that answers with each of ``responses`` in turn.
+
+    The factory takes no arguments, so a test that needs the second call to differ from the
+    first has nowhere else to put the difference.  Running out is an error rather than a repeat
+    of the last response: a provider that sent one batch too many would otherwise be answered
+    as if it had not.
+    """
+    remaining = list(responses)
+
+    def factory():
+        assert remaining, 'more requests were sent than this test has answers for'
+        return remaining.pop(0)
+
+    return factory
+
+
 class TestIntraCopy:
     """I-2〜I-5: the ``intra_copy`` contract and how it reports provider failures."""
 
@@ -2929,6 +3004,50 @@ class TestObjectVersionsPaging:
         query = parse.parse_qs(parse.urlsplit(requested[1]).query)
         assert query['key-marker'] == ['f/a']
         assert query['version-id-marker'] == ['v%2Fid']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_a_marker_that_is_not_repeated_is_dropped(self, auth, credentials, settings):
+        """CX2-2 / T-3: a ``VersionIdMarker`` belongs to the page that announced it.
+
+        A page boundary can fall in the middle of one key's version history, and then S3 sends
+        both markers.  The next boundary need not: once the listing has moved on to whole keys
+        again it announces a ``NextKeyMarker`` alone.  Carrying the previous page's version id
+        into that request asks to resume from a version of the *earlier* key -- S3 rejects the
+        pair outright, and where it does not, the page returned is not the one after this one.
+
+        Three pages is the smallest listing that can show it: the marker has to be set by one
+        boundary and then not repeated by the next, so a two-page listing can only show it
+        being set.  The stale-marker form of the third request is registered as well, so that
+        carrying it forward fails on the assertion below rather than on "No URLs matching".
+        """
+        provider = raw_provider(auth, credentials, settings)
+        requested = record_request_urls(provider)
+        page_three_body = list_versions_response(versions=[('k3', 'v3')])
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('k1', 'v1')], is_truncated=True,
+                                       next_key_marker='k1', next_version_id_marker='v1'),
+                Prefix='k')
+            await self._register_versions(
+                provider,
+                # No NextVersionIdMarker: this boundary falls between two keys.
+                list_versions_response(versions=[('k2', 'v2')], is_truncated=True,
+                                       next_key_marker='k2'),
+                Prefix='k', KeyMarker='k1', VersionIdMarker='v1')
+            await self._register_versions(provider, page_three_body, Prefix='k', KeyMarker='k2')
+            await self._register_versions(provider, page_three_body, Prefix='k', KeyMarker='k2',
+                                          VersionIdMarker='v1')
+
+            versions = await provider.get_object_versions({'Prefix': 'k'})
+
+        assert [item['VersionId'] for item in versions] == ['v1', 'v2', 'v3']
+        assert len(requested) == 3
+        query = parse.parse_qs(parse.urlsplit(requested[2]).query)
+        assert query['key-marker'] == ['k2']
+        assert 'version-id-marker' not in query
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -4133,6 +4252,58 @@ class TestCommitOutcome:
             await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
 
         assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('status', [200, 500])
+    async def test_a_commit_answered_in_invalid_utf8_claims_one(self, auth, credentials,
+                                                                settings, mock_time, status):
+        """CX2-2 / NOTE_SEMANTICS_DESIGN v2.2 §4-1: a body nobody can decode is UNKNOWN.
+
+        The matrix above reaches the general-exception cells by injecting a ``RuntimeError``
+        into ``make_request``, and the illegible-body cells with a synthetic ``UploadError``.
+        Neither goes through a socket, and the decoding happens below the provider -- so the
+        one thing that was never measured is the case that produces it: bytes that are not
+        UTF-8 arriving over real HTTP.  Both statuses are here because the byte sequence
+        surfaces as a different exception on each, and the verdict must not depend on that:
+
+        * **200** -- the body is read as bytes and handed to ``xmltodict``, which cannot parse
+          it.  Nothing contradicts success and nothing states it, so the commit's own
+          "does not report success" ``UploadError`` is what carries the mark;
+        * **500** -- ``exception_from_response`` builds the exception by calling
+          ``data.decode('utf-8')`` (``waterbutler/core/exceptions.py``), which raises
+          ``UnicodeDecodeError`` *instead of* returning an ``UploadError``.  That escapes
+          ``make_request`` as a type WaterButler does not recognise, and it reaches the notice
+          only because the commit marks every exception rather than the ones it knows.
+
+        The bytes are invalid UTF-8 in the middle of an otherwise well-formed success body, so
+        an implementation that decoded leniently -- or read the ``ETag`` out of the raw bytes --
+        would report the upload as completed instead.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider)
+        commit_url = await provider.generate_generic_presigned_url(
+            'my-subfolder/thefile.txt', method='complete_multipart_upload',
+            query_parameters={'UploadId': 'SESSION'})
+        commit_path = parse.urlsplit(commit_url).path
+
+        async def commit(request):
+            await request.read()
+            return web.Response(
+                status=status, content_type='application/xml',
+                body=b'<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult>'
+                     b'<ETag>"\xff\xfe"</ETag></CompleteMultipartUploadResult>')
+
+        app = web.Application()
+        app.router.add_post(commit_path, commit)
+
+        async with local_server(provider, app) as server:
+            redirect_presigned_origin(provider, server.url)
+            with pytest.raises(exceptions.UploadError) as e:
+                await provider._chunked_upload(None,
+                                               WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message
+        assert_no_secrets(e.value)
 
     @pytest.mark.parametrize('error_code', EXPECTED_DEFINITIVE_REJECTION_CODES)
     def test_every_definitive_rejection_code_suppresses_the_notice(self, auth, credentials,
