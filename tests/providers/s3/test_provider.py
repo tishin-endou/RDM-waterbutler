@@ -66,6 +66,21 @@ def mock_time(monkeypatch):
     monkeypatch.setattr(time, 'time', mock_time)
 
 
+@pytest.fixture(autouse=True)
+def pinned_signing_clock():
+    """Pin the clock botocore signs with, for every test in this module.
+
+    T-1 / CX1-11: a test that answers the *real* presigner has to name the URL the presigner
+    produces, and the only thing that moves between two otherwise identical signings is
+    ``X-Amz-Date`` and the signature derived from it.  Freezing it here rather than at each call
+    site means a test can go back to the real presigner by deleting the stub, without also
+    having to re-indent its body into a ``with`` block.  Nothing else about signing is touched:
+    parameter validation, serialisation and the HMAC all still run.
+    """
+    with frozen_signing_clock():
+        yield
+
+
 @pytest.fixture
 def provider(auth, credentials, settings):
     prov = S3Provider(auth, credentials, settings)
@@ -208,39 +223,25 @@ def build_folder_params(path):
 BUCKET_URL = 'https://that-kerning.s3.amazonaws.com/'
 
 
-def install_query_encoding_presigned_url(provider):
-    """Replace the ``provider`` fixture's presigned-URL stub with one that encodes the query
-    parameters into the URL, which is what a real presigned URL does.  The default stub throws
-    the parameters away, so every page of a paged listing would collapse onto a single URL and
-    aiohttpretty would be unable to tell one page request from the next.
+def use_real_presigner(provider):
+    """Uncover the real presigner on a ``provider`` fixture, and fix its region.
 
-    :return: the list of query-parameter dicts, one per call, in call order
+    T-1 / CX1-11: this replaces a helper that installed a *hand-written* presigner -- one that
+    urlencoded the parameters and stopped there.  Three ROUND1 majors lived in the gap between
+    that and what botocore actually does: it rejects a wrongly typed ``MaxKeys`` (CX1-1), merges
+    the parameters into the URL it signs rather than leaving them for ``params=`` to add again
+    (CX1-2), and asks for ``encoding-type=url`` so the keys come back percent-encoded (CX1-3).
+    None of the three could fail a test that never ran it.
+
+    The fixture stubs by assigning instance attributes, so deleting them uncovers the real bound
+    methods -- nothing is reconstructed here.  The signing clock is pinned module-wide by
+    :func:`pinned_signing_clock`, which is what makes the signed URL reproducible enough for
+    ``aiohttpretty`` to be told about it in advance.
     """
-    calls = []
-
-    async def _gen_presigned(path, method='head_object', query_parameters=None,
-                             default_params=True):
-        params = dict(query_parameters or {})
-        calls.append(params)
-        url = BUCKET_URL + (path or '').lstrip('/')
-        if params:
-            url += '?' + parse.urlencode(sorted(params.items()))
-        return url
-
-    provider.generate_generic_presigned_url = _gen_presigned
-    return calls
-
-
-def versions_url(**params):
-    """The URL that :func:`install_query_encoding_presigned_url` produces for a
-    ``list_object_versions`` call made with ``params``."""
-    return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
-
-
-def objects_url(**params):
-    """The URL that :func:`install_query_encoding_presigned_url` produces for a
-    ``list_objects_v2`` call made with ``params``."""
-    return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
+    provider.__dict__.pop('generate_generic_presigned_url', None)
+    provider.__dict__.pop('check_key_existence', None)
+    provider.region = 'us-east-1'
+    return provider
 
 
 def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=None,
@@ -314,34 +315,52 @@ def list_versions_response(versions=(), delete_markers=(), is_truncated=False,
     return body.encode('utf-8')
 
 
-class _AsyncClientCtx:
-    """``session.create_client()`` returns an async context manager, and ``mock.AsyncMock``
-    needs Python 3.8+."""
+class _OverriddenClientCtx:
+    """The real ``create_client()`` context manager, with ``methods`` bound over the client it
+    yields.  ``mock.AsyncMock`` needs Python 3.8+, hence the hand-written protocol."""
 
-    def __init__(self, client):
-        self._client = client
+    def __init__(self, inner, methods):
+        self._inner = inner
+        self._methods = methods
 
     async def __aenter__(self):
-        return self._client
+        client = await self._inner.__aenter__()
+        # botocore builds the API methods onto the client's class, so an instance attribute
+        # shadows the one being replaced and leaves the rest of the client alone.
+        for name, coroutine in self._methods.items():
+            setattr(client, name, coroutine)
+        return client
 
     async def __aexit__(self, *args):
-        return False
+        return await self._inner.__aexit__(*args)
 
 
 def patch_aiobotocore_client(**methods):
-    """Patch the aiobotocore session the provider builds its clients from, so that
-    ``create_client()`` yields a mock client with ``methods`` bound on it.  This injects at the
-    aiobotocore boundary only; the provider method under test still runs for real.
+    """Let the provider build a *real* aiobotocore client, then replace only ``methods`` on it.
 
-    :return: ``(patcher, client)`` -- use the patcher as a context manager
+    T-1 / CX1-11: client creation is not stubbed and ``generate_presigned_url`` is left alone,
+    so a provider method that signs a URL on its way to the call under test still signs it with
+    the real presigner -- the earlier version of this helper handed back a bare ``mock.Mock``,
+    which made the presigner return a ``Mock`` too and forced every caller to stub it as well.
+    What is replaced is the single API call whose arguments the test is asserting on.
+
+    :return: ``(patcher, handle)`` -- use the patcher as a context manager; ``handle`` carries
+        the same coroutine objects that were bound onto the client, so
+        ``handle.delete_objects.assert_called_once_with(...)`` reads the real call
     """
-    client = mock.Mock()
+    handle = mock.Mock()
     for name, coroutine in methods.items():
-        setattr(client, name, coroutine)
-    session = mock.Mock()
-    session.create_client = mock.Mock(return_value=_AsyncClientCtx(client))
-    patcher = mock.patch('waterbutler.providers.s3.provider.get_session', return_value=session)
-    return patcher, client
+        setattr(handle, name, coroutine)
+
+    def _get_session():
+        session = aiobotocore_session.get_session()
+        real_create_client = session.create_client
+        session.create_client = lambda *a, **kw: _OverriddenClientCtx(
+            real_create_client(*a, **kw), methods)
+        return session
+
+    patcher = mock.patch('waterbutler.providers.s3.provider.get_session', _get_session)
+    return patcher, handle
 
 
 def raw_provider(auth, credentials, settings):
@@ -1145,16 +1164,16 @@ class TestCRUD:
         user's quota forever.
         """
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(
-                versions=[('some-file', 'version-two'), ('some-file', 'version-one')],
-                delete_markers=[('some-file', 'marker-one')],
-            ),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(
+                    versions=[('some-file', 'version-two'), ('some-file', 'version-one')],
+                    delete_markers=[('some-file', 'marker-one')],
+                ),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1174,15 +1193,15 @@ class TestCRUD:
     async def test_delete_file_leaves_keys_that_merely_share_the_prefix(self, provider, mock_time):
         """Prefix= is a prefix match, so 'some-file.bak' comes back alongside 'some-file'."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(
-                versions=[('some-file', 'version-one'), ('some-file.bak', 'version-bak')],
-            ),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(
+                    versions=[('some-file', 'version-one'), ('some-file.bak', 'version-bak')],
+                ),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1201,13 +1220,13 @@ class TestCRUD:
         """V-3: a bucket with versioning disabled reports the single live object with the
         literal version id 'null', which DeleteObjects accepts verbatim."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(versions=[('some-file', 'null')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(versions=[('some-file', 'null')]),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1224,13 +1243,13 @@ class TestCRUD:
     async def test_delete_file_with_no_versions_makes_no_delete_call(self, provider, mock_time):
         """DeleteObjects rejects an empty object list, so there is nothing to send."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1245,14 +1264,14 @@ class TestCRUD:
         """V-4: DeleteObjects reports per-object failures in the 200 body.  Fail closed, and
         name the objects that survived so the caller can retry them."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(
-                versions=[('some-file', 'version-two'), ('some-file', 'version-one')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(
+                    versions=[('some-file', 'version-two'), ('some-file', 'version-one')]),
+            status=200)
 
         delete_result = {
             'Deleted': [{'Key': 'some-file', 'VersionId': 'version-two'}],
@@ -1280,14 +1299,14 @@ class TestCRUD:
         """V-5: a failed version listing must surface as a DeleteError, not as whatever the
         listing helper happens to throw, and must not leak the raw S3 error document."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code>'
-                 b'<Message>Access Denied</Message></Error>',
-            status=status,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code>'
+                     b'<Message>Access Denied</Message></Error>',
+            status=status)
 
         with pytest.raises(exceptions.DeleteError) as exc_info:
             await provider.delete(path)
@@ -1305,7 +1324,7 @@ class TestCRUD:
         """V-5: transport failures are not WaterButlerErrors and would otherwise escape
         delete() unconverted."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
         async def _fail(*args, **kwargs):
             raise transport_error()
@@ -1326,14 +1345,14 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_delete_confirm_delete(self, provider, mock_time):
         path = WaterButlerPath('/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix=''),
-            body=list_versions_response(
-                versions=[('some-folder/', 'v1'), ('some-folder/file.txt', 'v2')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': ''},
+                body=list_versions_response(
+                    versions=[('some-folder/', 'v1'), ('some-folder/file.txt', 'v2')]),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1360,17 +1379,17 @@ class TestCRUD:
         storage it occupies -- behind on a versioned bucket.
         """
         path = WaterButlerPath('/folder-to-delete/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='folder-to-delete/'),
-            body=list_versions_response(
-                versions=[('folder-to-delete/file1.txt', '111'),
-                          ('folder-to-delete/file1.txt', '222')],
-                delete_markers=[('folder-to-delete/file2.txt', '333')],
-            ),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'folder-to-delete/'},
+                body=list_versions_response(
+                    versions=[('folder-to-delete/file1.txt', '111'),
+                              ('folder-to-delete/file1.txt', '222')],
+                    delete_markers=[('folder-to-delete/file2.txt', '333')],
+                ),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1389,13 +1408,13 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_single_item_folder_delete(self, provider, mock_time):
         path = WaterButlerPath('/single-thing-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='single-thing-folder/'),
-            body=list_versions_response(versions=[('single-thing-folder/item', 'v1')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'single-thing-folder/'},
+                body=list_versions_response(versions=[('single-thing-folder/item', 'v1')]),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1415,13 +1434,13 @@ class TestCRUD:
         version of its own.  Deleting it must remove that key, not report the folder missing.
         """
         path = WaterButlerPath('/empty-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='empty-folder/'),
-            body=list_versions_response(versions=[('empty-folder/', 'v1')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'empty-folder/'},
+                body=list_versions_response(versions=[('empty-folder/', 'v1')]),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1439,13 +1458,13 @@ class TestCRUD:
         """V-6: a prefix with neither a version nor a delete marker under it is a folder that
         does not exist, and must not be reported as a successful delete."""
         path = WaterButlerPath('/not-found-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='not-found-folder/'),
-            body=list_versions_response(),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'not-found-folder/'},
+                body=list_versions_response(),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1460,14 +1479,14 @@ class TestCRUD:
     async def test_delete_folder_of_delete_markers_only(self, provider, mock_time):
         """V-6: a folder whose keys have all been delete-marked still has versions to purge."""
         path = WaterButlerPath('/tombstone-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='tombstone-folder/'),
-            body=list_versions_response(
-                delete_markers=[('tombstone-folder/file1.txt', '111')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'tombstone-folder/'},
+                body=list_versions_response(
+                    delete_markers=[('tombstone-folder/file1.txt', '111')]),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1485,14 +1504,14 @@ class TestCRUD:
     async def test_large_folder_delete(self, provider, mock_time):
         """DeleteObjects takes at most 1000 objects per call."""
         path = WaterButlerPath('/some-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
         keys = [f'some-folder/file-{index:05d}' for index in range(1001)]
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-folder/'),
-            body=list_versions_response(versions=[(key, 'v1') for key in keys]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-folder/'},
+                body=list_versions_response(versions=[(key, 'v1') for key in keys]),
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1511,25 +1530,23 @@ class TestCRUD:
         ListObjectVersions resumes from the last key *and* version id, not a continuation
         token."""
         path = WaterButlerPath('/large-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        page_one_url = versions_url(Bucket='that-kerning', Prefix='large-folder/')
-        page_two_url = versions_url(Bucket='that-kerning', Prefix='large-folder/',
-                                    KeyMarker='large-folder/file2.txt', VersionIdMarker='222')
-
-        aiohttpretty.register_uri(
-            'GET', page_one_url,
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'large-folder/'},
             body=list_versions_response(versions=[('large-folder/file1.txt', '111')],
                                         is_truncated=True,
                                         next_key_marker='large-folder/file2.txt',
                                         next_version_id_marker='222'),
-            status=200,
-        )
-        aiohttpretty.register_uri(
-            'GET', page_two_url,
+            status=200)
+        page_two_url = await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'large-folder/',
+                              'KeyMarker': 'large-folder/file2.txt',
+                              'VersionIdMarker': '222'},
             body=list_versions_response(versions=[('large-folder/file2.txt', '222')]),
-            status=200,
-        )
+            status=200)
 
         patcher, s3_client = patch_aiobotocore_client(
             delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
@@ -1549,14 +1566,14 @@ class TestCRUD:
     async def test_folder_delete_partial_failure_raises(self, provider, mock_time):
         """V-4, folder side: refusals reported inside the 200 body must not read as success."""
         path = WaterButlerPath('/error-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
-            body=list_versions_response(versions=[('error-folder/file1.txt', '111'),
-                                                  ('error-folder/file2.txt', '222')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'error-folder/'},
+                body=list_versions_response(versions=[('error-folder/file1.txt', '111'),
+                                                      ('error-folder/file2.txt', '222')]),
+            status=200)
 
         delete_result = {
             'Deleted': [{'Key': 'error-folder/file1.txt', 'VersionId': '111'}],
@@ -1577,13 +1594,13 @@ class TestCRUD:
     async def test_delete_folder_delete_error(self, provider, mock_time):
         """V-6: a refused DeleteObjects call surfaces as a DeleteError."""
         path = WaterButlerPath('/error-folder/')
-        install_query_encoding_presigned_url(provider)
+        use_real_presigner(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
-            body=list_versions_response(versions=[('error-folder/file1.txt', '111')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'error-folder/'},
+                body=list_versions_response(versions=[('error-folder/file1.txt', '111')]),
+            status=200)
 
         patcher, _ = patch_aiobotocore_client(
             delete_objects=MockCoroutine(side_effect=Exception('AccessDenied')))
