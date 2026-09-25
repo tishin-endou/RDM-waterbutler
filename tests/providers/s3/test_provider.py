@@ -8,7 +8,9 @@ import asyncio
 import hashlib
 import inspect
 import aiohttp
+import datetime
 import aiohttpretty
+import botocore.auth
 import botocore.exceptions
 from aiohttp import web
 from aiobotocore import session as aiobotocore_session
@@ -322,6 +324,55 @@ def patch_aiobotocore_client(**methods):
     session.create_client = mock.Mock(return_value=_AsyncClientCtx(client))
     patcher = mock.patch('waterbutler.providers.s3.provider.get_session', return_value=session)
     return patcher, client
+
+
+def raw_provider(auth, credentials, settings):
+    """A provider with only the region lookup stubbed, so that the real
+    ``generate_generic_presigned_url`` and ``check_key_existence`` run."""
+    prov = S3Provider(auth, credentials, settings)
+    prov._check_region = MockCoroutine()
+    prov.region = 'us-east-1'
+    return prov
+
+
+class _FrozenSigningClock(datetime.datetime):
+    """``datetime.datetime`` whose ``utcnow()`` does not move."""
+
+    @classmethod
+    def utcnow(cls):
+        return cls(2016, 2, 5, 14, 28, 50)
+
+
+def frozen_signing_clock():
+    """Pin the clock botocore signs with, so a presigned URL is reproducible.
+
+    T-1 / CX1-11: the real presigner has to run -- it is what rejects a wrongly typed
+    parameter, adds ``encoding-type=url`` and turns the parameters into the query string that
+    actually goes on the wire.  Three ROUND1 majors hid behind a hand-written stand-in for it.
+    Answering the real URL with ``aiohttpretty`` means the test has to name that URL, and the
+    only thing that differs between two otherwise identical signings is ``X-Amz-Date`` (one
+    second of resolution) and the signature derived from it.  This replaces the clock and
+    nothing else: parameter validation, serialisation and the HMAC all still happen for real.
+    """
+    shim = mock.Mock()
+    shim.datetime = _FrozenSigningClock
+    return mock.patch.object(botocore.auth, 'datetime', shim)
+
+
+async def register_presigned(provider, http_method, s3_method, path='', query_parameters=None,
+                             default_params=False, **response):
+    """Sign ``s3_method`` with the real presigner and answer that exact URL with ``response``.
+
+    Call inside :func:`frozen_signing_clock` so that the URL signed here and the one the
+    provider signs a moment later are the same string -- ``aiohttpretty`` matches on the whole
+    query, signature included.
+
+    :return: the presigned URL that was registered
+    """
+    url = await provider.generate_generic_presigned_url(
+        path, s3_method, query_parameters=query_parameters, default_params=default_params)
+    aiohttpretty.register_uri(http_method, url, **response)
+    return url
 
 
 class TestRegionDetection:
@@ -1756,106 +1807,122 @@ class TestFolderListingPaging:
     ``ZipStreamGenerator`` -- wants the complete listing and would choke on a token mixed in
     among the metadata objects, so the two behaviours are told apart by whether the caller
     passed a ``next_token`` keyword at all.
+
+    T-1 / CX1-11: every request here is signed by the real presigner.  The earlier version of
+    this class handed the provider a stand-in that accepted any parameter and pasted it into a
+    query string, which is why ``MaxKeys='1000'`` -- a value botocore refuses outright -- read
+    as covered (CX1-1).  Nothing below substitutes the presigner: the injection is at the HTTP
+    boundary, and the URL registered there is the one the presigner produced.
     """
 
     PREFIX = 'darp/'
 
-    def _register_page(self, url, keys, is_truncated=False, next_continuation_token=None):
-        aiohttpretty.register_uri(
-            'GET', url,
+    def _params(self, **extra):
+        params = {'Bucket': 'that-kerning', 'Prefix': self.PREFIX, 'Delimiter': '/'}
+        params.update(extra)
+        return params
+
+    async def _register_page(self, provider, keys, is_truncated=False,
+                             next_continuation_token=None, **extra):
+        """Answer the ListObjectsV2 page selected by ``extra`` with a listing of ``keys``."""
+        return await register_presigned(
+            provider, 'GET', 'list_objects_v2', query_parameters=self._params(**extra),
             body=list_objects_v2_response(keys, is_truncated=is_truncated,
                                           next_continuation_token=next_continuation_token),
             headers={'Content-Type': 'application/xml'},
         )
 
-    def _page_url(self, **extra):
-        params = {'Bucket': 'that-kerning', 'Prefix': self.PREFIX, 'Delimiter': '/'}
-        params.update(extra)
-        return objects_url(**params)
-
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_page_ends_with_the_continuation_token(self, provider, mock_time):
-        """P-2: a truncated page is returned as-is with the token appended as a bare str."""
-        calls = install_query_encoding_presigned_url(provider)
-        self._register_page(self._page_url(MaxKeys='1000'),
-                            ['darp/a.txt', 'darp/b.txt'],
-                            is_truncated=True, next_continuation_token='page-2-token')
+    @pytest.mark.parametrize('next_token, sent_token', [
+        # The API layer passes `next_token` for every page; `metadata()` turns a `None` into
+        # the empty string, so both name the first page.
+        (None, None),
+        ('', None),
+        # S3 hands back an opaque token and the UI hands it straight back.  A real one is
+        # base64 and contains characters that have to survive query encoding: this stands in
+        # for the worst of them.
+        ('t/ok en+/=&?#%', 't/ok en+/=&?#%'),
+    ])
+    async def test_a_page_request_reaches_s3(self, auth, credentials, settings,
+                                             next_token, sent_token):
+        """P-1 / P-2 / P-5 / CX1-1: the paging parameters are ones botocore will sign.
 
-        result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+        On ``ca65500e`` ``MaxKeys`` is the string ``'1000'``; botocore raises
+        ``ParamValidationError`` before anything is signed and the provider converts that into
+        a 404, so no request is made at all and every one of these cases fails.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        extra = {'MaxKeys': 1000}
+        if sent_token is not None:
+            extra['ContinuationToken'] = sent_token
+
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a.txt', 'darp/b.txt'],
+                                      is_truncated=True,
+                                      next_continuation_token='page-2-token', **extra)
+            result = await provider.metadata(WaterButlerPath('/darp/'), next_token=next_token)
 
         assert [item.name for item in result[:-1]] == ['a.txt', 'b.txt']
         assert result[-1] == 'page-2-token'
         # One page means one request -- the provider must not drain the listing here.
-        assert len(calls) == 1
+        assert len(aiohttpretty.calls) == 1
+        sent = aiohttpretty.calls[0]['uri'].params
+        assert sent['max-keys'] == '1000'
+        assert sent.get('continuation-token') == sent_token
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_page_asks_for_at_most_1000_keys(self, provider, mock_time):
-        """P-2: the page size is pinned so the token round trip stays bounded."""
-        calls = install_query_encoding_presigned_url(provider)
-        self._register_page(self._page_url(MaxKeys='1000'), ['darp/a.txt'])
-
-        await provider.metadata(WaterButlerPath('/darp/'), next_token='')
-
-        assert calls[0]['MaxKeys'] == '1000'
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_last_page_has_no_trailing_token(self, provider, mock_time):
+    async def test_last_page_has_no_trailing_token(self, auth, credentials, settings):
         """P-4: ``IsTruncated`` false means the caller must not see a str at the end."""
-        install_query_encoding_presigned_url(provider)
-        self._register_page(self._page_url(MaxKeys='1000'), ['darp/a.txt', 'darp/b.txt'])
+        provider = raw_provider(auth, credentials, settings)
 
-        result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a.txt', 'darp/b.txt'], MaxKeys=1000)
+            result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
 
         assert not isinstance(result[-1], str)
         assert [item.name for item in result] == ['a.txt', 'b.txt']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_token_is_sent_back_as_the_continuation_token(self, provider, mock_time):
-        """P-5: the token the UI received comes back unchanged and selects the next page."""
-        calls = install_query_encoding_presigned_url(provider)
-        self._register_page(self._page_url(MaxKeys='1000', ContinuationToken='page-2-token'),
-                            ['darp/c.txt'])
-
-        result = await provider.metadata(WaterButlerPath('/darp/'), next_token='page-2-token')
-
-        assert calls[0]['ContinuationToken'] == 'page-2-token'
-        assert [item.name for item in result] == ['c.txt']
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_listing_without_next_token_returns_every_page(self, provider, mock_time):
+    async def test_listing_without_next_token_returns_every_page(self, auth, credentials,
+                                                                 settings):
         """Regression guard: ``metadata(path)`` with no ``next_token`` keyword must return the
         complete listing and nothing but metadata objects.
 
         ``BaseProvider._folder_file_op`` reads ``item.name`` off every element and
         ``ZipStreamGenerator`` feeds every element to ``path_from_metadata``; a str token among
         them raises ``AttributeError`` mid-copy or mid-download.
-        """
-        install_query_encoding_presigned_url(provider)
-        self._register_page(self._page_url(), ['darp/a.txt'],
-                            is_truncated=True, next_continuation_token='page-2-token')
-        self._register_page(self._page_url(ContinuationToken='page-2-token'), ['darp/b.txt'])
 
-        result = await provider.metadata(WaterButlerPath('/darp/'))
+        No ``MaxKeys`` goes on these requests, which is what makes this the control case for
+        CX1-1: the drain path signs cleanly on ``ca65500e`` too.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a.txt'], is_truncated=True,
+                                      next_continuation_token='page-2-token')
+            await self._register_page(provider, ['darp/b.txt'],
+                                      ContinuationToken='page-2-token')
+            result = await provider.metadata(WaterButlerPath('/darp/'))
 
         assert [item.name for item in result] == ['a.txt', 'b.txt']
         assert not any(isinstance(item, str) for item in result)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_handle_data_leaves_a_single_file_alone(self, provider, file_header_metadata,
-                                                          mock_time):
+    async def test_handle_data_leaves_a_single_file_alone(self, auth, credentials, settings,
+                                                          file_header_metadata):
         """P-3: a file's metadata is not a listing, so nothing may be popped off it."""
+        provider = raw_provider(auth, credentials, settings)
         path = WaterButlerPath('/Foo/Bar/my-image.jpg')
-        aiohttpretty.register_uri('HEAD',
-                                  f'https://that-kerning.s3.amazonaws.com/{path.path}',
-                                  headers=file_header_metadata, match_querystring=False)
 
-        file_metadata = await provider.metadata(path)
+        with frozen_signing_clock():
+            await register_presigned(provider, 'HEAD', 'head_object', path=path.path,
+                                     default_params=True, headers=file_header_metadata)
+            file_metadata = await provider.metadata(path)
+
         data, token = provider.handle_data(file_metadata)
 
         assert isinstance(data, S3FileMetadataHeaders)
@@ -2599,15 +2666,6 @@ def assert_no_secrets(exc):
     blob = '{!r} {!s} {}'.format(exc, exc, getattr(exc, 'message', ''))
     leaked = [marker for marker in SECRET_MARKERS if marker in blob]
     assert leaked == [], 'exception exposes {}'.format(leaked)
-
-
-def raw_provider(auth, credentials, settings):
-    """A provider with only the region lookup stubbed, so that the real
-    ``generate_generic_presigned_url`` and ``check_key_existence`` run."""
-    prov = S3Provider(auth, credentials, settings)
-    prov._check_region = MockCoroutine()
-    prov.region = 'us-east-1'
-    return prov
 
 
 class commit_server:
