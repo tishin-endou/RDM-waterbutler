@@ -863,7 +863,9 @@ class S3Provider(provider.BaseProvider):
             data=cutoff_stream,
             skip_auto_headers={'CONTENT-TYPE'},
             headers={'Content-Length': str(chunk_size)},
-            params={'partNumber': str(chunk_number), 'uploadId': session_upload_id},
+            # No `params=`: `PartNumber` and `UploadId` are already in the presigned URL, and
+            # aiohttp extends a URL's query rather than overwriting it, so passing them again
+            # sends each one twice and breaks the signature.
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
@@ -906,7 +908,6 @@ class S3Provider(provider.BaseProvider):
                 abort_url,
                 skip_auto_headers={'CONTENT-TYPE'},
                 headers=headers,
-                params=headers,
                 expects=(204,),
                 throws=exceptions.UploadError,
             )
@@ -954,7 +955,6 @@ class S3Provider(provider.BaseProvider):
             list_url,
             skip_auto_headers={'CONTENT-TYPE'},
             headers=headers,
-            params=headers,
             expects=(200, 201, 404,),
             throws=exceptions.UploadError
         )

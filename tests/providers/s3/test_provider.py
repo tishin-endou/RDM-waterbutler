@@ -940,9 +940,12 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_chunked_upload_upload_part(self, provider, file_stream,
-                                              upload_parts_headers_list,
-                                              mock_time):
+    async def test_chunked_upload_upload_part(self, auth, credentials, settings, file_stream,
+                                              upload_parts_headers_list):
+        """T-1 / CX1-2: the part goes to the URL the real presigner signed, and to nothing
+        else.  ``PartNumber`` and ``UploadId`` are already in that URL, so the request must
+        not name them again."""
+        provider = raw_provider(auth, credentials, settings)
         assert file_stream.size == 6
         provider.CHUNK_SIZE = 2
 
@@ -950,21 +953,21 @@ class TestCRUD:
         chunk_number = 1
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        upload_part_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         # aiohttp resp headers use upper case
         part_headers = json.loads(upload_parts_headers_list).get('headers_list')[0]
         part_headers = {k.upper(): v for k, v in part_headers.items()}
-        aiohttpretty.register_uri('PUT', upload_part_url, status=200, headers=part_headers,
-                                  params={'partNumber': str(chunk_number), 'uploadId': upload_id})
 
-        part_metadata = await provider._upload_part(file_stream, path, upload_id, chunk_number,
-                                                    provider.CHUNK_SIZE)
+        with frozen_signing_clock():
+            upload_part_url = await register_presigned(
+                provider, 'PUT', 'upload_part', path=path.path, default_params=True,
+                query_parameters={'ContentLength': provider.CHUNK_SIZE,
+                                  'PartNumber': chunk_number, 'UploadId': upload_id},
+                status=200, headers=part_headers)
+            part_metadata = await provider._upload_part(file_stream, path, upload_id,
+                                                        chunk_number, provider.CHUNK_SIZE)
 
-        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url,
-                                     params={'partNumber': str(chunk_number), 'uploadId': upload_id})
+        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url)
         assert part_headers == part_metadata
-
-        provider.CHUNK_SIZE = pd_settings.CHUNK_SIZE
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
