@@ -287,7 +287,14 @@ class S3Provider(provider.BaseProvider):
             description = type(exc).__name__
             status = None
 
-        raise error_class('{}: {}'.format(context, description), code=code or status or 500)
+        # GRDM (CX1-6 / K-9): `from None`, because the point of this method is that `exc` must
+        # not be repeated.  Left on `__context__` it is still formatted by
+        # `traceback.format_exception`, which is what `waterbutler.server.api.v1.core`'s
+        # `log_exception` reaches through `exc_info` -- so a message this method deliberately
+        # refused to copy goes into the log anyway.  On a HEAD that message is the presigned
+        # URL, carrying `X-Amz-Credential` and `X-Amz-Signature`.
+        raise error_class('{}: {}'.format(context, description),
+                          code=code or status or 500) from None
 
     async def generate_generic_presigned_url(self, path, method='head_object', query_parameters=None, default_params=True):
         try:
@@ -827,7 +834,11 @@ class S3Provider(provider.BaseProvider):
                                 'manually remove them.'
             else:
                 abort_message = ' The upload is aborted.'
-            raise exceptions.UploadError('{}{}{}'.format(msg, note, abort_message))
+            # GRDM (CX1-6 / K-9): `from None` for the same reason as in
+            # `_raise_from_client_error` -- this message was composed to say what happened
+            # without the storage's prose, and `__context__` would put the prose back into the
+            # log.  `err` has already been logged above, by type and status only.
+            raise exceptions.UploadError('{}{}{}'.format(msg, note, abort_message)) from None
 
     async def _create_upload_session(self, path):
         """This operation initiates a multipart upload and returns an upload ID. This upload ID is
