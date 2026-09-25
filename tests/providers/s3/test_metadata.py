@@ -1,5 +1,6 @@
 import pytest
 
+from waterbutler.providers.s3.metadata import S3Metadata, S3FileMetadataHeaders
 from tests.providers.s3.fixtures import (
     file_metadata_headers_object,
     file_header_metadata,
@@ -136,3 +137,17 @@ class TestRevisionsMetadata:
 
         assert revision_metadata_object.version == '3/L4kqtJl40Nr8X8gdRQBpUMLUo'
 
+
+class TestNoHydrationHooks:
+    """CL M-1 / 決定-21: the S3 half of the removed Celery serialization hooks is gone too.
+
+    ``S3FileMetadataHeaders`` overrode ``_dehydrate``/``_rehydrate`` to carry ``_path`` through
+    the payload.  With the base pair removed those overrides call a ``super()`` that no longer
+    exists, so leaving them behind would be a method that raises the moment anything reaches
+    it.  See ``tests.core.test_metadata.TestNoPayloadDrivenConstruction`` for why the pair went.
+    """
+
+    @pytest.mark.parametrize('name', ['dehydrate', '_dehydrate', 'rehydrate', '_rehydrate'])
+    def test_s3_metadata_has_no_hydration_hooks(self, name):
+        assert not hasattr(S3Metadata, name)
+        assert not hasattr(S3FileMetadataHeaders, name)
