@@ -1068,6 +1068,24 @@ class S3Provider(provider.BaseProvider):
                 error_code,
             ))
 
+        # GRDM (CX1-4 / K-3): success has to be stated, not merely not-contradicted.  Reading
+        # only `<Error>` meant an empty `<Error/>`, a scalar `<Error>`, a body that is not XML,
+        # a truncated body and an empty body all fell through to a normal return -- the user is
+        # told the file is on the storage, and it is not necessarily there.
+        #
+        # `CompleteMultipartUploadResult` plus an `ETag` is the whole of what S3 promises on a
+        # completed commit: the ETag is computed from the assembled object, so it exists only
+        # once the assembly has finished.  Anything else is a body nobody can read, which is
+        # evidence for neither outcome and therefore UNKNOWN -- the recoverable side, which is
+        # the direction NOTE_SEMANTICS_DESIGN v2.2 §2 requires when the answer is illegible.
+        result = parsed.get('CompleteMultipartUploadResult')
+        if not isinstance(result, dict) or not result.get('ETag'):
+            raise _mark_commit_outcome_unknown(exceptions.UploadError(
+                'CompleteMultipartUpload answered {} with a body that does not report '
+                'success'.format(resp.status),
+                code=HTTPStatus.BAD_GATEWAY
+            ))
+
     async def delete(self, path, confirm_delete=0, **kwargs):
         """Deletes the key at the specified path
 
