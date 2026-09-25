@@ -2174,6 +2174,11 @@ class TestOperations:
         dest_provider.exists = MockCoroutine(return_value=True)
         dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
         dest_provider.bucket_name = provider.bucket_name
+        # 決定-20: the client is built from the destination's credentials and region.
+        dest_provider.aws_access_key_id = provider.aws_access_key_id
+        dest_provider.aws_secret_access_key = provider.aws_secret_access_key
+        dest_provider.region = provider.region
+        dest_provider._check_region = MockCoroutine()
 
         # Mock aiobotocore session → client (intra_copy uses copy_object directly)
         # mock.AsyncMock requires Python 3.8+; use MockCoroutine + inline async ctx manager
@@ -2386,6 +2391,14 @@ class TestIntraCopy:
         dest_provider.exists = MockCoroutine(return_value=exists)
         dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
         dest_provider.bucket_name = provider.bucket_name
+        # 決定-20: the copy is signed by the destination, so these are read for real now.  The
+        # same values as the source keep these tests measuring error reporting rather than
+        # credentials -- which is asserted separately, against two distinct real providers, by
+        # `test_intra_copy_is_signed_with_the_destination_credentials`.
+        dest_provider.aws_access_key_id = provider.aws_access_key_id
+        dest_provider.aws_secret_access_key = provider.aws_secret_access_key
+        dest_provider.region = provider.region
+        dest_provider._check_region = MockCoroutine()
         return dest_provider
 
     @pytest.mark.asyncio
@@ -2514,6 +2527,57 @@ class TestIntraCopy:
         assert len(sent) == 1
         assert 'Signature=' in sent[0].headers['Authorization'].decode('utf-8') \
             or 'AWS4-HMAC-SHA256' in sent[0].headers['Authorization'].decode('utf-8')
+
+    @pytest.mark.asyncio
+    async def test_intra_copy_is_signed_with_the_destination_credentials(
+            self, auth, credentials, settings, file_metadata_object, monkeypatch, mock_time):
+        """決定-20 / CX1-7: CopyObject is signed by ``dest_provider``, as the docstring says.
+
+        ``intra_copy``'s own contract -- "the credentials specified in `dest_provider` must have
+        read access to `source.bucket`" -- is the one develop implements: it signs the PUT with
+        the destination's key.  This provider was signing with the *source's* instead, so the
+        stated requirement bought the user nothing: granting the destination read access to the
+        source did not make the copy work, and the copy that did work was the one where the
+        source could write to the destination -- the opposite permission, and one no
+        documentation asks anybody to grant.  A copy between two S3 addons with different keys
+        therefore failed with an AccessDenied the operator had no way to read.
+
+        The region goes with the credentials.  SigV4 signs the region into the scope and the
+        host into the request, and CopyObject is a write *to the destination bucket*, so both
+        have to be the destination's; signing a destination in ap-northeast-1 with a us-east-1
+        scope is rejected before the object is ever read.
+
+        Injected at the transport boundary (``before-send``), so the request examined here is
+        the one botocore actually signed.
+        """
+        source = raw_provider(auth, credentials, settings)
+        dest = raw_provider(
+            auth,
+            {'access_key': 'DESTACCESSKEY', 'secret_key': 'dest-secret-key'},
+            {'id': 'other-kerning:/', 'bucket': 'other-kerning', 'encrypt_uploads': False})
+        dest.region = 'ap-northeast-1'
+        # The destination's own lookups are not what is being measured; the copy request is.
+        dest.exists = MockCoroutine(return_value=False)
+        dest.metadata = MockCoroutine(return_value=file_metadata_object)
+
+        sent = patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
+
+        await source.intra_copy(dest, WaterButlerPath('/source.txt'),
+                                WaterButlerPath('/dest.txt'))
+
+        assert len(sent) == 1
+        authorization = sent[0].headers['Authorization'].decode('utf-8')
+        assert 'Credential=DESTACCESSKEY/' in authorization
+        assert '/ap-northeast-1/s3/aws4_request' in authorization
+        assert 'Credential={}/'.format(source.aws_access_key_id) not in authorization
+        assert parse.urlsplit(sent[0].url).netloc == 's3.ap-northeast-1.amazonaws.com'
+        # The object still comes *from* the source bucket: this is about who signs, not what is
+        # copied.
+        copy_source = parse.unquote(sent[0].headers['x-amz-copy-source'].decode('utf-8'))
+        assert source.bucket_name in copy_source
+        assert 'source.txt' in copy_source
+        assert parse.urlsplit(sent[0].url).path == '/other-kerning/dest.txt'
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('body', [COPY_OBJECT_ERROR_BODY, COPY_OBJECT_EMPTY_ERROR_BODY])
