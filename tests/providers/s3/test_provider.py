@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import aiohttp
 import datetime
+import traceback
 import aiohttpretty
 import botocore.auth
 import botocore.exceptions
@@ -2807,7 +2808,18 @@ def s3_client_error(code, status, operation='HeadObject'):
 
 
 def assert_no_secrets(exc):
+    """K-9 / CX1-6: not in the message, and not in the traceback either.
+
+    Converting an exception into a safe one is not enough on its own.  ``raise X`` inside an
+    ``except`` leaves the original hanging off ``__context__``, and
+    ``waterbutler.server.api.v1.core.log_exception`` records the failure with ``exc_info``, so
+    the whole chain is formatted into the log.  Under SigV4 the original's message is the
+    presigned request URL -- ``exception_from_response``'s default -- which carries
+    ``X-Amz-Credential`` (the access key id) and ``X-Amz-Signature``.  The client response is
+    clean; the log is not, and K-9 covers the log.
+    """
     blob = '{!r} {!s} {}'.format(exc, exc, getattr(exc, 'message', ''))
+    blob += ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     leaked = [marker for marker in SECRET_MARKERS if marker in blob]
     assert leaked == [], 'exception exposes {}'.format(leaked)
 
@@ -2966,26 +2978,6 @@ def arrange_commit_failure(provider, transport, error_code):
 
 class TestErrorReporting:
     """K-2 / K-7 / K-8 / K-9: what the six aiobotocore call sites do with a failure."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.aiohttpretty
-    async def test_check_key_existence_does_not_expose_the_presigned_url(self, auth, credentials,
-                                                                        settings, mock_time):
-        """K-8/K-9: core builds its message out of the request URL
-        (``exceptions.DEFAULT_ERROR_MSG``), and ``waterbutler.server.api.v1.core.write_error``
-        hands ``exc.message`` straight to the client.  Re-wrapping that message verbatim puts the
-        signature and the access key id in a 404 body."""
-        provider = raw_provider(auth, credentials, settings)
-        patcher, _ = patch_aiobotocore_client(
-            generate_presigned_url=MockCoroutine(return_value=SIGNED_URL))
-        aiohttpretty.register_uri('HEAD', SIGNED_URL, status=403)
-
-        with patcher:
-            with pytest.raises(exceptions.NotFoundError) as e:
-                await provider.check_key_existence('my-subfolder/thefile.txt')
-
-        assert_no_secrets(e.value)
-        assert 'my-subfolder/thefile.txt' in e.value.message
 
     @pytest.mark.asyncio
     async def test_generate_presigned_url_reports_the_code_not_s3_prose(self, auth, credentials,
@@ -3800,6 +3792,115 @@ class TestCommitOutcome:
         exact set here means an addition has to be argued for, not slipped in."""
         assert pd_provider.DEFINITIVE_REJECTION_CODES == frozenset(
             EXPECTED_DEFINITIVE_REJECTION_CODES)
+
+
+def assert_context_suppressed(exc):
+    """CX1-6 / K-9: nothing the provider refused to say is reachable through ``__context__``.
+
+    An exception raised inside an ``except`` keeps the original on ``__context__`` unless the
+    ``raise`` says ``from None``, and ``traceback.format_exception`` -- which is what
+    ``log_exception``'s ``exc_info`` ends up calling -- walks that chain.  Converting a failure
+    into one that names only the type and the error code therefore does nothing for the log
+    while the chain is still there.
+
+    Asserted as a structural property rather than by scanning for markers: the marker scan can
+    only fail on the messages that happen to carry a URL today, whereas the rule is that a
+    deliberately-narrowed exception does not drag the wide one along behind it.
+    """
+    assert exc.__context__ is None or exc.__suppress_context__, (
+        'chains {}: {!s}'.format(type(exc.__context__).__name__, exc.__context__))
+
+
+class TestExceptionChaining:
+    """CX1-6 / K-9: the conversion points must not leave the original on the chain."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_check_key_existence_does_not_chain_the_signed_url(self, auth, credentials,
+                                                                      settings, mock_time):
+        """K-8/K-9: the HEAD path is where the original's message really is the presigned URL.
+        ``exception_from_response`` has no body to use on a HEAD, so it falls back to
+        ``DEFAULT_ERROR_MSG``, which is the request URL -- and under SigV4 that URL carries
+        ``X-Amz-Credential`` and ``X-Amz-Signature``.
+        ``waterbutler.server.api.v1.core.write_error`` hands ``exc.message`` straight to the
+        client and ``log_exception`` records the chain, so both have to be clean."""
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await register_presigned(provider, 'HEAD', 'head_object',
+                                     path='my-subfolder/thefile.txt', default_params=True,
+                                     status=403)
+
+            with pytest.raises(exceptions.NotFoundError) as e:
+                await provider.check_key_existence('my-subfolder/thefile.txt')
+
+        assert_context_suppressed(e.value)
+        assert_no_secrets(e.value)
+        assert 'my-subfolder/thefile.txt' in e.value.message
+
+    @pytest.mark.asyncio
+    async def test_generate_presigned_url_does_not_chain_s3_prose(self, auth, credentials,
+                                                                   settings, mock_time):
+        """The other kind of original: botocore's ``ClientError``, whose message quotes S3's
+        prose along with the request id and the host id."""
+        provider = raw_provider(auth, credentials, settings)
+        patcher, _ = patch_aiobotocore_client(
+            generate_presigned_url=MockCoroutine(
+                side_effect=s3_client_error('AccessDenied', 403)))
+
+        with patcher:
+            with pytest.raises(exceptions.NotFoundError) as e:
+                await provider.generate_generic_presigned_url('my-subfolder/thefile.txt')
+
+        assert_context_suppressed(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('abort_status', [204, 500])
+    async def test_the_chunked_upload_exit_does_not_chain_the_commit_failure(
+            self, auth, credentials, settings, mock_time, abort_status):
+        """``_chunked_upload`` composes its message precisely so that the failure is named
+        without the storage's prose.  Raising it from inside the ``except`` puts that prose
+        back.  Both abort outcomes are taken: after CX1-5 the abort's own exception is caught
+        too, and that handler is a second place a context can be picked up from."""
+        provider = raw_provider(auth, credentials, settings)
+        provider._create_upload_session = MockCoroutine(return_value='SESSION')
+        provider._upload_parts = MockCoroutine(return_value=[{'ETAG': 'abc'}])
+
+        with frozen_signing_clock():
+            await register_commit(provider,
+                                  commit_error_xml('InternalError').encode('utf-8'))
+            await register_presigned(
+                provider, 'DELETE', 'abort_multipart_upload', path=COMMIT_PATH.path,
+                query_parameters={'UploadId': 'SESSION'}, default_params=True,
+                body=b'', status=abort_status)
+            await register_presigned(
+                provider, 'GET', 'list_parts', path=COMMIT_PATH.path,
+                query_parameters={'UploadId': 'SESSION'}, default_params=True,
+                body=b'', status=404)
+
+            with pytest.raises(exceptions.UploadError) as e:
+                await provider._chunked_upload(None, COMMIT_PATH)
+
+        assert_context_suppressed(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_the_commit_error_body_is_not_chained_either(self, auth, credentials,
+                                                                settings, mock_time):
+        """``_complete_multipart_upload`` raises from inside the ``try`` that read the body, so
+        there is no context to suppress -- pin that, because moving the raise into an
+        ``except`` would silently reintroduce one."""
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await register_commit(provider,
+                                  commit_error_xml('InternalError').encode('utf-8'))
+
+            with pytest.raises(exceptions.UploadError) as e:
+                await commit(provider)
+
+        assert_context_suppressed(e.value)
 
 
 class TestAbortFailureKeepsTheCommitNotice:
