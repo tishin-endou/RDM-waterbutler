@@ -3199,6 +3199,30 @@ class TestResponseParsing:
             await provider.get_folder_metadata('my-subfolder/', {'Prefix': 'my-subfolder/'})
 
 
+COMMIT_PATH = WaterButlerPath('/my-subfolder/thefile.txt')
+
+COMMIT_SUCCESS_BODY = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<CompleteMultipartUploadResult>'
+    '<Location>https://that-kerning.s3.amazonaws.com/my-subfolder/thefile.txt</Location>'
+    '<Bucket>that-kerning</Bucket><Key>my-subfolder/thefile.txt</Key>'
+    '<ETag>&quot;abc&quot;</ETag>'
+    '</CompleteMultipartUploadResult>'
+).encode('utf-8')
+
+
+async def register_commit(provider, body, status=200):
+    """Answer the real presigned CompleteMultipartUpload URL with ``body``."""
+    return await register_presigned(
+        provider, 'POST', 'complete_multipart_upload', path=COMMIT_PATH.path,
+        query_parameters={'UploadId': 'SESSION'}, default_params=True,
+        body=body, status=status)
+
+
+async def commit(provider):
+    await provider._complete_multipart_upload(COMMIT_PATH, 'SESSION', [{'ETAG': 'abc'}])
+
+
 class TestCompleteMultipartUpload:
     """K-1 / K-3: committing a multi-part upload."""
 
@@ -3210,16 +3234,16 @@ class TestCompleteMultipartUpload:
         assembly fails part way through, because the status line is already on the wire by then.
         ``expects=(200, 201)`` reads that as a completed upload."""
         provider = raw_provider(auth, credentials, settings)
-        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
         body = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<Error><Code>InternalError</Code>'
                 '<Message>We encountered an internal error. Please try again.</Message>'
                 '</Error>').encode('utf-8')
-        aiohttpretty.register_uri('POST', SIGNED_URL, body=body, status=200)
 
-        with pytest.raises(exceptions.UploadError) as e:
-            await provider._complete_multipart_upload(
-                WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+        with frozen_signing_clock():
+            await register_commit(provider, body)
+
+            with pytest.raises(exceptions.UploadError) as e:
+                await commit(provider)
 
         assert 'InternalError' in e.value.message
         assert_no_secrets(e.value)
@@ -3230,17 +3254,76 @@ class TestCompleteMultipartUpload:
                                                             mock_time):
         """K-3: the success body must still be accepted."""
         provider = raw_provider(auth, credentials, settings)
-        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
-        body = ('<?xml version="1.0" encoding="UTF-8"?>'
-                '<CompleteMultipartUploadResult>'
-                '<Location>https://that-kerning.s3.amazonaws.com/my-subfolder/thefile.txt</Location>'
-                '<Bucket>that-kerning</Bucket><Key>my-subfolder/thefile.txt</Key>'
-                '<ETag>&quot;abc&quot;</ETag>'
-                '</CompleteMultipartUploadResult>').encode('utf-8')
-        aiohttpretty.register_uri('POST', SIGNED_URL, body=body, status=200)
 
-        await provider._complete_multipart_upload(
-            WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
+        with frozen_signing_clock():
+            await register_commit(provider, COMMIT_SUCCESS_BODY)
+            await commit(provider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('label,body', [
+        ('an empty Error element',
+         b'<?xml version="1.0" encoding="UTF-8"?><Error/>'),
+        ('an Error that is not an element',
+         b'<?xml version="1.0" encoding="UTF-8"?><Error>failure</Error>'),
+        ('an Error with no Code',
+         b'<?xml version="1.0" encoding="UTF-8"?><Error><Message>no</Message></Error>'),
+        ('a body that is not XML',
+         b'<html><body>502 Bad Gateway</body></html>'),
+        ('a truncated body',
+         b'<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Loc'),
+        ('an empty body', b''),
+        ('a result with no ETag',
+         b'<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult>'
+         b'<Bucket>that-kerning</Bucket></CompleteMultipartUploadResult>'),
+        ('an unknown root element',
+         b'<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult>'
+         b'<UploadId>SESSION</UploadId></InitiateMultipartUploadResult>'),
+    ])
+    async def test_complete_rejects_a_200_that_does_not_report_success(self, auth, credentials,
+                                                                       settings, mock_time,
+                                                                       label, body):
+        """CX1-4 / K-3: only a ``CompleteMultipartUploadResult`` carrying an ``ETag`` says the
+        object was assembled.  Everything else here reached ``isinstance(error, dict)``, found
+        no dict, and returned as if the upload had completed -- the user is told the file is
+        there and it is not.
+
+        NOTE_SEMANTICS_DESIGN v2.2 §2 wants "2xx *and* a well-formed body" before a commit
+        counts as done; a body nobody can read is not evidence either way, so these are UNKNOWN
+        and the notice has to be on them.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await register_commit(provider, body)
+
+            with pytest.raises(exceptions.UploadError) as e:
+                await commit(provider)
+
+        assert pd_provider._is_commit_outcome_unknown(e.value), label
+        assert provider._commit_outcome_note(e.value), label
+        assert_no_secrets(e.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_complete_keeps_classifying_a_rejection_it_can_read(self, auth, credentials,
+                                                                       settings, mock_time):
+        """CX1-4: tightening the success gate must not turn a readable rejection into UNKNOWN.
+        ``EntityTooSmall`` is the one code in DEFINITIVE_REJECTION_CODES that was actually
+        observed on a commit, so the commit did not happen and the user must not be told it
+        may have."""
+        provider = raw_provider(auth, credentials, settings)
+        body = (b'<?xml version="1.0" encoding="UTF-8"?>'
+                b'<Error><Code>EntityTooSmall</Code></Error>')
+
+        with frozen_signing_clock():
+            await register_commit(provider, body)
+
+            with pytest.raises(exceptions.UploadError) as e:
+                await commit(provider)
+
+        assert 'EntityTooSmall' in e.value.message
+        assert provider._commit_outcome_note(e.value) == ''
 
     @pytest.mark.asyncio
     async def test_chunked_upload_says_so_when_the_abort_succeeded(self, auth, credentials,
