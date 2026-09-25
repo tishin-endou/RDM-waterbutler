@@ -3948,14 +3948,15 @@ class TestChunkedUploadWireQuery:
     the merge.  These tests use a real socket and read the query the server received.
     """
 
-    async def _capture(self, provider, method, path, call):
+    async def _capture(self, provider, method, path, call, body=b''):
         """Run ``call`` against a loopback server and return the query string it received."""
         seen = {}
 
         async def handler(request):
             await request.read()
             seen['query'] = request.query_string
-            return web.Response(status=200, headers={'ETag': '"d41d8cd98f00b204e9800998ecf8"'})
+            return web.Response(status=200, body=body,
+                                headers={'ETag': '"d41d8cd98f00b204e9800998ecf8"'})
 
         app = web.Application()
         app.router.add_route(method, '/{tail:.*}', handler)
@@ -3964,6 +3965,20 @@ class TestChunkedUploadWireQuery:
             await call(path)
 
         return parse.parse_qs(seen['query'], keep_blank_values=True)
+
+    @staticmethod
+    def _folded_counts(query):
+        """How many times each parameter was sent, with the case of its name folded away.
+
+        CL 所見 1: ``parse_qs`` keys on the exact name, so counting under one catches only a
+        duplicate spelled the same way as the original.  A ``params={'PartNumber': ...}`` beside
+        a signed ``partNumber`` is the same bug -- two entries in the canonical query string and
+        so the same ``SignatureDoesNotMatch`` -- and would read as a pass.
+        """
+        counts = {}
+        for name, values in query.items():
+            counts[name.lower()] = counts.get(name.lower(), 0) + len(values)
+        return counts
 
     @pytest.mark.asyncio
     async def test_part_request_sends_each_parameter_once(self, auth, credentials, settings):
@@ -3982,7 +3997,10 @@ class TestChunkedUploadWireQuery:
         assert query['uploadId'] == ['SESSION']
         # The signature is signed over the canonical query; a duplicate breaks it even when
         # the two values agree, so the count is the thing to assert, not the value.
-        assert len(query['X-Amz-Signature']) == 1
+        counts = self._folded_counts(query)
+        assert counts['partnumber'] == 1
+        assert counts['uploadid'] == 1
+        assert counts['x-amz-signature'] == 1
 
     @pytest.mark.asyncio
     async def test_list_parts_request_sends_each_parameter_once(self, auth, credentials,
@@ -3999,7 +4017,30 @@ class TestChunkedUploadWireQuery:
                                     list_parts)
 
         assert query['uploadId'] == ['SESSION']
-        assert len(query['X-Amz-Signature']) == 1
+        counts = self._folded_counts(query)
+        assert counts['uploadid'] == 1
+        assert counts['x-amz-signature'] == 1
+
+    @pytest.mark.asyncio
+    async def test_create_session_request_sends_each_parameter_once(self, auth, credentials,
+                                                                    settings):
+        """CL 所見 1: ``uploads`` is what makes the POST an initiate, and it is in the signed
+        URL already.  It carries no value, so a second copy of it is invisible to a check that
+        reads ``query['uploads']`` -- and still breaks the signature.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        async def create_session(path):
+            await provider._create_upload_session(path)
+
+        query = await self._capture(
+            provider, 'POST', WaterButlerPath('/my-subfolder/f.txt'), create_session,
+            body=b'<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult>'
+                 b'<UploadId>SESSION</UploadId></InitiateMultipartUploadResult>')
+
+        counts = self._folded_counts(query)
+        assert counts['uploads'] == 1
+        assert counts['x-amz-signature'] == 1
 
     @pytest.mark.asyncio
     async def test_uploading_parts_logs_nothing_at_error_level(self, auth, credentials, settings,
