@@ -419,6 +419,28 @@ def redirect_presigned_origin(provider, origin):
     provider.generate_generic_presigned_url = _redirected
 
 
+def record_request_urls(provider):
+    """Record the URL of every request ``provider`` makes, without changing any of them.
+
+    T-1 / CX1-11: this is a spy, not a stand-in.  The real ``make_request`` runs, so the request
+    still goes out over the session that ``aiohttpretty`` is standing in for; the wrapper only
+    keeps a copy of the URL the real presigner produced, which is the only way to read the query
+    that actually went on the wire byte for byte (``aiohttpretty`` hands back a ``furl`` whose
+    arguments are already decoded).
+
+    :return: the list of requested URLs, in order
+    """
+    requested = []
+    real_make_request = provider.make_request
+
+    async def _recording(method, url, *args, **kwargs):
+        requested.append(url)
+        return await real_make_request(method, url, *args, **kwargs)
+
+    provider.make_request = _recording
+    return requested
+
+
 class TestRegionDetection:
 
     @pytest.mark.asyncio
@@ -2866,6 +2888,47 @@ class TestObjectVersionsPaging:
             versions = await provider.get_object_versions({'Prefix': 'f/'})
 
         assert [item['Key'] for item in versions] == ['f/a+b', 'f/x y.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_version_id_marker_is_resumed_verbatim(self, auth, credentials, settings):
+        """CX2-1 / 決定-23: ``EncodingType=url`` covers the key names, not the version ids.
+
+        S3 percent-encodes what it derived from a key -- ``Key``, ``Prefix``, ``Delimiter``,
+        ``KeyMarker``/``NextKeyMarker`` -- because those are the values a key name can make
+        unreadable.  A version id is an opaque identifier that S3 minted itself, so it comes back
+        exactly as it must be sent again; decoding one asks to resume from a different version.
+        A ``%`` in it is the case that separates the two rules, and this pins both in a single
+        request: the key marker is decoded, the version id marker is not.
+
+        The pre-fix form of the second request is registered as well, so that decoding the
+        version id fails on the assertion below -- which names the value that was sent -- rather
+        than on ``aiohttpretty``'s "No URLs matching", which would say only that some URL
+        differed.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        requested = record_request_urls(provider)
+        page_two_body = list_versions_response(versions=[('f%2Fb', 'version-two')])
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('f%2Fa', 'v%2Fid')], is_truncated=True,
+                                       next_key_marker='f%2Fa',
+                                       next_version_id_marker='v%2Fid'),
+                Prefix='f/')
+            await self._register_versions(provider, page_two_body, Prefix='f/',
+                                          KeyMarker='f/a', VersionIdMarker='v%2Fid')
+            await self._register_versions(provider, page_two_body, Prefix='f/',
+                                          KeyMarker='f/a', VersionIdMarker='v/id')
+
+            versions = await provider.get_object_versions({'Prefix': 'f/'})
+
+        assert [item['Key'] for item in versions] == ['f/a', 'f/b']
+        assert len(requested) == 2
+        query = parse.parse_qs(parse.urlsplit(requested[1]).query)
+        assert query['key-marker'] == ['f/a']
+        assert query['version-id-marker'] == ['v%2Fid']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty

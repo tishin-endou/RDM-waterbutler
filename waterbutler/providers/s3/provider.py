@@ -485,15 +485,17 @@ class S3Provider(provider.BaseProvider):
     def _decoder_for(result):
         """GRDM: the rule for reading key names out of ``result``.
 
-        botocore asks every listing for ``encoding-type=url``, so S3 answers with the keys,
-        prefixes and markers percent-encoded and says so in ``EncodingType``.  Decoding has to
-        follow what the response declares rather than being assumed: a bucket that answers
-        without ``EncodingType`` is reporting the names verbatim, and decoding those would
-        corrupt any key that legitimately contains a ``%``.
+        botocore asks every listing for ``encoding-type=url``, so S3 answers with the values it
+        derived from key names -- the keys, the prefixes and the key markers -- percent-encoded,
+        and says so in ``EncodingType``.  Decoding has to follow what the response declares
+        rather than being assumed: a bucket that answers without ``EncodingType`` is reporting
+        the names verbatim, and decoding those would corrupt any key that legitimately contains
+        a ``%``.  Values S3 minted itself -- a version id, a continuation token -- are opaque
+        and are not encoded, so this decoder is not theirs to apply.
 
-        A marker matters twice over.  It is read out of one response and sent back as a query
-        parameter on the next request, where the signer encodes it again -- so a marker kept
-        encoded is asked for as ``f%252Fa%252Bb`` and the page is never found.
+        A key marker matters twice over.  It is read out of one response and sent back as a
+        query parameter on the next request, where the signer encodes it again -- so a marker
+        kept encoded is asked for as ``f%252Fa%252Bb`` and the page is never found.
 
         :param dict result: the parsed listing
         :return: a callable that turns a value from ``result`` back into the name
@@ -683,7 +685,10 @@ class S3Provider(provider.BaseProvider):
             next_version_id_marker = result.get('NextVersionIdMarker')
             query_parameters['KeyMarker'] = decode(next_key_marker)
             if next_version_id_marker:
-                query_parameters['VersionIdMarker'] = decode(next_version_id_marker)
+                # GRDM: a version id is opaque and is not covered by `EncodingType=url`, which
+                # encodes only what S3 derived from a key name -- decoding one would resume from
+                # a version that does not exist.
+                query_parameters['VersionIdMarker'] = next_version_id_marker
             else:
                 query_parameters.pop('VersionIdMarker', None)
 
