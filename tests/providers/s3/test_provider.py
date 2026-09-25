@@ -375,6 +375,28 @@ async def register_presigned(provider, http_method, s3_method, path='', query_pa
     return url
 
 
+def redirect_presigned_origin(provider, origin):
+    """Send the provider's presigned requests to ``origin`` instead of to S3.
+
+    T-1 / CX1-11: this is not a stand-in for the presigner.  The real
+    ``generate_generic_presigned_url`` runs and its output is kept whole -- path, query,
+    signature -- with only the scheme and host rewritten.  The endpoint the provider signs
+    against is hard-coded to ``s3[.<region>].amazonaws.com``, and a test cannot listen there;
+    redirecting the origin is the only way to put the presigner's own query on a real socket.
+    Nothing that uses this checks the signature, which the rewritten host would invalidate.
+    """
+    real = provider.generate_generic_presigned_url
+    prefix = parse.urlsplit(origin)[:2]
+
+    async def _redirected(path, method='head_object', query_parameters=None,
+                          default_params=True):
+        url = await real(path, method, query_parameters=query_parameters,
+                         default_params=default_params)
+        return parse.urlunsplit(prefix + parse.urlsplit(url)[2:])
+
+    provider.generate_generic_presigned_url = _redirected
+
+
 class TestRegionDetection:
 
     @pytest.mark.asyncio
@@ -2668,13 +2690,14 @@ def assert_no_secrets(exc):
     assert leaked == [], 'exception exposes {}'.format(leaked)
 
 
-class commit_server:
-    """An ``aiohttp.web`` server that accepts a single commit.
+class local_server:
+    """An ``aiohttp.web`` server bound to a loopback port, tied to ``provider``'s sessions.
 
     Ported from ``tests/providers/s3compatsigv4/test_provider.py`` (PR #98).
-    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so the redirect
-    following that happens *inside* that call cannot be reproduced with it, and pinning it
-    needs a real socket.
+    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so anything that
+    happens *inside* that call -- redirect following, and the merge of a URL's query with
+    ``make_request``'s ``params=`` -- cannot be observed with it.  Pinning those needs a
+    real socket.
 
     Startup and teardown are owned here.  With ``runner.setup()`` through URL assembly left
     outside the ``finally``, a failure after the server started would carry a listening
@@ -3133,6 +3156,74 @@ class TestCompleteMultipartUpload:
         assert 'The upload is aborted.' not in e.value.message
 
 
+class TestChunkedUploadWireQuery:
+    """R-6 / U-9 / CX1-2: what the part, abort and list-parts requests put on the wire.
+
+    A presigned URL already carries every parameter it was signed over.  Passing the same
+    parameters again as ``make_request(params=...)`` does not overwrite them: ``ClientRequest``
+    *extends* the URL's query, so the request goes out with each one twice.  S3 answers a
+    duplicated query parameter with ``SignatureDoesNotMatch`` -- the signature covers the
+    canonical query string, which no longer matches -- so every chunked upload of a file
+    larger than one part fails.
+
+    ``aiohttpretty`` cannot show this: it replaces ``ClientSession._request``, which is above
+    the merge.  These tests use a real socket and read the query the server received.
+    """
+
+    async def _capture(self, provider, method, path, call):
+        """Run ``call`` against a loopback server and return the query string it received."""
+        seen = {}
+
+        async def handler(request):
+            await request.read()
+            seen['query'] = request.query_string
+            return web.Response(status=200, headers={'ETag': '"d41d8cd98f00b204e9800998ecf8"'})
+
+        app = web.Application()
+        app.router.add_route(method, '/{tail:.*}', handler)
+        async with local_server(provider, app) as server:
+            redirect_presigned_origin(provider, server.url)
+            await call(path)
+
+        return parse.parse_qs(seen['query'], keep_blank_values=True)
+
+    @pytest.mark.asyncio
+    async def test_part_request_sends_each_parameter_once(self, auth, credentials, settings):
+        """CX1-2: ``partNumber`` and ``uploadId`` are in the signed URL, so ``_upload_part``
+        must not add them a second time.  On ``ca65500e`` both arrive twice."""
+        provider = raw_provider(auth, credentials, settings)
+        stream = streams.StringStream(b'abcdefghij')
+
+        async def upload(path):
+            await provider._upload_part(stream, path, 'SESSION', 1, 10)
+
+        query = await self._capture(provider, 'PUT', WaterButlerPath('/my-subfolder/f.txt'),
+                                    upload)
+
+        assert query['partNumber'] == ['1']
+        assert query['uploadId'] == ['SESSION']
+        # The signature is signed over the canonical query; a duplicate breaks it even when
+        # the two values agree, so the count is the thing to assert, not the value.
+        assert len(query['X-Amz-Signature']) == 1
+
+    @pytest.mark.asyncio
+    async def test_list_parts_request_sends_each_parameter_once(self, auth, credentials,
+                                                                settings):
+        """CL m-2: ``_list_uploaded_chunks`` passes ``params=headers`` -- an empty dict that
+        reads as a copy-paste of the headers argument.  It adds nothing today; the assertion
+        is that the request carries the signed query and only that."""
+        provider = raw_provider(auth, credentials, settings)
+
+        async def list_parts(path):
+            await provider._list_uploaded_chunks(path, 'SESSION')
+
+        query = await self._capture(provider, 'GET', WaterButlerPath('/my-subfolder/f.txt'),
+                                    list_parts)
+
+        assert query['uploadId'] == ['SESSION']
+        assert len(query['X-Amz-Signature']) == 1
+
+
 class TestCommitPreconditions:
     """K-5 / 決定-12: the commit has to be sent exactly once.
 
@@ -3177,7 +3268,7 @@ class TestCommitPreconditions:
         ``allow_redirects=True``, so two commit POSTs go out without spending any of core's
         retry budget.
 
-        ``aiohttpretty`` cannot pin this; see ``commit_server``."""
+        ``aiohttpretty`` cannot pin this; see ``local_server``."""
         calls = []
 
         async def first(request):
@@ -3204,7 +3295,7 @@ class TestCommitPreconditions:
         app.router.add_post('/second', second)
 
         provider = raw_provider(auth, credentials, settings)
-        async with commit_server(provider, app) as server:
+        async with local_server(provider, app) as server:
             provider.generate_generic_presigned_url = MockCoroutine(return_value=server.url)
             with pytest.raises(exceptions.UploadError):
                 await provider._complete_multipart_upload(
