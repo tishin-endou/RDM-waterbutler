@@ -2169,16 +2169,34 @@ class TestCreateFolder:
 class TestOperations:
 
     @pytest.mark.asyncio
-    async def test_get_object_versions_adds_bucket_to_presigned_params(self, provider):
-        provider.generate_generic_presigned_url = MockCoroutine(return_value='http://example.com')
-        provider.make_request = MockCoroutine(return_value=MockS3Response())
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_adds_bucket_to_presigned_params(self, provider, mock_time):
+        """The caller passes only a ``Prefix``.  ``Bucket`` has to be filled in here because
+        ListObjectVersions is signed over its parameters -- a missing bucket is not a default
+        botocore supplies later, the call fails to sign.
+
+        T-1 / CX1-11: asserted against the URL the real presigner produced and the request that
+        was actually made with it, rather than against the arguments it was called with.  In a
+        signed URL the bucket is the path and the prefix is a query parameter, so a test that
+        only inspects the call arguments cannot tell a bucket that was signed in from one that
+        was dropped on the way.
+        """
+        use_real_presigner(provider)
+        url = await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': provider.bucket_name, 'Prefix': 'my-image.jpg',
+                              'Delimiter': '/'},
+            body=list_versions_response(), status=200)
 
         await provider.get_object_versions({'Prefix': 'my-image.jpg', 'Delimiter': '/'})
 
-        _, kwargs = provider.generate_generic_presigned_url.call_args
-        assert kwargs['query_parameters']['Bucket'] == provider.bucket_name
-        assert kwargs['query_parameters']['Prefix'] == 'my-image.jpg'
-        assert kwargs['default_params'] is False
+        assert aiohttpretty.has_call(method='GET', uri=url)
+        split = parse.urlsplit(url)
+        assert split.path == '/{}'.format(provider.bucket_name)
+        assert 'versions' in split.query
+        query = parse.parse_qs(split.query)
+        assert query['prefix'] == ['my-image.jpg']
+        assert query['delimiter'] == ['/']
 
     @pytest.mark.asyncio
     async def test_intra_copy(self, provider, file_metadata_object, mock_time):
@@ -3093,11 +3111,15 @@ def arrange_chunked_commit(provider, aborted=True):
     ``_complete_multipart_upload`` itself is deliberately left real:
     NOTE_SEMANTICS_DESIGN v2.2 §4-2d -- a test that judges the notice must not mock any of
     the code that decides it.  The injection goes to the boundary below (``make_request``).
+
+    T-1 / CX1-11: which is also why the presigner is no longer stood in for here.  The commit
+    signs a URL on its way to the ``make_request`` that ``arrange_commit_failure`` replaces, so
+    the real presigner runs and its output is simply not read -- a stub bought nothing, and left
+    a signing failure invisible to the whole notice matrix.
     """
     provider._create_upload_session = MockCoroutine(return_value='SESSION')
     provider._upload_parts = MockCoroutine(return_value=[{'ETAG': 'abc'}])
     provider._abort_chunked_upload = MockCoroutine(return_value=aborted)
-    provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
 
 
 def arrange_commit_failure(provider, transport, error_code):
@@ -3780,14 +3802,21 @@ class TestCommitPreconditions:
     async def test_commit_is_sent_exactly_once(self, auth, credentials, settings, mock_time,
                                                status):
         """Counting the POSTs pins that ``retry=0`` takes effect.  Inspecting the caller only
-        pins that it is written down."""
+        pins that it is written down.
+
+        T-1 / CX1-11: the URL being counted is the one the real presigner produced for this
+        commit, not a constant.  ``retry_on`` matches on the status, but core's retry re-sends
+        the *same* URL, so answering the real one is what makes "exactly once" a statement
+        about the commit request rather than about a string the test chose.
+        """
         provider = raw_provider(auth, credentials, settings)
-        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
         error_body = ('<?xml version="1.0" encoding="UTF-8"?>'
                       '<Error><Code>SlowDown</Code>'
                       '<Message>Please reduce your request rate.</Message></Error>')
-        aiohttpretty.register_uri('POST', SIGNED_URL, status=status,
-                                  body=error_body.encode('utf-8'))
+        await register_presigned(
+            provider, 'POST', 'complete_multipart_upload',
+            path='my-subfolder/thefile.txt', query_parameters={'UploadId': 'SESSION'},
+            default_params=True, status=status, body=error_body.encode('utf-8'))
 
         with pytest.raises(exceptions.UploadError):
             await provider._complete_multipart_upload(
@@ -3808,7 +3837,20 @@ class TestCommitPreconditions:
         ``allow_redirects=True``, so two commit POSTs go out without spending any of core's
         retry budget.
 
-        ``aiohttpretty`` cannot pin this; see ``local_server``."""
+        ``aiohttpretty`` cannot pin this; see ``local_server``.
+
+        T-1 / CX1-11: the first route is mounted on the path the real presigner signed, and the
+        request reaches it through ``redirect_presigned_origin`` -- only the scheme and host are
+        rewritten, because a test cannot listen on ``s3.amazonaws.com``.  So what the redirect is
+        offered is the commit's own URL, and a signing change that moved the path would be a
+        failure here rather than a test quietly measuring a constant.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        commit_url = await provider.generate_generic_presigned_url(
+            'my-subfolder/thefile.txt', method='complete_multipart_upload',
+            query_parameters={'UploadId': 'SESSION'})
+        commit_path = parse.urlsplit(commit_url).path
+
         calls = []
 
         async def first(request):
@@ -3831,19 +3873,18 @@ class TestCommitPreconditions:
                      '</Error>')
 
         app = web.Application()
-        app.router.add_post('/first', first)
+        app.router.add_post(commit_path, first)
         app.router.add_post('/second', second)
 
-        provider = raw_provider(auth, credentials, settings)
         async with local_server(provider, app) as server:
-            provider.generate_generic_presigned_url = MockCoroutine(return_value=server.url)
+            redirect_presigned_origin(provider, server.url)
             with pytest.raises(exceptions.UploadError):
                 await provider._complete_multipart_upload(
                     WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
 
         # Exactly one commit POST.  A second one records ``/second``, so a failure here shows
         # how far the request got.
-        assert calls == ['/first']
+        assert calls == [commit_path]
 
     @pytest.mark.asyncio
     async def test_commit_request_states_both_preconditions(self, auth, credentials, settings,
@@ -3852,9 +3893,11 @@ class TestCommitPreconditions:
         through their effect.  The two counting tests above go through aiohttp, so a future
         change that keeps the observable single-send by accident -- core dropping the retry
         loop, say -- would leave them green while the commit stopped declaring what it needs.
+
+        T-1 / CX1-11: ``make_request`` is the boundary being watched, so the presigner above it
+        is left real -- its URL is signed and then simply not sent anywhere.
         """
         provider = raw_provider(auth, credentials, settings)
-        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
         provider.make_request = MockCoroutine(
             side_effect=exceptions.UploadError('nope', code=500))
 
