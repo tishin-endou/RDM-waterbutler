@@ -749,15 +749,27 @@ class S3Provider(provider.BaseProvider):
         """
         await self._check_region()
         exists = await dest_provider.exists(dest_path)
-        region_name = {"region_name": self.region} if self.region else {}
+
+        # GRDM (CX1-7 / 決定-20): signed by the *destination*, which is what the docstring above
+        # promises and what develop does -- it builds the URL from `dest_provider`'s key.  Signing
+        # with the source's key instead made the documented permission useless: granting the
+        # destination read access to the source did nothing, and what the copy actually needed
+        # was for the source to be able to write to the destination -- the opposite grant, which
+        # nothing tells an operator to make.  The region travels with the credentials: SigV4
+        # signs the region into the scope and the host into the request, and CopyObject is a
+        # write to the destination bucket, so a destination outside the source's region would
+        # otherwise be signed for the wrong one and refused before the object was ever read.
+        await dest_provider._check_region()
+        region = dest_provider.region
+        region_name = {"region_name": region} if region else {}
         # GRDM: pinned to the regional endpoint -- see `generate_generic_presigned_url`.
-        endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
+        endpoint_url = {'endpoint_url': f'https://s3.{region}.amazonaws.com'} if region else {'endpoint_url': 'https://s3.amazonaws.com'}
 
         session = get_session()
         async with session.create_client(
                 's3',
-                aws_secret_access_key=self.aws_secret_access_key,
-                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=dest_provider.aws_secret_access_key,
+                aws_access_key_id=dest_provider.aws_access_key_id,
                 **region_name,
                 **endpoint_url
         ) as s3_client:
