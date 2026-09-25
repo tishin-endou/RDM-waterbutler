@@ -804,7 +804,23 @@ class S3Provider(provider.BaseProvider):
             # behind, are two different questions.  The notice goes between the failure
             # sentence and the abort outcome so that both reach the user.
             note = self._commit_outcome_note(err)
-            aborted = await self._abort_chunked_upload(path, session_upload_id)
+            # GRDM (CX1-5): `_abort_chunked_upload` answers `False` only when it read the
+            # storage's replies and parts were still there.  Every other way it goes wrong --
+            # the DELETE answering 404, 403 or 500 -- leaves `make_request` raising, and that
+            # exception used to replace both `msg` and `note`, so a failed cleanup was all the
+            # user heard about.  A 404 `NoSuchUpload` here is the worst cell of that: it is
+            # what S3 says once the UploadId is consumed, which is the case where the commit
+            # did succeed and the user most needs to be told to go and look.
+            #
+            # An abort that raised cleaned nothing up, so it is reported as `False`.
+            try:
+                aborted = await self._abort_chunked_upload(path, session_upload_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as abort_err:
+                logger.error('Multi-part upload failed to abort: upload_id={} error={} {}'.format(
+                    session_upload_id, type(abort_err).__name__, getattr(abort_err, 'code', '')))
+                aborted = False
             if not aborted:
                 abort_message = '  The abort action failed to clean up the temporary file ' \
                                 'parts generated during the upload process.  Please ' \
