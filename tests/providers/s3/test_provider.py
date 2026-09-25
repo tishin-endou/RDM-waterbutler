@@ -7,6 +7,7 @@ import base64
 import asyncio
 import hashlib
 import inspect
+import logging
 import aiohttp
 import datetime
 import traceback
@@ -2396,6 +2397,36 @@ class TestIntraCopy:
         assert 'AccessDenied' in exc_info.value.message
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('error', [
+        botocore.exceptions.EndpointConnectionError(endpoint_url='https://s3.amazonaws.com'),
+        botocore.exceptions.ReadTimeoutError(endpoint_url='https://s3.amazonaws.com'),
+        botocore.exceptions.ParamValidationError(report='Key must be a string'),
+        aiohttp.ClientPayloadError('the response body ended early'),
+    ])
+    async def test_intra_copy_converts_every_failure_botocore_can_raise(
+            self, provider, file_metadata_object, mock_time, error):
+        """CX1-8 / K-7 / K-8: ``ClientError`` is the one failure that means "S3 answered".  The
+        endpoint being unreachable, the read timing out, a parameter failing validation before
+        anything is sent and the body ending early are the ordinary rest, and each one used to
+        travel out of ``intra_copy`` unconverted -- reaching the API layer as a bare 500 whose
+        message is botocore's own, which names the endpoint.
+
+        The other five aiobotocore call sites already catch ``Exception``; this is the sixth.
+        """
+        dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
+        patcher, client = patch_aiobotocore_client(
+            copy_object=MockCoroutine(side_effect=error))
+
+        with patcher:
+            with pytest.raises(exceptions.IntraCopyError) as exc_info:
+                await provider.intra_copy(dest_provider, WaterButlerPath('/source'),
+                                          WaterButlerPath('/dest'))
+
+        assert type(error).__name__ in exc_info.value.message
+        assert_no_secrets(exc_info.value)
+        assert_context_suppressed(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_intra_copy_error_message_omits_provider_detail(self, provider,
                                                                   file_metadata_object,
                                                                   mock_time):
@@ -3107,88 +3138,253 @@ class TestErrorReporting:
         assert e.value.message == 'CopyObject failed: ClientError InternalError'
         assert e.value.code == 500
 
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_delete_folder_reports_a_failed_listing_as_a_delete_failure(
+            self, auth, credentials, settings, mock_time):
+        """CX1-13 / K-12: a folder delete that cannot list what to delete is a delete failure.
+
+        The listing is made with ``throws=DownloadError``, and nothing between there and the
+        caller changes it: the user asked to delete a folder and is told a download went wrong,
+        with a status borrowed from an operation they did not ask for.  K-12's "core handles it"
+        holds only while the error carries no ``data``; S3 answers this with a readable XML body,
+        so ``exception_from_response`` puts its prose -- request id and host id included -- into
+        ``message`` and core hands that straight back.
+
+        T-1 / CX1-11: signed by the real presigner, injected at the HTTP boundary.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        path = WaterButlerPath('/doomed-folder/')
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<Error><Code>AccessDenied</Code>'
+                '<Message>Access Denied</Message>'
+                '<RequestId>REQ123</RequestId><HostId>HOST456</HostId></Error>').encode('utf-8')
+
+        with frozen_signing_clock():
+            await register_presigned(
+                provider, 'GET', 'list_object_versions',
+                query_parameters={'Bucket': 'that-kerning', 'Prefix': 'doomed-folder/'},
+                body=body, status=403, headers={'Content-Type': 'application/xml'})
+
+            with pytest.raises(exceptions.DeleteError) as e:
+                await provider.delete(path)
+
+        assert e.value.code == 403
+        assert 'DownloadError' in e.value.message
+        assert 'REQ123' not in e.value.message
+        assert 'HOST456' not in e.value.message
+        assert_no_secrets(e.value)
+        assert_context_suppressed(e.value)
+
 
 class TestResponseParsing:
-    """K-10: what each XML shape the provider can be handed turns into."""
+    """K-10 / CX1-10: what each XML shape the provider can be handed turns into.
+
+    Every case here is a 200.  That is the point: the body is the only thing that says what
+    happened, so a shape the provider cannot read has to become an error rather than an empty
+    answer.  An empty folder listing and an unreadable one look identical to the caller, and
+    ``_delete_folder`` acts on the difference -- "no versions under this prefix" is how it
+    decides there is nothing to purge.
+
+    T-1 / CX1-11: signed by the real presigner, injected at the HTTP boundary.
+    """
+
+    FOLDER_PARAMS = {'Bucket': 'that-kerning', 'Prefix': 'my-subfolder/'}
+    VERSION_PARAMS = {'Bucket': 'that-kerning', 'Prefix': 'my-image.jpg'}
+
+    async def _register_folder(self, provider, body):
+        return await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=dict(self.FOLDER_PARAMS), body=body, status=200,
+            headers={'Content-Type': 'application/xml'})
+
+    async def _register_versions(self, provider, body):
+        return await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters=dict(self.VERSION_PARAMS), body=body, status=200,
+            headers={'Content-Type': 'application/xml'})
+
+    async def _register_once(self, provider, s3_method, params, body):
+        """Answer the presigned URL exactly once.
+
+        The truncation cases below are about a listing loop that cannot move on.  Registering a
+        single answer makes the second, identical request raise out of ``aiohttpretty`` instead
+        of being served again, so a loop that fails to terminate shows up as a failure that can
+        be measured rather than as a test run that never ends.
+        """
+        return await register_presigned(
+            provider, 'GET', s3_method, query_parameters=dict(params),
+            responses=[{'body': body, 'status': 200,
+                        'headers': {'Content-Type': 'application/xml'}}])
+
+    async def _list_folder(self, provider):
+        return await provider.get_folder_metadata('my-subfolder/',
+                                                  dict(self.FOLDER_PARAMS))
+
+    async def _list_versions(self, provider):
+        return await provider.get_object_versions(dict(self.VERSION_PARAMS))
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_listing_rejects_an_unrecognised_root_element(self, provider, mock_time):
+    async def test_folder_listing_rejects_an_unrecognised_root_element(self, auth, credentials,
+                                                                       settings, mock_time):
         """K-10: ``doc.get('ListBucketResult', {})`` answers ``{}`` for any body whose root
         element is not spelled exactly that -- a namespace-prefixed one, say -- and an empty
         listing is indistinguishable from an empty folder.  Fail closed instead."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
         body = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<s3:ListBucketResult xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">'
                 '<s3:IsTruncated>false</s3:IsTruncated>'
                 '<s3:Contents><s3:Key>my-subfolder/thefile.txt</s3:Key></s3:Contents>'
                 '</s3:ListBucketResult>').encode('utf-8')
-        aiohttpretty.register_uri('GET', objects_url(Prefix='my-subfolder/'), body=body,
-                                  status=200)
 
-        with pytest.raises(exceptions.DownloadError):
-            await provider.get_folder_metadata('my-subfolder/', {'Prefix': 'my-subfolder/'})
+        with frozen_signing_clock():
+            await self._register_folder(provider, body)
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_folder(provider)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_version_listing_rejects_an_unrecognised_root_element(self, provider, mock_time):
+    async def test_version_listing_rejects_an_unrecognised_root_element(self, auth, credentials,
+                                                                        settings, mock_time):
         """K-10: the same shape on the versions listing decides what a delete purges.  An empty
         list means "nothing to delete", so a delete would report success having removed nothing."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
         body = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<s3:ListVersionsResult xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">'
                 '<s3:IsTruncated>false</s3:IsTruncated>'
                 '</s3:ListVersionsResult>').encode('utf-8')
-        aiohttpretty.register_uri('GET', versions_url(Bucket='that-kerning',
-                                                      Prefix='my-image.jpg'),
-                                  body=body, status=200)
 
-        with pytest.raises(exceptions.DownloadError):
-            await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+        with frozen_signing_clock():
+            await self._register_versions(provider, body)
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_versions(provider)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_listing_accepts_a_whitespace_formatted_body(self, provider, mock_time):
+    async def test_folder_listing_accepts_a_whitespace_formatted_body(self, auth, credentials,
+                                                                      settings, mock_time):
         """K-10: indentation between the elements must not change the result."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
         body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n'
                 '  <IsTruncated>false</IsTruncated>\n'
                 '  <Contents>\n    <Key>my-subfolder/thefile.txt</Key>\n  </Contents>\n'
                 '</ListBucketResult>\n').encode('utf-8')
-        aiohttpretty.register_uri('GET', objects_url(Prefix='my-subfolder/'), body=body,
-                                  status=200)
 
-        contents, prefixes, token = await provider.get_folder_metadata(
-            'my-subfolder/', {'Prefix': 'my-subfolder/'})
+        with frozen_signing_clock():
+            await self._register_folder(provider, body)
+            contents, prefixes, token = await self._list_folder(provider)
 
         assert [item['Key'] for item in contents] == ['my-subfolder/thefile.txt']
         assert token == ''
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_listing_accepts_a_single_contents_element(self, provider, mock_time):
+    async def test_folder_listing_accepts_a_single_contents_element(self, auth, credentials,
+                                                                    settings, mock_time):
         """K-10: xmltodict collapses a lone repeated element to a dict rather than a
         one-element list."""
-        install_query_encoding_presigned_url(provider)
-        aiohttpretty.register_uri(
-            'GET', objects_url(Prefix='my-subfolder/'),
-            body=list_objects_v2_response(['my-subfolder/thefile.txt']), status=200)
+        provider = raw_provider(auth, credentials, settings)
 
-        contents, prefixes, token = await provider.get_folder_metadata(
-            'my-subfolder/', {'Prefix': 'my-subfolder/'})
+        with frozen_signing_clock():
+            await self._register_folder(
+                provider, list_objects_v2_response(['my-subfolder/thefile.txt']))
+            contents, prefixes, token = await self._list_folder(provider)
 
         assert [item['Key'] for item in contents] == ['my-subfolder/thefile.txt']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_listing_rejects_an_empty_body(self, provider, mock_time):
+    async def test_folder_listing_rejects_an_empty_body(self, auth, credentials, settings,
+                                                        mock_time):
         """K-10: an empty 200 must not read as an empty folder."""
-        install_query_encoding_presigned_url(provider)
-        aiohttpretty.register_uri('GET', objects_url(Prefix='my-subfolder/'), body=b'', status=200)
+        provider = raw_provider(auth, credentials, settings)
 
-        with pytest.raises(exceptions.DownloadError):
-            await provider.get_folder_metadata('my-subfolder/', {'Prefix': 'my-subfolder/'})
+        with frozen_signing_clock():
+            await self._register_folder(provider, b'')
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_folder(provider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('element', ['Contents', 'CommonPrefixes'])
+    async def test_folder_listing_rejects_a_scalar_where_elements_belong(
+            self, auth, credentials, settings, mock_time, element):
+        """CX1-10: failing closed on the root element alone stops one step short.  xmltodict
+        renders ``<Contents>text</Contents>`` as a string, and iterating a string yields its
+        characters -- ``'t'.get('Key')`` is an ``AttributeError``, which escapes the provider
+        as a bare 500 saying nothing.  The shape is unreadable for the same reason the root
+        element was, so it fails the same way."""
+        provider = raw_provider(auth, credentials, settings)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<ListBucketResult><IsTruncated>false</IsTruncated>'
+                '<{0}>a stray string</{0}></ListBucketResult>'.format(element)).encode('utf-8')
+
+        with frozen_signing_clock():
+            await self._register_folder(provider, body)
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_folder(provider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    @pytest.mark.parametrize('element', ['Version', 'DeleteMarker'])
+    async def test_version_listing_rejects_a_scalar_where_elements_belong(
+            self, auth, credentials, settings, mock_time, element):
+        """CX1-10: the same on the listing a folder delete is built from."""
+        provider = raw_provider(auth, credentials, settings)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<ListVersionsResult><IsTruncated>false</IsTruncated>'
+                '<{0}>a stray string</{0}></ListVersionsResult>'.format(element)).encode('utf-8')
+
+        with frozen_signing_clock():
+            await self._register_versions(provider, body)
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_versions(provider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_folder_listing_rejects_a_truncation_it_cannot_resume(self, auth, credentials,
+                                                                        settings, mock_time):
+        """CX1-10: ``IsTruncated`` true with no ``NextContinuationToken`` leaves the loop with
+        nothing to change, so it re-sends the identical request for ever.  Neither that nor
+        quietly returning the first page is safe -- the caller would take a partial listing for
+        the whole folder -- so it fails closed."""
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_once(
+                provider, 'list_objects_v2', self.FOLDER_PARAMS,
+                list_objects_v2_response(['my-subfolder/a.txt'], is_truncated=True))
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_folder(provider)
+
+        assert len(aiohttpretty.calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_version_listing_rejects_a_truncation_it_cannot_resume(self, auth, credentials,
+                                                                         settings, mock_time):
+        """CX1-10: the versions listing stopped quietly instead, which is worse than it sounds
+        -- ``_delete_folder`` deletes exactly what this returns, so a folder delete would
+        report success having purged only the first page and left the rest behind."""
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_once(
+                provider, 'list_object_versions', self.VERSION_PARAMS,
+                list_versions_response([('my-image.jpg', 'v1')], is_truncated=True))
+
+            with pytest.raises(exceptions.DownloadError):
+                await self._list_versions(provider)
+
+        assert len(aiohttpretty.calls) == 1
 
 
 COMMIT_PATH = WaterButlerPath('/my-subfolder/thefile.txt')
@@ -3419,6 +3615,29 @@ class TestChunkedUploadWireQuery:
 
         assert query['uploadId'] == ['SESSION']
         assert len(query['X-Amz-Signature']) == 1
+
+    @pytest.mark.asyncio
+    async def test_uploading_parts_logs_nothing_at_error_level(self, auth, credentials, settings,
+                                                                caplog):
+        """CL M-2: ``_upload_parts`` opens with ``logger.error('_upload_parts')``.
+
+        Every multi-part upload that goes perfectly emits an ERROR saying only the name of the
+        method it is in.  That is what an alert routes on and what an operator reads first, so a
+        marker left in from debugging turns the ERROR level into noise and buries the failures
+        this provider does report there.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        stream = streams.StringStream(b'abcdefghij')
+
+        async def upload(path):
+            with caplog.at_level(logging.INFO, logger='waterbutler.providers.s3.provider'):
+                await provider._upload_parts(stream, path, 'SESSION')
+
+        await self._capture(provider, 'PUT', WaterButlerPath('/my-subfolder/f.txt'), upload)
+
+        errors = [record.getMessage() for record in caplog.records
+                  if record.levelno >= logging.ERROR]
+        assert errors == []
 
 
 class TestCommitPreconditions:
