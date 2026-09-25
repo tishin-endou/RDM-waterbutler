@@ -792,8 +792,14 @@ class S3Provider(provider.BaseProvider):
         raises FileNotFoundError if the status from S3 is not 200
 
         :param str path: Path to the key you want to download
+        :param bool accept_url: GRDM (G-10): return the presigned URL instead of the bytes, so
+            that the server can redirect the client to S3.  This is the default on the download
+            route -- ``metadata.download_file`` passes ``'direct' not in query`` -- and it is how
+            develop behaves; the file then travels from S3 to the browser without passing through
+            WaterButler at all.
         :param dict \*\*kwargs: Additional arguments that are ignored
-        :rtype: :class:`waterbutler.core.streams.ResponseStreamReader`
+        :rtype: :class:`waterbutler.core.streams.ResponseStreamReader`, or :class:`str` when
+            ``accept_url`` is set
         :raises: :class:`waterbutler.core.exceptions.DownloadError`
         """
 
@@ -814,6 +820,15 @@ class S3Provider(provider.BaseProvider):
         query_parameters['ResponseContentDisposition'] = make_disposition(display_name)
 
         url = await self.generate_generic_presigned_url(path.path, 'get_object', query_parameters=query_parameters)
+
+        if accept_url:
+            # GRDM (G-10): hand the URL over rather than the bytes.  It is signed over the same
+            # parameters the streaming request below would have used -- the version asked for and
+            # the Content-Disposition that names the download -- and expires in
+            # `settings.TEMP_URL_SECS`, so what the client receives is the one object, for a
+            # short while, and not the credentials that reached it.  `range` is not applied here
+            # on purpose: the client re-sends its own Range to S3 when it follows the redirect.
+            return url
 
         resp = await self.make_request(
             'GET',

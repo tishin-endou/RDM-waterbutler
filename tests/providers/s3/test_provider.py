@@ -1634,7 +1634,13 @@ class TestCRUD:
                                           display_name=display_name)
 
         assert isinstance(url, str), 'download streamed instead of answering with a URL'
-        assert url == expected
+        # Compared field by field rather than as a string: the query is a mapping, and the order
+        # the parameters happen to be written in is not part of what S3 is being asked for.  The
+        # signature is in there and is checked like any other field, so a URL signed over
+        # different parameters still fails.
+        assert parse.urlsplit(url)[:3] == parse.urlsplit(expected)[:3]
+        assert (parse.parse_qs(parse.urlsplit(url).query)
+                == parse.parse_qs(parse.urlsplit(expected).query))
         # Nothing was fetched: the point of the redirect is that WaterButler does not carry the
         # bytes.  A request here would mean the file was downloaded once to be handed over.
         assert aiohttpretty.calls == []
