@@ -240,15 +240,26 @@ def objects_url(**params):
     return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
 
 
-def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=None):
-    """Build a ListObjectsV2 response body listing ``keys``."""
+def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=None,
+                             common_prefixes=(), encoding_type='url'):
+    """Build a ListObjectsV2 response body listing ``keys``.
+
+    ``encoding_type`` defaults to ``'url'`` because that is what S3 answers: botocore puts
+    ``encoding-type=url`` on every listing it signs, and S3 echoes the element back to say the
+    key names in the body are percent-encoded.  Pass ``None`` for the bucket that was listed
+    without it.
+    """
     body = '<?xml version="1.0" encoding="UTF-8"?>'
     body += '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
     body += '<Name>that-kerning</Name>'
     body += '<MaxKeys>1000</MaxKeys>'
+    if encoding_type is not None:
+        body += f'<EncodingType>{encoding_type}</EncodingType>'
     body += '<IsTruncated>{}</IsTruncated>'.format('true' if is_truncated else 'false')
     if next_continuation_token is not None:
         body += f'<NextContinuationToken>{next_continuation_token}</NextContinuationToken>'
+    for prefix in common_prefixes:
+        body += f'<CommonPrefixes><Prefix>{prefix}</Prefix></CommonPrefixes>'
     for key in keys:
         body += ('<Contents>'
                  f'<Key>{key}</Key>'
@@ -262,14 +273,18 @@ def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=N
 
 
 def list_versions_response(versions=(), delete_markers=(), is_truncated=False,
-                           next_key_marker=None, next_version_id_marker=None):
+                           next_key_marker=None, next_version_id_marker=None,
+                           encoding_type='url'):
     """Build a ListObjectVersions response body.
 
     ``versions`` and ``delete_markers`` are iterables of ``(key, version_id)`` pairs.
+    ``encoding_type`` defaults to ``'url'`` -- see :func:`list_objects_v2_response`.
     """
     body = '<?xml version="1.0" encoding="UTF-8"?>'
     body += '<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
     body += '<Name>that-kerning</Name>'
+    if encoding_type is not None:
+        body += f'<EncodingType>{encoding_type}</EncodingType>'
     body += '<IsTruncated>{}</IsTruncated>'.format('true' if is_truncated else 'false')
     if next_key_marker is not None:
         body += f'<NextKeyMarker>{next_key_marker}</NextKeyMarker>'
@@ -1848,12 +1863,15 @@ class TestFolderListingPaging:
         return params
 
     async def _register_page(self, provider, keys, is_truncated=False,
-                             next_continuation_token=None, **extra):
+                             next_continuation_token=None, common_prefixes=(),
+                             encoding_type='url', **extra):
         """Answer the ListObjectsV2 page selected by ``extra`` with a listing of ``keys``."""
         return await register_presigned(
             provider, 'GET', 'list_objects_v2', query_parameters=self._params(**extra),
             body=list_objects_v2_response(keys, is_truncated=is_truncated,
-                                          next_continuation_token=next_continuation_token),
+                                          next_continuation_token=next_continuation_token,
+                                          common_prefixes=common_prefixes,
+                                          encoding_type=encoding_type),
             headers={'Content-Type': 'application/xml'},
         )
 
@@ -1934,6 +1952,38 @@ class TestFolderListingPaging:
 
         assert [item.name for item in result] == ['a.txt', 'b.txt']
         assert not any(isinstance(item, str) for item in result)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_encoded_names_are_decoded(self, auth, credentials, settings):
+        """CX1-3: keys and common prefixes are percent-encoded when the listing says so."""
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a%2Bb.txt', 'darp/x%20y.txt'],
+                                      common_prefixes=['darp%2Fsub%20dir%2F'], MaxKeys=1000)
+            result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert sorted(item.name for item in result) == ['a+b.txt', 'sub dir', 'x y.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_a_listing_that_is_not_encoded_is_read_verbatim(self, auth, credentials,
+                                                                  settings):
+        """CX1-3: ``key.replace('+', ' ')`` is the form-encoding rule, and S3 does not use it.
+
+        Under ``encoding-type=url`` a literal ``+`` arrives as ``%2B`` and a space as ``%20``,
+        so that replace can only ever fire on a name that was *not* encoded -- where it
+        renames the object.  A user who uploads ``a+b.txt`` then cannot download it.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a+b.txt'], encoding_type=None,
+                                      MaxKeys=1000)
+            result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert [item.name for item in result] == ['a+b.txt']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -2586,11 +2636,20 @@ class TestObjectVersionsPaging:
     ListObjectVersions never returns a ``NextContinuationToken``; it continues with
     ``NextKeyMarker``/``NextVersionIdMarker``.  It also reports deleted objects in separate
     ``DeleteMarker`` elements, which the current collector ignores entirely.
+
+    T-1 / CX1-11: every request here is signed by the real presigner, which is also what puts
+    ``encoding-type=url`` on the listing.  The stand-in this class used to install did not,
+    so the encoding half of the contract was invisible to it (CX1-3).
     """
+
+    async def _register_versions(self, provider, body, **params):
+        params.setdefault('Bucket', 'that-kerning')
+        return await register_presigned(provider, 'GET', 'list_object_versions',
+                                        query_parameters=params, body=body, status=200)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_get_object_versions_pages_with_key_marker(self, provider, mock_time):
+    async def test_get_object_versions_pages_with_key_marker(self, auth, credentials, settings):
         """A truncated first page must be continued with KeyMarker/VersionIdMarker.
 
         The first page is registered as a two-element response list rather than as a single
@@ -2599,66 +2658,126 @@ class TestObjectVersionsPaging:
         this test would hang instead of fail.  With the cap, the third request raises
         aiohttpretty's "No responses left." and the test fails in bounded time.
         """
-        install_query_encoding_presigned_url(provider)
-
-        page_one_url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
-        page_two_url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg',
-                                    KeyMarker='my-image.jpg', VersionIdMarker='version-one')
-
+        provider = raw_provider(auth, credentials, settings)
         page_one_body = list_versions_response(versions=[('my-image.jpg', 'version-one')],
                                                is_truncated=True,
                                                next_key_marker='my-image.jpg',
                                                next_version_id_marker='version-one')
-        aiohttpretty.register_uri(
-            'GET', page_one_url,
-            responses=[{'body': page_one_body, 'status': 200},
-                       {'body': page_one_body, 'status': 200}],
-        )
-        aiohttpretty.register_uri(
-            'GET', page_two_url,
-            body=list_versions_response(versions=[('my-image.jpg', 'version-two')]),
-            status=200,
-        )
 
-        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+        with frozen_signing_clock():
+            page_one_url = await register_presigned(
+                provider, 'GET', 'list_object_versions',
+                query_parameters={'Bucket': 'that-kerning', 'Prefix': 'my-image.jpg'},
+                responses=[{'body': page_one_body, 'status': 200},
+                           {'body': page_one_body, 'status': 200}],
+            )
+            page_two_url = await self._register_versions(
+                provider,
+                list_versions_response(versions=[('my-image.jpg', 'version-two')]),
+                Prefix='my-image.jpg', KeyMarker='my-image.jpg',
+                VersionIdMarker='version-one')
 
+            versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+
+        assert page_one_url != page_two_url
         assert [item['VersionId'] for item in versions] == ['version-one', 'version-two']
         assert aiohttpretty.has_call(method='GET', uri=page_two_url)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_get_object_versions_collects_delete_markers(self, provider, mock_time):
+    async def test_encoded_keys_and_markers_are_decoded(self, auth, credentials, settings):
+        """V-1 / V-2 / V-6 / CX1-3: read the key names by the rule the response declares.
+
+        botocore puts ``encoding-type=url`` on every listing it signs, so S3 percent-encodes
+        the key names and the markers that resume from them, and says so with
+        ``<EncodingType>url</EncodingType>``.
+
+        The marker is the sharp edge.  It goes back as a ``KeyMarker`` *parameter*, which the
+        signer percent-encodes on the way out; handing it the already-encoded form asks S3 for
+        a key literally named ``f%2Fa%2Bb``.  No such key exists, so the second page is a
+        listing of something else -- here, a URL nothing answers.
+
+        Equivalence with develop: develop signs with boto2, which sends no ``EncodingType``
+        and gets raw key names back.  The decoded set below, ``f/a+b`` and ``f/x y.txt``, is
+        exactly what develop's ``get_full_revision`` collects from the same bucket, which is
+        the contract this must not change.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('f%2Fa%2Bb', 'version-one')],
+                                       is_truncated=True, next_key_marker='f%2Fa%2Bb',
+                                       next_version_id_marker='version-one'),
+                Prefix='f/')
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('f%2Fx%20y.txt', 'version-two')]),
+                Prefix='f/', KeyMarker='f/a+b', VersionIdMarker='version-one')
+
+            versions = await provider.get_object_versions({'Prefix': 'f/'})
+
+        assert [item['Key'] for item in versions] == ['f/a+b', 'f/x y.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_a_listing_that_is_not_encoded_is_read_verbatim(self, auth, credentials,
+                                                                  settings):
+        """CX1-3: decoding is the response's declaration, not an assumption.
+
+        A bucket listed without ``EncodingType`` answers with the key names as stored, and a
+        key may legitimately contain a percent sign.  Decoding one of those would rename the
+        object -- and a rename in a listing that drives a delete is how the wrong thing gets
+        deleted.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('100%2Fdone.txt', 'version-one')],
+                                       encoding_type=None),
+                Prefix='100')
+
+            versions = await provider.get_object_versions({'Prefix': '100'})
+
+        assert [item['Key'] for item in versions] == ['100%2Fdone.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_collects_delete_markers(self, auth, credentials,
+                                                               settings):
         """Delete markers are versions too and must be collectable for a full purge."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
 
-        url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
-        aiohttpretty.register_uri(
-            'GET', url,
-            body=list_versions_response(versions=[('my-image.jpg', 'version-one')],
-                                        delete_markers=[('my-image.jpg', 'marker-one')]),
-            status=200,
-        )
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                       delete_markers=[('my-image.jpg', 'marker-one')]),
+                Prefix='my-image.jpg')
 
-        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'},
-                                                      include_delete_markers=True)
+            versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'},
+                                                          include_delete_markers=True)
 
         assert sorted(item['VersionId'] for item in versions) == ['marker-one', 'version-one']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_get_object_versions_omits_delete_markers_by_default(self, provider, mock_time):
+    async def test_get_object_versions_omits_delete_markers_by_default(self, auth, credentials,
+                                                                       settings):
         """revisions() must not grow delete markers as a side effect of the fix."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
 
-        url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
-        aiohttpretty.register_uri(
-            'GET', url,
-            body=list_versions_response(versions=[('my-image.jpg', 'version-one')],
-                                        delete_markers=[('my-image.jpg', 'marker-one')]),
-            status=200,
-        )
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                       delete_markers=[('my-image.jpg', 'marker-one')]),
+                Prefix='my-image.jpg')
 
-        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+            versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
 
         assert [item['VersionId'] for item in versions] == ['version-one']
 
