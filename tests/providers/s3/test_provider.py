@@ -11,11 +11,13 @@ import logging
 import aiohttp
 import datetime
 import traceback
+import xmltodict
 import aiohttpretty
 import botocore.auth
 import botocore.exceptions
 from aiohttp import web
 from aiobotocore import session as aiobotocore_session
+from aiobotocore.client import AioBaseClient
 from http import client
 from urllib import parse
 from unittest import mock
@@ -321,17 +323,23 @@ class _OverriddenClientCtx:
 
 
 def patch_aiobotocore_client(**methods):
-    """Let the provider build a *real* aiobotocore client, then replace only ``methods`` on it.
+    """Let the provider build a *real* aiobotocore client, then raise from ``methods`` on it.
 
     T-1 / CX1-11: client creation is not stubbed and ``generate_presigned_url`` is left alone,
     so a provider method that signs a URL on its way to the call under test still signs it with
-    the real presigner -- the earlier version of this helper handed back a bare ``mock.Mock``,
-    which made the presigner return a ``Mock`` too and forced every caller to stub it as well.
-    What is replaced is the single API call whose arguments the test is asserting on.
+    the real presigner.
+
+    T-1 / CX2-3: **failure injection only.**  A method bound here shadows ``_make_api_call``,
+    so nothing below it -- serialisation, signing, the ``needs-retry`` chain, the rest-xml
+    parser -- runs at all.  That is the point when the failure being measured is one the SDK
+    itself raises (a ``ClientError`` the provider has to convert, a cancellation), and it is a
+    hole when the call is expected to succeed: the request S3 would have received is never
+    built, so nothing about it can be asserted.  Success and partial-failure answers therefore
+    belong to ``patch_session_with_before_send``, which replaces the transport and leaves the
+    SDK to run.
 
     :return: ``(patcher, handle)`` -- use the patcher as a context manager; ``handle`` carries
-        the same coroutine objects that were bound onto the client, so
-        ``handle.delete_objects.assert_called_once_with(...)`` reads the real call
+        the same coroutine objects that were bound onto the client
     """
     handle = mock.Mock()
     for name, coroutine in methods.items():
@@ -1165,7 +1173,7 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete(self, provider, mock_time):
+    async def test_delete(self, provider, monkeypatch, mock_time):
         """GRDM: deleting a file purges every version of the key, not only the current one.
 
         A plain DELETE only writes a new delete marker, so the old versions keep occupying the
@@ -1182,22 +1190,60 @@ class TestCRUD:
                 ),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-file', 'VersionId': 'version-two'},
-                                {'Key': 'some-file', 'VersionId': 'version-one'},
-                                {'Key': 'some-file', 'VersionId': 'marker-one'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-file', 'VersionId': 'version-two'},
+                         {'Key': 'some-file', 'VersionId': 'version-one'},
+                         {'Key': 'some-file', 'VersionId': 'marker-one'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_leaves_keys_that_merely_share_the_prefix(self, provider, mock_time):
+    async def test_a_successful_delete_is_a_real_sdk_call(self, provider, monkeypatch, mock_time):
+        """CX2-3 / T-1: a delete that succeeds still runs the SDK end to end.
+
+        The delete tests here used to bind a coroutine over ``delete_objects`` on a real client,
+        which reads like a real call and is not one: ``_make_api_call`` never runs, so nothing is
+        serialised, signed or parsed and the expectations are checked against the dict the
+        provider passed in.  Injecting at ``before-send`` leaves all of that in place.  This
+        counts the operations the client actually dispatched, so re-introducing a client-level
+        stub anywhere in this file would show up here as a zero rather than as a silent loss of
+        coverage.
+        """
+        path = WaterButlerPath('/some-file')
+
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+            body=list_versions_response(versions=[('some-file', 'v1')]),
+            status=200)
+
+        api_calls = []
+        real_make_api_call = AioBaseClient._make_api_call
+
+        async def _counting(client, operation_name, api_params):
+            api_calls.append(operation_name)
+            return await real_make_api_call(client, operation_name, api_params)
+
+        monkeypatch.setattr(AioBaseClient, '_make_api_call', _counting)
+        sent = patch_delete_objects(monkeypatch)
+
+        await provider.delete(path)
+
+        assert api_calls == ['DeleteObjects']
+        assert len(sent) == 1
+        assert b'AWS4-HMAC-SHA256' in sent[0].headers['Authorization']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_delete_file_leaves_keys_that_merely_share_the_prefix(self, provider,
+                                                                        monkeypatch, mock_time):
         """Prefix= is a prefix match, so 'some-file.bak' comes back alongside 'some-file'."""
         path = WaterButlerPath('/some-file')
 
@@ -1209,20 +1255,20 @@ class TestCRUD:
                 ),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-file', 'VersionId': 'version-one'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-file', 'VersionId': 'version-one'}], 'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_on_bucket_without_versioning(self, provider, mock_time):
+    async def test_delete_file_on_bucket_without_versioning(self, provider, monkeypatch,
+                                                            mock_time):
         """V-3: a bucket with versioning disabled reports the single live object with the
         literal version id 'null', which DeleteObjects accepts verbatim."""
         path = WaterButlerPath('/some-file')
@@ -1233,19 +1279,20 @@ class TestCRUD:
                 body=list_versions_response(versions=[('some-file', 'null')]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-file', 'VersionId': 'null'}], 'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-file', 'VersionId': 'null'}], 'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_with_no_versions_makes_no_delete_call(self, provider, mock_time):
+    async def test_delete_file_with_no_versions_makes_no_delete_call(self, provider, monkeypatch,
+                                                                     mock_time):
         """DeleteObjects rejects an empty object list, so there is nothing to send."""
         path = WaterButlerPath('/some-file')
 
@@ -1255,16 +1302,15 @@ class TestCRUD:
                 body=list_versions_response(),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        assert s3_client.delete_objects.called is False
+        await provider.delete(path)
+
+        assert sent == []
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_partial_failure_raises(self, provider, mock_time):
+    async def test_delete_file_partial_failure_raises(self, provider, monkeypatch, mock_time):
         """V-4: DeleteObjects reports per-object failures in the 200 body.  Fail closed, and
         name the objects that survived so the caller can retry them."""
         path = WaterButlerPath('/some-file')
@@ -1276,16 +1322,12 @@ class TestCRUD:
                     versions=[('some-file', 'version-two'), ('some-file', 'version-one')]),
             status=200)
 
-        delete_result = {
-            'Deleted': [{'Key': 'some-file', 'VersionId': 'version-two'}],
-            'Errors': [{'Key': 'some-file', 'VersionId': 'version-one',
-                        'Code': 'AccessDenied', 'Message': 'Access Denied'}],
-        }
-        patcher, _ = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value=delete_result))
-        with patcher:
-            with pytest.raises(exceptions.DeleteError) as exc_info:
-                await provider.delete(path)
+        patch_delete_objects(monkeypatch, _FakeHTTPResponse(200, delete_objects_response(
+            deleted=[('some-file', 'version-two')],
+            errors=[('some-file', 'version-one', 'AccessDenied')])))
+
+        with pytest.raises(exceptions.DeleteError) as exc_info:
+            await provider.delete(path)
 
         message = exc_info.value.message
         assert 'some-file' in message
@@ -1344,7 +1386,7 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_confirm_delete(self, provider, mock_time):
+    async def test_delete_confirm_delete(self, provider, monkeypatch, mock_time):
         path = WaterButlerPath('/')
 
         await register_presigned(
@@ -1354,26 +1396,26 @@ class TestCRUD:
                     versions=[('some-folder/', 'v1'), ('some-folder/file.txt', 'v2')]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            with pytest.raises(exceptions.DeleteError):
-                await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-            assert s3_client.delete_objects.called is False
+        with pytest.raises(exceptions.DeleteError):
+            await provider.delete(path)
 
-            await provider.delete(path, confirm_delete=1)
+        assert sent == []
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-folder/', 'VersionId': 'v1'},
-                                {'Key': 'some-folder/file.txt', 'VersionId': 'v2'}],
-                    'Quiet': False},
+        await provider.delete(path, confirm_delete=1)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-folder/', 'VersionId': 'v1'},
+                         {'Key': 'some-folder/file.txt', 'VersionId': 'v2'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_with_versions(self, provider, mock_time):
+    async def test_delete_folder_with_versions(self, provider, monkeypatch, mock_time):
         """V-6: deleting a folder purges every version and every delete marker under the
         prefix.  Deleting only the live keys leaves the folder's whole history -- and the
         storage it occupies -- behind on a versioned bucket.
@@ -1390,22 +1432,22 @@ class TestCRUD:
                 ),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'folder-to-delete/file1.txt', 'VersionId': '111'},
-                                {'Key': 'folder-to-delete/file1.txt', 'VersionId': '222'},
-                                {'Key': 'folder-to-delete/file2.txt', 'VersionId': '333'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'folder-to-delete/file1.txt', 'VersionId': '111'},
+                         {'Key': 'folder-to-delete/file1.txt', 'VersionId': '222'},
+                         {'Key': 'folder-to-delete/file2.txt', 'VersionId': '333'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_single_item_folder_delete(self, provider, mock_time):
+    async def test_single_item_folder_delete(self, provider, monkeypatch, mock_time):
         path = WaterButlerPath('/single-thing-folder/')
 
         await register_presigned(
@@ -1414,20 +1456,20 @@ class TestCRUD:
                 body=list_versions_response(versions=[('single-thing-folder/item', 'v1')]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'single-thing-folder/item', 'VersionId': 'v1'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'single-thing-folder/item', 'VersionId': 'v1'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_empty_folder_delete(self, provider, mock_time):
+    async def test_empty_folder_delete(self, provider, monkeypatch, mock_time):
         """V-6: an empty folder still exists as the 0-byte ``prefix/`` key, which is one
         version of its own.  Deleting it must remove that key, not report the folder missing.
         """
@@ -1439,19 +1481,19 @@ class TestCRUD:
                 body=list_versions_response(versions=[('empty-folder/', 'v1')]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'empty-folder/', 'VersionId': 'v1'}], 'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'empty-folder/', 'VersionId': 'v1'}], 'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_not_found(self, provider, mock_time):
+    async def test_delete_folder_not_found(self, provider, monkeypatch, mock_time):
         """V-6: a prefix with neither a version nor a delete marker under it is a folder that
         does not exist, and must not be reported as a successful delete."""
         path = WaterButlerPath('/not-found-folder/')
@@ -1462,17 +1504,16 @@ class TestCRUD:
                 body=list_versions_response(),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            with pytest.raises(exceptions.NotFoundError):
-                await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        assert s3_client.delete_objects.called is False
+        with pytest.raises(exceptions.NotFoundError):
+            await provider.delete(path)
+
+        assert sent == []
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_of_delete_markers_only(self, provider, mock_time):
+    async def test_delete_folder_of_delete_markers_only(self, provider, monkeypatch, mock_time):
         """V-6: a folder whose keys have all been delete-marked still has versions to purge."""
         path = WaterButlerPath('/tombstone-folder/')
 
@@ -1483,20 +1524,20 @@ class TestCRUD:
                     delete_markers=[('tombstone-folder/file1.txt', '111')]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'tombstone-folder/file1.txt', 'VersionId': '111'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'tombstone-folder/file1.txt', 'VersionId': '111'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_large_folder_delete(self, provider, mock_time):
+    async def test_large_folder_delete(self, provider, monkeypatch, mock_time):
         """DeleteObjects takes at most 1000 objects per call."""
         path = WaterButlerPath('/some-folder/')
 
@@ -1507,12 +1548,11 @@ class TestCRUD:
                 body=list_versions_response(versions=[(key, 'v1') for key in keys]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        batches = [call[1]['Delete']['Objects'] for call in s3_client.delete_objects.call_args_list]
+        await provider.delete(path)
+
+        batches = [sent_delete_objects(request)[1]['Objects'] for request in sent]
         assert [len(batch) for batch in batches] == [1000, 1]
         assert [entry['Key'] for batch in batches for entry in batch] == keys
 
@@ -1556,7 +1596,7 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_truncated_response(self, provider, mock_time):
+    async def test_delete_folder_truncated_response(self, provider, monkeypatch, mock_time):
         """V-6: a folder holding more than one page of versions must be listed to the end
         before any of it is deleted, otherwise the tail of the folder silently survives.
         ListObjectVersions resumes from the last key *and* version id, not a continuation
@@ -1579,22 +1619,22 @@ class TestCRUD:
             body=list_versions_response(versions=[('large-folder/file2.txt', '222')]),
             status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
+
+        await provider.delete(path)
 
         assert aiohttpretty.has_call(method='GET', uri=page_two_url)
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'large-folder/file1.txt', 'VersionId': '111'},
-                                {'Key': 'large-folder/file2.txt', 'VersionId': '222'}],
-                    'Quiet': False},
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'large-folder/file1.txt', 'VersionId': '111'},
+                         {'Key': 'large-folder/file2.txt', 'VersionId': '222'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_delete_partial_failure_raises(self, provider, mock_time):
+    async def test_folder_delete_partial_failure_raises(self, provider, monkeypatch, mock_time):
         """V-4, folder side: refusals reported inside the 200 body must not read as success."""
         path = WaterButlerPath('/error-folder/')
 
@@ -1605,16 +1645,12 @@ class TestCRUD:
                                                       ('error-folder/file2.txt', '222')]),
             status=200)
 
-        delete_result = {
-            'Deleted': [{'Key': 'error-folder/file1.txt', 'VersionId': '111'}],
-            'Errors': [{'Key': 'error-folder/file2.txt', 'VersionId': '222',
-                        'Code': 'AccessDenied', 'Message': 'Access Denied'}],
-        }
-        patcher, _ = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value=delete_result))
-        with patcher:
-            with pytest.raises(exceptions.DeleteError) as exc_info:
-                await provider.delete(path)
+        patch_delete_objects(monkeypatch, _FakeHTTPResponse(200, delete_objects_response(
+            deleted=[('error-folder/file1.txt', '111')],
+            errors=[('error-folder/file2.txt', '222', 'AccessDenied')])))
+
+        with pytest.raises(exceptions.DeleteError) as exc_info:
+            await provider.delete(path)
 
         assert 'error-folder/file2.txt' in exc_info.value.message
         assert 'AccessDenied' in exc_info.value.message
@@ -2234,7 +2270,7 @@ class TestOperations:
         assert query['delimiter'] == ['/']
 
     @pytest.mark.asyncio
-    async def test_intra_copy(self, provider, file_metadata_object, mock_time):
+    async def test_intra_copy(self, provider, file_metadata_object, monkeypatch, mock_time):
         source_path = WaterButlerPath('/source')
         dest_path = WaterButlerPath('/dest')
 
@@ -2250,23 +2286,24 @@ class TestOperations:
         dest_provider.region = provider.region
         dest_provider._check_region = MockCoroutine()
 
-        # T-1 / CX1-11: this used to hand `get_session` a bare `mock.Mock()`, so no aiobotocore
+        # T-1 / CX2-3: this used to hand `get_session` a bare `mock.Mock()`, so no aiobotocore
         # client was ever built and the CopySource the provider assembles was checked against a
-        # client that would have accepted anything.  `patch_aiobotocore_client` builds the real
-        # client and shadows only `copy_object`, so the arguments asserted below are the ones a
-        # real client received.
-        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+        # client that would have accepted anything.  Injecting at `before-send` instead leaves
+        # the real client to serialise and sign the request, so what is asserted below is the
+        # PUT S3 would have received rather than the dict the provider passed in.
+        sent = patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
 
-        with patcher:
-            metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
+        metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
 
         assert metadata.kind == 'file'
         assert not exists
         provider._check_region.assert_called()
-        client.copy_object.assert_called_once_with(
-            Bucket=provider.bucket_name,
-            Key=dest_path.path,
-            CopySource={'Bucket': provider.bucket_name, 'Key': source_path.path},
+        assert len(sent) == 1
+        assert sent_copy_object(sent[0]) == (
+            provider.bucket_name,
+            dest_path.path,
+            '{}/{}'.format(provider.bucket_name, source_path.path),
         )
 
     @pytest.mark.asyncio
@@ -2483,6 +2520,54 @@ def serve_in_order(*responses):
     return factory
 
 
+def patch_delete_objects(monkeypatch, *responses):
+    """Answer the provider's DeleteObjects calls at the transport boundary.
+
+    Given no ``responses``, every batch is answered with an empty ``DeleteResult`` -- a delete
+    that refused nothing, which is what the calls being asserted on here are about.  Tests that
+    need a refusal pass the bodies themselves.
+
+    :return: the list of sent requests, in order
+    """
+    factory = (serve_in_order(*responses) if responses
+               else lambda: _FakeHTTPResponse(200, delete_objects_response()))
+    return patch_session_with_before_send(monkeypatch, factory, operation='DeleteObjects')
+
+
+def sent_delete_objects(request):
+    """Read a DeleteObjects call back off the wire.
+
+    T-1 / CX2-3: these calls used to be asserted on a coroutine bound over the client, which
+    told the test what the *provider* passed and nothing about what botocore made of it.  The
+    request examined here has been serialised into rest-xml and signed, so an argument the SDK
+    would have dropped or renamed shows up as a difference rather than as a pass.
+
+    :return: ``(bucket, {'Objects': [...], 'Quiet': bool})`` -- the shape ``delete_objects``
+        was called with, so the expectations read the same either side of the move
+    """
+    document = xmltodict.parse(request.body)['Delete']
+    objects = document.get('Object') or []
+    if not isinstance(objects, list):
+        # A single-object batch has no list around it in XML.
+        objects = [objects]
+    return (parse.urlsplit(request.url).path.strip('/'),
+            {'Objects': [dict(entry) for entry in objects],
+             'Quiet': document.get('Quiet') == 'true'})
+
+
+def sent_copy_object(request):
+    """Read a CopyObject call back off the wire.
+
+    The ``CopySource`` dict the client is called with has no wire form of its own: botocore
+    renders it into the single ``x-amz-copy-source`` header, percent-encoding the key.  That
+    rendering is the part a test asserting on the call arguments never saw.
+
+    :return: ``(bucket, key, copy_source)``, ``copy_source`` percent-decoded
+    """
+    bucket, _, key = parse.urlsplit(request.url).path.lstrip('/').partition('/')
+    return bucket, key, parse.unquote(request.headers['x-amz-copy-source'].decode('utf-8'))
+
+
 class TestIntraCopy:
     """I-2〜I-5: the ``intra_copy`` contract and how it reports provider failures."""
 
@@ -2504,14 +2589,14 @@ class TestIntraCopy:
     @pytest.mark.asyncio
     async def test_intra_copy_reports_created_when_dest_is_absent(self, provider,
                                                                   file_metadata_object,
-                                                                  mock_time):
+                                                                  monkeypatch, mock_time):
         """I-5: ``(metadata, created)`` -- ``created`` is True only when nothing was overwritten."""
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
-        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+        patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
 
-        with patcher:
-            metadata_result, created = await provider.intra_copy(
-                dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+        metadata_result, created = await provider.intra_copy(
+            dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
 
         assert created is True
         assert metadata_result is file_metadata_object
@@ -2520,14 +2605,14 @@ class TestIntraCopy:
     @pytest.mark.asyncio
     async def test_intra_copy_reports_not_created_when_dest_exists(self, provider,
                                                                    file_metadata_object,
-                                                                   mock_time):
+                                                                   monkeypatch, mock_time):
         """I-5: an overwrite reports ``created`` False."""
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=True)
-        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+        patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
 
-        with patcher:
-            metadata_result, created = await provider.intra_copy(
-                dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+        metadata_result, created = await provider.intra_copy(
+            dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
 
         assert created is False
         assert metadata_result is file_metadata_object
@@ -2540,7 +2625,7 @@ class TestIntraCopy:
         """
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
         error = make_client_error('AccessDenied', 'Access Denied', 403)
-        patcher, client = patch_aiobotocore_client(
+        patcher, _ = patch_aiobotocore_client(
             copy_object=MockCoroutine(side_effect=error))
 
         with patcher:
@@ -2570,7 +2655,7 @@ class TestIntraCopy:
         The other five aiobotocore call sites already catch ``Exception``; this is the sixth.
         """
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
-        patcher, client = patch_aiobotocore_client(
+        patcher, _ = patch_aiobotocore_client(
             copy_object=MockCoroutine(side_effect=error))
 
         with patcher:
@@ -2595,7 +2680,7 @@ class TestIntraCopy:
             'Access Denied for arn:aws:iam::123456789012:user/some-user',
             403,
         )
-        patcher, client = patch_aiobotocore_client(
+        patcher, _ = patch_aiobotocore_client(
             copy_object=MockCoroutine(side_effect=error))
 
         with patcher:
@@ -2775,7 +2860,7 @@ class TestIntraCopySizeLimit:
     @pytest.mark.aiohttpretty
     async def test_move_over_limit_falls_back_to_copy_then_delete(self, provider, file_content,
                                                                   file_header_metadata,
-                                                                  mock_time):
+                                                                  monkeypatch, mock_time):
         calls = self._spy_on_intra(provider)
         src_url, dest_url = await self._register_copy_traffic(provider, file_content,
                                                               file_header_metadata)
@@ -2786,23 +2871,22 @@ class TestIntraCopySizeLimit:
             provider, 'GET', 'list_object_versions',
             query_parameters={'Bucket': 'that-kerning', 'Prefix': 'source.txt'},
             body=list_versions_response(versions=[('source.txt', 'v1')]), status=200)
-        delete_patcher, delete_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [{'Key': 'source.txt'}]}))
+        deleted = patch_delete_objects(monkeypatch, _FakeHTTPResponse(200, delete_objects_response(
+            deleted=[('source.txt', 'v1')])))
 
-        with delete_patcher:
-            metadata_result, created = await provider.move(
-                provider,
-                WaterButlerPath('/source.txt'),
-                WaterButlerPath('/dest.txt'),
-                handle_naming=False,
-                file_size=provider.FILE_SIZE_INTRA_COPY_LIMIT + 1,
-            )
+        metadata_result, created = await provider.move(
+            provider,
+            WaterButlerPath('/source.txt'),
+            WaterButlerPath('/dest.txt'),
+            handle_naming=False,
+            file_size=provider.FILE_SIZE_INTRA_COPY_LIMIT + 1,
+        )
 
         assert calls['move'] == []
         assert calls['copy'] == []
         assert created is True
         assert metadata_result.kind == 'file'
-        assert delete_client.delete_objects.called
+        assert len(deleted) == 1
 
     @pytest.mark.parametrize('method_name', ['can_intra_copy', 'can_intra_move'])
     @pytest.mark.parametrize('offset,expected', [
