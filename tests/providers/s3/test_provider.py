@@ -2178,8 +2178,8 @@ class TestOperations:
         source_path = WaterButlerPath('/source')
         dest_path = WaterButlerPath('/dest')
 
-        # Mock dest_provider (exists=True → file already at dest, intra_copy returns not True=False)
-        # Original test registered HEAD 200 for dest → exists=True; assert not exists checks False
+        # The destination is a second provider, not the object under test; ``exists=True`` is what
+        # makes ``intra_copy`` report ``created`` False.
         dest_provider = mock.Mock()
         dest_provider.exists = MockCoroutine(return_value=True)
         dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
@@ -2190,27 +2190,20 @@ class TestOperations:
         dest_provider.region = provider.region
         dest_provider._check_region = MockCoroutine()
 
-        # Mock aiobotocore session → client (intra_copy uses copy_object directly)
-        # mock.AsyncMock requires Python 3.8+; use MockCoroutine + inline async ctx manager
-        mock_s3_client = mock.Mock()
-        mock_s3_client.copy_object = MockCoroutine(return_value={})
+        # T-1 / CX1-11: this used to hand `get_session` a bare `mock.Mock()`, so no aiobotocore
+        # client was ever built and the CopySource the provider assembles was checked against a
+        # client that would have accepted anything.  `patch_aiobotocore_client` builds the real
+        # client and shadows only `copy_object`, so the arguments asserted below are the ones a
+        # real client received.
+        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
 
-        class _AsyncClientCtx:
-            async def __aenter__(self_):
-                return mock_s3_client
-            async def __aexit__(self_, *args):
-                return False
-
-        mock_session = mock.Mock()
-        mock_session.create_client = mock.Mock(return_value=_AsyncClientCtx())
-
-        with mock.patch('waterbutler.providers.s3.provider.get_session', return_value=mock_session):
+        with patcher:
             metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
 
         assert metadata.kind == 'file'
         assert not exists
         provider._check_region.assert_called()
-        mock_s3_client.copy_object.assert_called_once_with(
+        client.copy_object.assert_called_once_with(
             Bucket=provider.bucket_name,
             Key=dest_path.path,
             CopySource={'Bucket': provider.bucket_name, 'Key': source_path.path},
