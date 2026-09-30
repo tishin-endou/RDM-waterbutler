@@ -4448,6 +4448,74 @@ class TestCRUD:
         assert aiohttpretty.has_call(method='GET', uri=versions_url, params=params)
         provider.bucket.delete_objects.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_delete_objects_batch_logs_partial_failure(self, provider, caplog):
+        objects = [{'Key': 'f{}'.format(i)} for i in range(3)]
+        provider.bucket.delete_objects = mock.Mock(return_value={
+            'Deleted': [{'Key': 'f0'}],
+            'Errors': [
+                {'Key': 'f1', 'Code': 'AccessDenied'},
+                {'Key': 'f2', 'Code': 'InternalError'},
+            ],
+        })
+        with caplog.at_level(logging.ERROR, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.DeleteError):
+                await provider._delete_objects_batch(objects, 'test')
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert '(test)' in msg
+        assert 'total=3' in msg
+        assert 'failed=2' in msg
+        assert 'f1' in msg
+        assert 'AccessDenied' in msg
+
+    @pytest.mark.asyncio
+    async def test_delete_objects_batch_limits_logged_keys_to_five(self, provider, caplog):
+        objects = [{'Key': 'k{}'.format(i)} for i in range(8)]
+        provider.bucket.delete_objects = mock.Mock(return_value={
+            'Deleted': [],
+            'Errors': [{'Key': 'k{}'.format(i), 'Code': 'X'} for i in range(8)],
+        })
+        with caplog.at_level(logging.ERROR, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.DeleteError):
+                await provider._delete_objects_batch(objects, 'test')
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        msg = records[-1].getMessage()
+        assert 'k4' in msg
+        assert 'k5' not in msg
+
+    @pytest.mark.asyncio
+    async def test_delete_objects_batch_wraps_client_error(self, provider, caplog):
+        from botocore.exceptions import ClientError as BotoClientError
+        provider.bucket.delete_objects = mock.Mock(
+            side_effect=BotoClientError(
+                {'Error': {'Code': 'NoSuchBucket', 'Message': 'secret-url.example.com'}},
+                'DeleteObjects'))
+        with caplog.at_level(logging.ERROR, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.DeleteError) as exc_info:
+                await provider._delete_objects_batch([{'Key': 'x'}], 'test')
+        assert 'ClientError' in str(exc_info.value)
+        assert 'NoSuchBucket' in str(exc_info.value)
+        assert 'secret-url' not in str(exc_info.value)
+        assert exc_info.value.__suppress_context__
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        assert 'botocore error' in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_delete_objects_batch_wraps_botocore_error(self, provider, caplog):
+        from botocore.exceptions import BotoCoreError
+        provider.bucket.delete_objects = mock.Mock(side_effect=BotoCoreError())
+        with caplog.at_level(logging.ERROR, logger=PROVIDER_LOGGER):
+            with pytest.raises(exceptions.DeleteError) as exc_info:
+                await provider._delete_objects_batch([{'Key': 'x'}], 'test')
+        assert 'BotoCoreError' in str(exc_info.value)
+        assert exc_info.value.__suppress_context__
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        assert 'botocore error' in records[0].getMessage()
+
 
 class TestMetadata:
 
