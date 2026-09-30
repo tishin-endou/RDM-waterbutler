@@ -16,15 +16,8 @@ CHUNK_SIZE = int(config.get('CHUNK_SIZE', 64000000))  # 64 MB
 
 CHUNKED_UPLOAD_MAX_ABORT_RETRIES = int(config.get('CHUNKED_UPLOAD_MAX_ABORT_RETRIES', 2))
 
-# S3-compatible storages return different XML error codes when the storage-side
-# quota / capacity has been exhausted.  Well-known ones are listed as defaults:
-# - 'QuotaExceeded': generic S3-compatible storages
-# - 'XMinioAdminBucketQuotaExceeded': MinIO with a bucket quota configured
-# - 'XMinioStorageFull': MinIO when the underlying disk is full (S3 data path)
-# This list is not exhaustive, so ``_translate_upload_error`` additionally
-# treats HTTP 507 as a quota failure regardless of the error code.
-# Deployments can replace this list via the provider config when their storage
-# vendor uses a different error code.
+# Storage-side quota error codes.  Not exhaustive: HTTP 507 is also treated
+# as quota failure.  Deployments can replace this list via provider config.
 QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS = [
     'QuotaExceeded',
     'XMinioAdminBucketQuotaExceeded',
@@ -38,8 +31,6 @@ def _read_error_codes():
         return config.get_object('QUOTA_EXCEEDED_ERROR_CODES',
                                  QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS)
     except (ValueError, TypeError) as err:
-        # ``JSONDecodeError`` is a ``ValueError``.  ``TypeError`` covers a
-        # non-string, non-JSON value arriving from a config file.
         logger.warning('S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES is not valid JSON '
                        '(%s: %s); falling back to the built-in defaults.  A bare error code '
                        'must be quoted, e.g. \'["QuotaExceeded"]\'.',

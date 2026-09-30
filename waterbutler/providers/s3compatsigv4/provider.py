@@ -36,8 +36,6 @@ CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 # assembling anything.  Everything outside this set is treated as UNKNOWN
 # (fail-safe: unnecessary notice > missing notice).  Hardcoded rather than
 # configurable so it cannot drift with the operator-extensible quota list.
-# Only ``EntityTooSmall`` is confirmed against a real storage; the other
-# eight rest on the S3 specification and MinIO's error definitions.
 DEFINITIVE_REJECTION_CODES = frozenset({
     'AccessDenied',
     'InvalidPart',
@@ -68,8 +66,7 @@ def _bounded_body(body):
     return head.encode('utf-8')[:ERROR_BODY_LOG_LIMIT].decode('utf-8', 'ignore')
 
 
-# Sentinel: xmltodict maps empty elements to None, so None alone cannot
-# distinguish "absent" from "present but empty".
+# Sentinel: distinguishes "key absent" from "key present but value empty".
 _MISSING = object()
 
 
@@ -326,11 +323,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         try:
             result = xmltodict.parse(response_body)
         except ExpatError:
-            # Letting ExpatError escape surfaces as a bare HTTP 500 with a
-            # stack trace: ``_translate_upload_error`` has no ``.message`` to
-            # work with on it.  The storage answered unintelligibly, which is
-            # an upstream fault, so report HTTP 502 -- consistently with
-            # ``_create_upload_session``.
+            # Unintelligible response is an upstream fault.
             logger.warning('Couldn\'t parse %s result', s3_api_name)
             raise _mark_storage_response(
                 exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
@@ -1023,15 +1016,14 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             raise
 
         try:
-            # ``read()`` belongs inside the try: a connection dropped mid-body
-            # is exactly what a struggling storage does, and leaving the read
-            # outside meant that case skipped the release entirely.
+            # read() must be inside this try so a mid-body disconnect is
+            # also marked outcome-unknown.
             response_body = await resp.read()
-            # S3 reports failures as HTTP 200 + <Error> body.
+            # 2xx is not proof of success here; inspect the body.
             self._check_for_200_error(response_body, "CompleteMultipartUpload",
                                       exceptions.UploadError)
         except Exception as err:
-            # Broad except: also catches aiohttp errors during resp.read().
+            # Any failure after send is outcome-unknown.
             _mark_commit_outcome_unknown(err)
             raise
         finally:
