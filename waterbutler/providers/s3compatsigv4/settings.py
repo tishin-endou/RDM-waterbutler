@@ -33,30 +33,7 @@ QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS = [
 
 
 def _read_error_codes():
-    """Read the configured error-code list, surviving anything the envvar holds.
-
-    ``get_object`` is required here rather than plain ``get``: ``get`` returns
-    the raw string when the value comes from an envvar, i.e. the *undecoded*
-    JSON text.  A bare ``str`` takes ``_normalise_error_codes``'s scalar
-    branch and becomes ``frozenset({'["QuotaExceeded"]'})``, one entry holding
-    the JSON text itself.  That is worse than substring matching, not better:
-    no storage error code can ever equal it, so quota detection silently stops
-    working everywhere except the HTTP 507 fallback.
-
-    ``SettingsDict.get_object`` calls ``json.loads`` with no ``try``, so an
-    envvar that is not valid JSON raises while this module is being imported.
-    Normalising ``get_object``'s *return value* -- which is what
-    ``_normalise_error_codes`` does -- cannot help, because the argument is
-    evaluated first.
-
-    An import failure here is not the loud failure it looks like.  stevedore
-    turns the entry-point load error into a ``RuntimeError``, which
-    ``waterbutler/core/utils.py`` converts into ``ProviderNotFound``: the
-    process stays up, every other provider keeps working, and s3compatsigv4
-    answers HTTP 404 to everything.  A typo in a quota code would surface as a
-    symptom with no visible connection to its cause.  Falling back to the
-    defaults keeps quota detection working and puts the cause in the log.
-    """
+    """Read the configured error-code list, falling back to defaults on bad JSON."""
     try:
         return config.get_object('QUOTA_EXCEEDED_ERROR_CODES',
                                  QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS)
@@ -71,37 +48,10 @@ def _read_error_codes():
 
 
 def _normalise_error_codes(configured):
-    """Coerce a configured error-code list into a ``frozenset`` of ``str``.
+    """Coerce a configured value into a ``frozenset`` of ``str``.
 
-    ``SettingsDict.get_object`` is ``json.loads`` with no type check
-    (``waterbutler/settings.py``), so the value can decode to any JSON type.
-    The only consumer is a ``code in codes`` membership test, which degrades
-    silently for every type but a collection of strings:
-
-    * a bare ``str`` makes the test substring matching (``'Quota'`` would match
-      a configured ``'QuotaExceeded'``) -- and handing it to ``frozenset``
-      instead explodes it into one entry per character, so nothing matches;
-    * a number is not iterable at all, so ``frozenset`` raises ``TypeError``.
-
-    Normalising here rather than at the point of use is deliberate: this module
-    is the only place the raw configuration exists, so fixing the type here
-    means no caller can observe the un-normalised value.
-
-    A scalar is coerced rather than rejected.  Raising would happen at import
-    time and take the whole provider down over a quota-code typo, which is a
-    far worse outcome than running with the single code the operator meant;
-    the warning is what makes the misconfiguration visible.
-
-    A mapping is rejected rather than coerced.  ``dict`` satisfies ``Iterable``,
-    so it would slip past the scalar branch and be reduced to its *keys* --
-    a result that is indistinguishable from a working configuration until a
-    quota error goes unrecognised in production.  There is no reading of
-    ``{"QuotaExceeded": 507}`` that makes the operator's intent unambiguous.
-
-    ``None`` is treated as "not configured".  JSON ``null`` decodes to it and
-    it is neither a ``Mapping``, a ``str``, nor ``Iterable``, so it used to
-    reach the scalar branch and produce ``frozenset({'None'})`` -- a
-    configuration under which no storage error code can ever match.
+    Scalar and None values are coerced with a warning; mappings fall back to
+    defaults.
     """
     if configured is None:
         return frozenset(QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS)

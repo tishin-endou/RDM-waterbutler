@@ -33,21 +33,7 @@ PROVIDER_LOGGER = pd_provider.__name__
 
 
 def storage_error(message, code=403, exception_type=exceptions.UploadError):
-    """Build the error a storage rejection produces on the upload path.
-
-    In production these errors are born in ``make_request`` (via
-    ``exception_from_response``) and are tagged by ``_make_upload_request`` so
-    that ``_translate_upload_error`` knows the payload is a raw storage
-    response rather than a message WaterButler wrote itself.
-
-    Tests that fake a storage failure above the ``make_request`` boundary have
-    to reproduce that tag, and must do it by calling the provider's own
-    ``_mark_storage_response`` -- re-implementing the tag here would let the
-    test keep passing if the marker were renamed or its semantics changed.
-    An *untagged* error carrying a storage body cannot occur in production, so
-    asserting translation behaviour against one would test a state the
-    provider never actually sees.
-    """
+    """Build a tagged storage-origin UploadError for test injection."""
     return pd_provider._mark_storage_response(exception_type(message, code=code))
 
 
@@ -61,8 +47,6 @@ from waterbutler.providers.s3compatsigv4.metadata import (S3CompatSigV4Revision,
                                                      )
 from hmac import compare_digest
 
-# Invariant: same operation + same observed code -> same verdict on every transport.
-# Unknown/missing codes fall to UNKNOWN (fail-safe: over-report rather than under-report).
 COMMIT_CODE_CASES = [
     ('AccessDenied', False),
     ('InvalidPart', False),
@@ -74,7 +58,7 @@ COMMIT_CODE_CASES = [
     (None, True),
 ]
 
-# Independent copy -- generating from the implementation would let a deleted row delete its own test.
+# Independent copy so a deleted row cannot delete its own test.
 DEFINITIVE_REJECTION_CODES = [
     'AccessDenied',
     'InvalidPart',
@@ -109,14 +93,11 @@ def arrange_commit_failure(provider, transport, error_code):
         provider.make_request = MockCoroutine(side_effect=exceptions.UploadError(
             {'response': commit_error_xml(error_code)}, code=500))
     elif transport == 'complete_200_error':
-        # S3 reports a failed CompleteMultipartUpload as HTTP 200 + <Error>.
         resp = mock.Mock()
         resp.read = MockCoroutine(return_value=commit_error_xml(error_code).encode('utf-8'))
         resp.release = MockCoroutine()
         provider.make_request = MockCoroutine(return_value=resp)
     elif transport == 'disconnect':
-        # Error XML placed in ``message`` on purpose: catches implementations
-        # that read a code from the message fallback instead of a parsed body.
         provider.make_request = MockCoroutine(
             side_effect=aiohttp.ServerDisconnectedError(commit_error_xml(error_code)))
     elif transport == 'broken_xml':
@@ -140,11 +121,7 @@ def arrange_chunked_commit(provider):
 
 
 class commit_server:
-    """Real-socket server for commit tests.
-
-    Needed because ``aiohttpretty`` cannot reproduce redirects, and a real
-    ``ClientResponse`` pins the injection-point premise the mock cells rely on.
-    """
+    """Real-socket test server for commit endpoint tests."""
 
     def __init__(self, provider, app):
         self.provider = provider
@@ -157,7 +134,6 @@ class commit_server:
         try:
             site = web.TCPSite(self.runner, '127.0.0.1', 0)
             await site.start()
-            # Deliberate use of private attr: an AttributeError is better than a silent skip.
             sockets = site._server.sockets
             assert sockets, 'the test server bound no socket'
             self.url = 'http://127.0.0.1:{}/first'.format(sockets[0].getsockname()[1])

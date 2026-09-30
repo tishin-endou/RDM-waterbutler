@@ -29,9 +29,6 @@ from waterbutler.providers.s3compatsigv4.metadata import (
 
 logger = logging.getLogger(__name__)
 
-# Failures that mean "the exchange was cut short" (as opposed to "the storage
-# answered with an error").  ``asyncio.TimeoutError`` is not a subclass of
-# ``aiohttp.ClientError``, so it must be listed explicitly.
 CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
 # Error codes that prove CompleteMultipartUpload was declined *before*
@@ -41,15 +38,15 @@ CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 # Only ``EntityTooSmall`` is confirmed against a real storage; the other
 # eight rest on the S3 specification and MinIO's error definitions.
 DEFINITIVE_REJECTION_CODES = frozenset({
-    'AccessDenied',         # no permission, so the commit never started
-    'InvalidPart',          # the part set does not add up; nothing to assemble
-    'InvalidPartOrder',     # likewise, out of order
-    'EntityTooSmall',       # a non-final part is under the minimum
-    'EntityTooLarge',       # over the size limit; the storage refused it
-    'MalformedXML',         # the commit body was unreadable
-    'SignatureDoesNotMatch',  # rejected at signature verification
-    'InvalidAccessKeyId',   # likewise, at authentication
-    'NoSuchBucket',         # there is nowhere for the object to exist
+    'AccessDenied',
+    'InvalidPart',
+    'InvalidPartOrder',
+    'EntityTooSmall',
+    'EntityTooLarge',
+    'MalformedXML',
+    'SignatureDoesNotMatch',
+    'InvalidAccessKeyId',
+    'NoSuchBucket',
 })
 
 # Upper bound, in bytes, on how much of a raw error body is logged.
@@ -205,15 +202,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     )
 
     async def _make_upload_request(self, *args, **kwargs):
-        """``make_request`` for the upload path, tagging storage-origin failures.
-
-        Every ``UploadError`` that escapes here was built by
-        ``exception_from_response`` from an actual storage response, so it is
-        the raw material ``_translate_upload_error`` is allowed to interpret.
-        Marking at the source keeps that judgement next to the request that
-        justifies it, instead of re-deriving it from the exception's shape at
-        the point of use.
-        """
+        """``make_request`` wrapper that tags storage-origin UploadErrors."""
         try:
             return await self.make_request(*args, **kwargs)
         except exceptions.UploadError as err:
@@ -581,8 +570,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
         # Log the raw diagnostics; the translated error carries only a summary.
         raw_body = self._raw_error_body(err)
-        # ``int()`` keeps the rendering stable across Python versions: before
-        # 3.11 ``'%s' % HTTPStatus.FORBIDDEN`` is ``'HTTPStatus.FORBIDDEN'``.
         status = int(err.code) if isinstance(err.code, int) else err.code
         log = logger.warning if is_quota_error else logger.error
         log('Storage rejected the upload: status=%s code=%s body=%s',
@@ -595,8 +582,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 '{}{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note,
                                   outcome_note, extra_message),
                 code=HTTPStatus.INSUFFICIENT_STORAGE,
-                # Running out of storage is an expected, user-resolvable failure:
-                # keep it out of Sentry's error level and the 5xx alerting path.
                 is_user_error=True,
             )
         if error_code is not None:
@@ -606,7 +591,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     error_code, error_message, outcome_note, extra_message),
                 code=err.code,
             )
-        # Unclassifiable; must not hand raw body back to the caller.
         return exceptions.UploadError(
             '{}{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, outcome_note,
                             extra_message),
@@ -765,15 +749,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         try:
             upload_session_metadata = await resp.read()
         finally:
-            # A storage that is out of room tends to drop the connection
-            # mid-body, and ``read()`` then raises with the connection still
-            # held.  A read failure here means no ``UploadId`` was ever
-            # obtained, so ``_chunked_upload`` returns from its
-            # ``CONNECTION_ERRORS`` handler at step 1 and never aborts anything.
-            # The reason to release is the ordinary one: the connector is
-            # shared, and a leak here is paid for by every later request on this
-            # provider -- the part uploads, the commit, and the abort that a
-            # *later* failure does reach.
             await resp.release()
         try:
             session_data = xmltodict.parse(upload_session_metadata, strip_whitespace=False)
@@ -1039,12 +1014,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     HTTPStatus.CREATED,
                 ),
                 throws=exceptions.UploadError,
-                # retry=0: a re-sent commit consumes the UploadId even if it
-                # fails, so outcome classification becomes meaningless.
-                retry=0,
-                # allow_redirects=False: aiohttp 3.6.2 follows 307/308
-                # redirects by default, which would re-send the POST.
-                allow_redirects=False,
+                retry=0,  # resend consumes the UploadId
+                allow_redirects=False,  # prevent aiohttp from re-sending the POST
             )
         except Exception as err:
             _mark_commit_outcome_unknown(err)
