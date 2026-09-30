@@ -29,10 +29,6 @@ from waterbutler.providers.s3compatsigv4.metadata import (
 
 logger = logging.getLogger(__name__)
 
-# Matches an ``<Error>`` element with or without a namespace prefix, so that
-# namespace-prefixed error documents are not rejected by the cheap pre-filter.
-ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
-
 # Failures that mean "the exchange with the storage was cut short", as opposed
 # to "the storage answered with an error".  ``asyncio.TimeoutError`` is NOT a
 # subclass of ``aiohttp.ClientError``: the whole-request timeout that
@@ -553,44 +549,35 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
     @classmethod
     def _parse_s3_error_body(cls, err):
-        """Extract the S3 XML error ``Code`` and ``Message`` from an
-        :class:`waterbutler.core.exceptions.UploadError` raised by ``make_request``.
+        """Extract the S3 XML error ``Code`` and ``Message`` from *err*.
 
-        :param err: ( :class:`.UploadError` ) The error raised by ``make_request``
         :rtype: tuple(str or None, str or None)
         :return: ``(error_code, error_message)``, or ``(None, None)`` when the
-            response body is not a parsable S3 XML error
+            response body is not a parsable S3 XML error.
         """
         body = cls._raw_error_body(err)
-        if body is None or not ERROR_ELEMENT_RE.search(body):
+        if body is None:
             return None, None
         try:
             parsed = xmltodict.parse(body)
-        except ExpatError:
+        except ExpatError as exc:
+            logger.warning('_parse_s3_error_body: kind=xml_parse_failure '
+                           'exception=%s body=%s',
+                           type(exc).__name__, _bounded_body(body))
             return None, None
         if not isinstance(parsed, dict):
             return None, None
         error = _local_name_lookup(parsed, 'Error')
         if not isinstance(error, dict):
-            # ``<Error>text</Error>`` parses to a plain string, and an empty
-            # document parses to ``None``.  Neither carries an error code.
+            logger.warning('_parse_s3_error_body: kind=error_not_dict '
+                           'body=%s', _bounded_body(body))
             return None, None
         code = _local_name_lookup(error, 'Code')
         message = _local_name_lookup(error, 'Message')
         if not isinstance(code, str) or not code.strip():
-            # An empty ``<Code/>`` is ``None`` and ``<Code attr="..."/>`` is a
-            # dict; without a code there is nothing to translate.
+            logger.warning('_parse_s3_error_body: kind=code_missing '
+                           'body=%s', _bounded_body(body))
             return None, None
-        # The code-matching rule requires surrounding whitespace to be
-        # removed before the code is matched.  ``xmltodict`` 0.9.0 already
-        # strips text nodes, so these ``.strip()`` calls are redundant *today*
-        # and deleting them changes no behaviour; they are kept rather than
-        # removed because the rule must not depend silently on a third party's
-        # default.
-        # ``test_the_xml_parser_is_what_strips_the_code`` watches that default,
-        # so a dependency bump that drops it turns these back into the only
-        # thing holding the rule up instead of quietly breaking the
-        # classification.
         return code.strip(), message.strip() if isinstance(message, str) else None
 
     @classmethod

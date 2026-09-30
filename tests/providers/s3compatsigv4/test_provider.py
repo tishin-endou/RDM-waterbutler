@@ -3317,6 +3317,37 @@ class TestCRUD:
         assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
         assert provider.QUOTA_EXCEEDED_MESSAGE in translated.message
 
+    def test_parse_s3_error_body_logs_xml_parse_failure(self, provider, caplog):
+        err = storage_error({'response': 'not xml at all'}, code=500)
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            provider._parse_s3_error_body(err)
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert 'ExpatError' in msg
+        assert 'xml_parse_failure' in msg
+
+    def test_parse_s3_error_body_logs_error_not_dict(self, provider, caplog):
+        err = storage_error(
+            {'response': '<Error>something went wrong</Error>'}, code=500)
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            provider._parse_s3_error_body(err)
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert 'error_not_dict' in msg
+
+    def test_parse_s3_error_body_logs_code_missing(self, provider, caplog):
+        err = storage_error(
+            {'response': '<Error><Code/><Message>nope</Message></Error>'},
+            code=500)
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            provider._parse_s3_error_body(err)
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert 'code_missing' in msg
+
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_create_session_quota_exceeded(self, provider, file_stream,
