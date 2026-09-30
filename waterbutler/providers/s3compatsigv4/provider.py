@@ -29,39 +29,17 @@ from waterbutler.providers.s3compatsigv4.metadata import (
 
 logger = logging.getLogger(__name__)
 
-# Failures that mean "the exchange with the storage was cut short", as opposed
-# to "the storage answered with an error".  ``asyncio.TimeoutError`` is NOT a
-# subclass of ``aiohttp.ClientError``: the whole-request timeout that
-# ``make_request`` applies (``settings.AIOHTTP_TIMEOUT``, 3600s by default)
-# raises it directly, so it has to be listed explicitly.  This is the exact
-# path taken when a storage stops reading the request body on quota exhaustion
-# and then goes silent.
+# Failures that mean "the exchange was cut short" (as opposed to "the storage
+# answered with an error").  ``asyncio.TimeoutError`` is not a subclass of
+# ``aiohttp.ClientError``, so it must be listed explicitly.
 CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
-# Error codes that mean the storage declined the CompleteMultipartUpload
-# *before* assembling anything, so the object cannot exist.  Everything else --
-# including codes that are not in this table at all, and responses whose code
-# could not be observed -- is treated as UNKNOWN and gets the "it may have
-# completed" notice.
-#
-# The fail-safe points this way on purpose.  An unnecessary notice sends the
-# user to check a file list that turns out not to contain the file: annoying,
-# and they recover on their own.  A missing notice sends them to upload the
-# file a second time when the first one did land, which consumes the quota
-# twice and needs an administrator to undo.  A table that is extended by hand
-# will eventually be out of date, and it has to be out of date in the direction
-# that stays recoverable.
-#
-# Deliberately hardcoded rather than read from ``settings``: the quota codes in
-# ``settings.QUOTA_EXCEEDED_ERROR_CODES`` *are* operator-extensible, and the
-# suppression rule in ``_commit_outcome_note`` depends on the quota branch
-# being evaluated first precisely because the two lists cannot be kept in step.
-# Making this one configurable too would reintroduce that coupling.
-#
-# Only ``EntityTooSmall`` has been confirmed against a real storage (MinIO
-# returned it for CompleteMultipartUpload and the object was absent
-# afterwards); the other eight rest on the S3 specification and MinIO's own
-# error definitions.
+# Error codes that prove CompleteMultipartUpload was declined *before*
+# assembling anything.  Everything outside this set is treated as UNKNOWN
+# (fail-safe: unnecessary notice > missing notice).  Hardcoded rather than
+# configurable so it cannot drift with the operator-extensible quota list.
+# Only ``EntityTooSmall`` is confirmed against a real storage; the other
+# eight rest on the S3 specification and MinIO's error definitions.
 DEFINITIVE_REJECTION_CODES = frozenset({
     'AccessDenied',         # no permission, so the commit never started
     'InvalidPart',          # the part set does not add up; nothing to assemble
@@ -74,35 +52,15 @@ DEFINITIVE_REJECTION_CODES = frozenset({
     'NoSuchBucket',         # there is nowhere for the object to exist
 })
 
-# Upper bound, **in bytes**, on how much of the storage's raw error body is
-# written to the log.  The body is the only place ``RequestId`` / ``Resource``
-# survive once the error has been translated into a summary message, but it must
-# not be unbounded: a misconfigured proxy can answer with a full HTML page.
+# Upper bound, in bytes, on how much of a raw error body is logged.
 ERROR_BODY_LOG_LIMIT = 512
 
 
 def _bounded_body(body):
-    """The leading :data:`ERROR_BODY_LOG_LIMIT` **bytes** of ``body``, as text.
+    """The leading :data:`ERROR_BODY_LOG_LIMIT` bytes of *body*, as text.
 
-    Both log sites go through this so that the bound means the same thing at
-    each.  ``'%.*s'`` counts *characters*, which lets a Japanese error message
-    or a non-ASCII HTML error page through at up to three times the declared
-    size -- the very case the constant's comment is about.
-
-    Bodies arrive as ``bytes`` straight off the wire in one place and as ``str``
-    (already decoded by ``exception_from_response``) in the other, so both are
-    accepted.  Cutting bytes can split a multibyte character, hence ``replace``.
-
-    Cutting the input to the limit is not enough on its own, as measured:
-    ``replace`` substitutes U+FFFD for every byte it cannot decode, and U+FFFD
-    is three bytes of UTF-8, so ``b'\\xff' * 512`` came back as 1536 bytes --
-    three times the declared bound.  The result is
-    therefore **re-measured** after decoding and cut again, on a character
-    boundary (``ignore`` drops the partial character the second cut leaves).
-    The first cut still happens, so a multi-megabyte HTML page is never decoded
-    in full; it is safe because decoding never shrinks a byte string -- valid
-    UTF-8 round-trips and invalid bytes expand -- so a 512-byte prefix always
-    has at least 512 bytes of output to give.
+    Accepts both ``bytes`` and ``str``.  The result is re-measured after
+    decoding to keep the byte bound even when ``replace`` expands invalid bytes.
     """
     if body is None:
         return None
@@ -112,25 +70,14 @@ def _bounded_body(body):
     return head.encode('utf-8')[:ERROR_BODY_LOG_LIMIT].decode('utf-8', 'ignore')
 
 
-# Sentinel for "the key is not in the mapping at all".  ``xmltodict`` maps an
-# empty element to ``None`` (``<Error/>``, ``<Error></Error>`` and
-# ``<Error>   </Error>`` all become ``{'Error': None}``), so ``None`` on its own
-# cannot distinguish "absent" from "present but empty".  Those two must not be
-# conflated: an empty ``<Error>`` element still means the request failed.
+# Sentinel: xmltodict maps empty elements to None, so None alone cannot
+# distinguish "absent" from "present but empty".
 _MISSING = object()
 
 
-# ``_translate_upload_error`` interprets an error by parsing the storage's XML
-# body out of it.  That is only meaningful for errors that actually carry one.
-# WaterButler also raises ``UploadError`` with its own prose -- e.g. the 502
-# ``_create_upload_session`` raises when the session response is unreadable --
-# and those must pass through untouched: parsing them yields "unclassifiable"
-# and the fallback would overwrite the message with a generic one.
-#
-# The distinction is carried explicitly on the exception rather than inferred
-# from its shape.  Inferring it (e.g. "``data`` is a dict, so it must be raw")
-# is not safe: the two kinds are indistinguishable by inspection, so a newly
-# added WaterButler-authored error would silently pick the wrong branch.
+# Explicit flag: only errors carrying a raw storage response body should be
+# parsed for S3 error codes.  WaterButler-authored UploadErrors must not be
+# re-interpreted (they share the same exception type but carry prose, not XML).
 _STORAGE_RESPONSE_FLAG = '_wb_storage_response'
 
 # The failure was observed while committing a multipart upload, so the object
@@ -241,13 +188,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         'interpreted.  Please retry the upload, and contact the storage administrator if the '
         'problem persists.'
     )
-    # A dropped connection is only evidence of exhausted capacity, never proof:
-    # it is just as often a network fault.  Naming both keeps the message from
-    # sending the user off to free up space when nothing is full.
-    # "before the upload completed" was removed deliberately: the same message
-    # is returned when the connection drops while *reading the answer to the
-    # commit*, and there the upload may well have completed.  Asserting the
-    # opposite is what sends the user off to upload the file a second time.
+    # A dropped connection is evidence of exhaustion only when the storage
+    # received enough data; otherwise it is a generic transport failure.
     CONNECTION_INTERRUPTED_MESSAGE = (
         'Upload failed because the connection to the cloud storage was interrupted.  This may '
         'indicate that the storage is full, that its quota has been exceeded, or that there '
@@ -379,24 +321,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         s3_api_name='S3 API',
         exception_type=exceptions.UnhandledProviderError,
     ):
-        """check an S3 API result with http status is 200 OK.
+        """Check an S3 API response for a 200+Error body and raise if found.
 
-        try to parse response body as a xml.
-        if the xml has an 'Error' element then raise an exception.
-
-        The raised exception carries the raw body under ``data['response']``,
-        which is the same shape :func:`.exceptions.exception_from_response`
-        builds for a genuine non-2xx XML response.  Keeping the two shapes
-        identical is what lets ``_translate_upload_error`` recognise a quota
-        failure that S3 reported with HTTP 200 (CompleteMultipartUpload does
-        this) instead of surfacing a bare HTTP 500.
-
-        The check is deliberately *fail-closed*: once an ``Error`` element is
-        seen the operation has failed, so being unable to classify it (empty
-        element, missing ``Code``, unparsable body) still raises.  Returning
-        normally would let ``upload()`` go on to read the *previous* object's
-        metadata and report a successful upload of data that was never
-        committed.
+        Fail-closed: once an ``Error`` element is seen, the operation has
+        failed regardless of whether the code can be classified.
 
         :param str response_body: API response body.
         :param str s3_api_name: S3 API name for logging.
@@ -406,7 +334,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             if isinstance(response_body, bytes) else response_body
 
         try:
-            # memo: If no element, the parser will raise an ExpatError.
             result = xmltodict.parse(response_body)
         except ExpatError:
             # Letting ExpatError escape surfaces as a bare HTTP 500 with a
@@ -430,15 +357,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 error_code = code.strip()
         logger.warning('%s returned with an error: %s', s3_api_name, error_code or 'Unknown')
 
-        # The storage reported a failure inside a 2xx response.  Sending the
-        # request was not something WaterButler got wrong, so the fault is
-        # attributed upstream: HTTP 502 rather than 500.
-        # ``_translate_upload_error`` refines this to 507 when the body turns
-        # out to be a quota rejection.
-        #
-        # The synthesised status carries no information about the outcome, and
-        # it is not asked to: ``_commit_outcome_note`` classifies on the error
-        # code alone, and the code is still in ``body`` for it to read.
         raise _mark_storage_response(
             exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
@@ -584,12 +502,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     def _is_quota_exhaustion(cls, err):
         """Whether ``err`` is the storage reporting that it is out of space.
 
-        ``_translate_upload_error`` and the ``_chunked_upload`` entry log both
-        report the same failure, so they have to agree on this.  When only the
-        translator knew that quota exhaustion is an expected, user-resolvable
-        outcome, the entry log still went out at ERROR and paged oncall every
-        time somebody filled a bucket.
-
         Because the list of vendor-specific quota codes cannot be exhaustive,
         a response that already carries HTTP 507 counts whatever its code is.
         """
@@ -602,37 +514,20 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
     @classmethod
     def _observed_error_code(cls, err):
-        """The S3 error code WaterButler actually *saw*, or ``None``.
-
-        The gate on ``_is_storage_response`` is the point of this helper.
-        ``_raw_error_body`` falls back to ``err.message`` when there is no
-        response payload, and aiohttp's connection errors carry a message of
-        their own -- so without the gate, an exception whose message happened to
-        contain S3-looking XML would be classified as if the storage had
-        answered.  A dropped connection is exactly the case where nothing was
-        observed, and it must not be able to speak for the storage.
+        """The S3 error code from ``err``'s body, gated on the storage-response
+        flag so that connection errors are never misclassified.  Returns
+        ``None`` when the flag is absent or parsing fails.
         """
         if not _is_storage_response(err):
             return None
-        # ``_parse_s3_error_body`` already strips surrounding whitespace, which
-        # covers ``<Code>\n  AccessDenied\n</Code>``.  Case is *not* folded and
-        # the comparison below is exact: S3 error codes are identifiers that
-        # agree between vendors down to the case, and a substring match would
-        # let ``XQuotaExceededFoo`` pass for ``QuotaExceeded``.
         return cls._parse_s3_error_body(err)[0]
 
     @classmethod
     def _commit_outcome(cls, error_code):
         """Whether ``error_code`` proves the commit did not happen.
 
-        ``None`` -- no code, or none that could be read -- is UNKNOWN, as is any
-        code outside :data:`DEFINITIVE_REJECTION_CODES`.
-
-        The two outcomes are named ``NOT_COMMITTED`` and ``UNKNOWN``.  The
-        ``bool`` here is those two names spelled ``True`` and ``False``:
-        ``True`` is NOT_COMMITTED, ``False`` is UNKNOWN.  Kept as a ``bool``
-        because the only caller uses it as a condition, and a string would have
-        to be compared against a constant that a typo could silently defeat.
+        Returns ``True`` (NOT_COMMITTED) when the code is in
+        :data:`DEFINITIVE_REJECTION_CODES`, ``False`` (UNKNOWN) otherwise.
         """
         return error_code is not None and error_code in DEFINITIVE_REJECTION_CODES
 
@@ -640,38 +535,13 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     def _commit_outcome_note(cls, err):
         """The notice to append when the commit's outcome is genuinely unknown.
 
-        The decision is made from the storage's error code alone:
+        Decision order:
 
-        1. **Quota exhaustion suppresses the notice, and is checked first.**
-           Running out of space is the storage refusing to keep the object, so
-           "it may have completed" would contradict the very message it is
-           appended to.  This is not a fallback to the status class -- it is a
-           suppression, and it has to come first because the two lists cannot be
-           kept in step: ``_is_quota_exhaustion`` counts *any* HTTP 507 whatever
-           its code, and operators can extend
-           ``settings.QUOTA_EXCEEDED_ERROR_CODES`` at will, so quota responses
-           routinely carry codes that no hardcoded table knows.  Measured during
-           the design review: 4 of 5 quota-positive inputs were absent from the
-           table, and every one of them produced the self-contradictory message.
-        2. **Otherwise the code decides**, via
-           :data:`DEFINITIVE_REJECTION_CODES`.  Anything else is UNKNOWN.
-
-        The HTTP status class is deliberately *not* consulted.  It cannot carry
-        this: ``_check_for_200_error`` synthesises HTTP 502 for every
-        200-with-``<Error>`` body, which is the shape a failed
-        CompleteMultipartUpload actually takes, so the status says "5xx" for
-        responses the storage was quite definite about.  The rule lives here
-        rather than at each mark site so that the ways a commit can fail cannot
-        drift apart.
-
-        This is sound only because the commit is sent exactly once.  Two things
-        hold that up, and they stop different re-sends: ``retry=0`` stops
-        WaterButler's own retry loop, ``allow_redirects=False`` stops the HTTP
-        client following a 307/308.  Both are in
-        ``_complete_multipart_upload``.  Under either kind of re-send the
-        observed code is the *last* attempt's, and a first attempt that
-        succeeded would come back as ``NoSuchUpload`` -- at which point
-        classifying by code says nothing about the upload.
+        1. Quota exhaustion suppresses the notice (checked first, because the
+           quota code list and the rejection code list cannot be kept in step).
+        2. Otherwise :data:`DEFINITIVE_REJECTION_CODES` decides; anything
+           outside is UNKNOWN.
+        3. UNKNOWN returns the "may have completed" notice.
         """
         if not _is_commit_outcome_unknown(err):
             return ''
@@ -682,18 +552,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         return cls.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
 
     def _translate_upload_error(self, err, extra_message=''):
-        """Translate a raw :class:`.UploadError` from the storage backend into a
-        user-facing error.
+        """Translate a raw :class:`.UploadError` into a user-facing error.
 
-        Storage-side quota exhaustion (e.g. ``QuotaExceeded``) is mapped to HTTP
-        507 (Insufficient Storage) with an explicit message so that the user can
-        tell why and how the upload ended.  Other S3 XML errors are re-raised
-        with a readable message instead of the raw XML body.
-
-        Because the list of vendor-specific quota error codes cannot be
-        exhaustive, a response that already carries HTTP 507 is treated as a
-        quota failure whatever its error code is (or even without a parsable
-        body).
+        Quota exhaustion is mapped to HTTP 507.  Unclassifiable errors get a
+        readable message instead of the raw XML body.
 
         :param err: ( :class:`.UploadError` ) The original error
         :param str extra_message: An optional message appended to the translated
@@ -701,22 +563,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         :rtype: :class:`.UploadError`
         """
         if not _is_storage_response(err):
-            # WaterButler authored this message, so there is no storage body to
-            # interpret and the text is already user-facing.  Parsing it would
-            # yield "unclassifiable" and the fallback below would replace it
-            # with a generic message -- losing, for example, the instruction to
-            # have an administrator remove a stale multipart session.
-            #
-            # This branch is also where an upload call site that forgot
-            # ``_make_upload_request`` would land, and it degrades *quietly* in
-            # two ways at once.  Quota errors would stop becoming 507s -- and,
-            # less visibly, ``_commit_outcome_note`` gates on the same tag, so
-            # the commit notice would stop appearing too: an untagged commit
-            # failure tells the user nothing was stored when nobody knows that.
-            # Neither degradation fails anything.  DEBUG rather than WARNING
-            # because the legitimate case is the common one -- this is a
-            # breadcrumb for whoever is asking why a 507 or a notice did not
-            # happen, not an alert.
+            # WaterButler-authored; no storage body to parse.  Pass through.
             logger.debug('Passing through an untagged upload error unmodified: '
                          'type=%s status=%s', type(err).__name__, err.code)
             if not extra_message:
@@ -724,11 +571,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             return exceptions.UploadError(
                 '{}{}'.format(err.message, extra_message),
                 code=err.code,
-                # Rebuilding the exception must not silently re-classify it.
-                # ``is_user_error`` decides the Sentry level in
-                # ``server/api/v1/core.py``; defaulting it to ``False`` here
-                # would promote a user-caused failure to an error-level event
-                # purely because the abort warning had to be appended.
+                # Preserve is_user_error to avoid re-classifying the Sentry level.
                 is_user_error=err.is_user_error,
             )
 
@@ -736,12 +579,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         is_quota_error = self._is_quota_exhaustion(err)
         outcome_note = self._commit_outcome_note(err)
 
-        # The translated error only carries a summary message, so this is the
-        # single place where the storage's own diagnostics (RequestId, Resource)
-        # can still be recorded.  Both upload paths funnel through here.
-        # Quota exhaustion is logged one level down: it is an expected,
-        # user-resolvable failure and should not trip log-based alerting (the
-        # same reasoning as ``is_user_error`` below).
+        # Log the raw diagnostics; the translated error carries only a summary.
         raw_body = self._raw_error_body(err)
         # ``int()`` keeps the rendering stable across Python versions: before
         # 3.11 ``'%s' % HTTPStatus.FORBIDDEN`` is ``'HTTPStatus.FORBIDDEN'``.
@@ -753,17 +591,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         if is_quota_error:
             code_note = '  (storage error code: {})'.format(error_code) \
                 if error_code is not None else ''
-            # ``outcome_note`` is appended here like everywhere else, and is
-            # always empty on this path -- ``_commit_outcome_note`` suppresses
-            # it for quota exhaustion, first, before consulting the code table.
-            #
-            # Writing it out rather than omitting it is the point.  An earlier
-            # revision suppressed the notice *here* instead, which meant the
-            # rule was enforced in two places and neither could be tested: a
-            # mutation that deleted the quota branch from
-            # ``_commit_outcome_note`` left all tests green, because this
-            # omission silently covered for it.  One suppression, in one place,
-            # that a test can actually reach.
             return exceptions.UploadError(
                 '{}{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note,
                                   outcome_note, extra_message),
@@ -779,14 +606,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     error_code, error_message, outcome_note, extra_message),
                 code=err.code,
             )
-        # Nothing could be classified.  ``err`` must still not be handed back:
-        # ``BaseHandler.write_error`` writes ``exc.data`` verbatim as the
-        # response body when it is set, and falls back to ``exc.message``
-        # otherwise.  For a dict message that body is the storage's raw XML
-        # (Resource paths, RequestId); for the string message that
-        # ``exception_from_response`` builds when there is no body, it is the
-        # presigned URL including its signature.  The raw body is already in
-        # the log above, which is where it belongs.
+        # Unclassifiable; must not hand raw body back to the caller.
         return exceptions.UploadError(
             '{}{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, outcome_note,
                             extra_message),
@@ -812,12 +632,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     async def _contiguous_upload(self, stream, path):
         """Uploads the given stream in one request."""
 
-        # Read the entire stream to compute MD5
         stream_data = await stream.read()
         md5_digest = hashlib.md5(stream_data).digest()
         md5_base64 = base64.b64encode(md5_digest).decode('utf-8')
 
-        # Create a new stream from the data
         upload_stream = streams.StringStream(stream_data)
 
         headers = {
@@ -851,28 +669,13 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 throws=exceptions.UploadError,
             )
         except exceptions.UploadError as err:
-            # Translate storage-side errors (e.g. quota exceeded) into a
-            # user-facing error instead of returning the raw XML body.
-            # ``from None``: the untranslated error is what carries the raw
-            # body, and a chained ``__context__`` puts it straight back into
-            # the rendered traceback.
+            # from None: keep the raw body out of the traceback.
             raise self._translate_upload_error(err) from None
         except CONNECTION_ERRORS as err:
-            # Some S3-compatible storages close the connection while the client
-            # is still sending the request body (e.g. when the storage-side
-            # quota has been exceeded).  Without this handler the raw client
-            # error propagates as an unexplained HTTP 500.
-            # Type only.  aiohttp builds ``ClientOSError(errno, 'Can not write
-            # request body for <url>')`` in ``ClientRequest.write_bytes``, and
-            # for this provider that URL is presigned -- its ``str()`` carries
-            # ``X-Amz-Credential`` and ``X-Amz-Signature``.  A socket dying
-            # mid-body is the event this handler exists for, so rendering the
-            # exception here would put the signature in the log on the common
-            # path, not a rare one.
+            # Storage may close the connection on quota exhaustion.  Log the
+            # error type only (no repr: URLs may contain signatures).
             logger.error('Connection error during contiguous upload: error_type=%s',
                          type(err).__name__)
-            # ``from None`` for the same reason: a chained ``__context__``
-            # renders the original message into the traceback Sentry stores.
             raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
                                          code=HTTPStatus.BAD_GATEWAY) from None
 
@@ -884,40 +687,24 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     async def _chunked_upload(self, stream, path):
         """Uploads the given stream to S3 over multiple chunks"""
 
-        # Step 1. Create a multi-part upload session
         try:
             session_upload_id = await self._create_upload_session(path)
         except exceptions.UploadError as err:
-            # The session has not been created, so there is nothing to abort.
-            # Storage-side quota errors can occur at session creation too.
-            # ``from None``: the untranslated error is what carries the raw
-            # body, and a chained ``__context__`` puts it straight back into
-            # the rendered traceback.
+            # Nothing to abort; translate and propagate.
             raise self._translate_upload_error(err) from None
         except CONNECTION_ERRORS as err:
-            # Type only, and ``from None``: see ``_contiguous_upload``.  The
-            # presigned URL reaches this path exactly the same way.
             logger.error('Connection error during multipart session creation: error_type=%s',
                          type(err).__name__)
             raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
                                          code=HTTPStatus.BAD_GATEWAY) from None
 
         try:
-            # Step 2. Break stream into chunks and upload them one by one
             parts_metadata = await self._upload_parts(stream, path, session_upload_id)
-            # Step 3. Commit the parts and end the upload session
             await self._complete_multipart_upload(path, session_upload_id, parts_metadata)
         except Exception as err:
             msg = 'An unexpected error has occurred during the multi-part upload.'
-            # Type and status only.  ``repr()`` of a WaterButlerError renders
-            # its whole message, and for a dict message that is the storage's
-            # raw body serialised as JSON -- unbounded, and about to be logged
-            # again (bounded) by ``_translate_upload_error``.
             err_code = getattr(err, 'code', None)
-            # Quota exhaustion is expected and the user can resolve it, so it
-            # must not go out at ERROR here after the translator has already
-            # classified it as a warning -- otherwise this line alone keeps
-            # paging oncall.
+            # Quota exhaustion is user-resolvable; log as warning, not error.
             log = logger.warning if self._is_quota_exhaustion(err) else logger.error
             log('%s upload_id=%s error_type=%s error_code=%s', msg, session_upload_id,
                 type(err).__name__,
@@ -925,46 +712,19 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             aborted = await self._abort_chunked_upload(path, session_upload_id)
             abort_message = ''
             if not aborted:
-                # NOTE: this warning must be appended only when the abort has
-                # FAILED.  (An earlier revision appended it on success.)
                 abort_message = '  The abort action failed to clean up the temporary file ' \
                                 'parts generated during the upload process.  Please manually ' \
                                 'remove them.'
             if isinstance(err, exceptions.UploadError):
-                # Preserve the original storage error (status code and body) and
-                # translate quota-exhaustion responses into a user-facing error.
                 raise self._translate_upload_error(
                     err, extra_message=abort_message) from None
             if isinstance(err, CONNECTION_ERRORS):
-                # The notice applies whenever the commit was the request that
-                # dropped -- this is the path a read failure at commit time
-                # takes.  It does not depend on the exception carrying a status:
-                # ``_commit_outcome_note`` consults the S3 error *code* and
-                # nothing else, so a ``ClientResponseError`` with a ``.code`` of
-                # 400, 500 or 507 is treated exactly like a bare
-                # ``ServerDisconnectedError`` (measured).  There is
-                # deliberately no fallback to the HTTP status class.
-                #
-                # ``from None``: aiohttp's message for a mid-body disconnect
-                # embeds the presigned URL, and a chained ``__context__`` would
-                # carry it into the traceback.
                 raise exceptions.UploadError(
                     '{}{}{}'.format(self.CONNECTION_INTERRUPTED_MESSAGE,
                                     self._commit_outcome_note(err), abort_message),
                     code=HTTPStatus.BAD_GATEWAY,
                 ) from None
-            # No ``code=``, so this one defaults to 500 -- not to 502.  The
-            # ``UploadError`` branch above goes through
-            # ``_translate_upload_error``, which keeps the storage's own status
-            # (403 stays 403) and answers 507 for quota exhaustion; only the
-            # ``CONNECTION_ERRORS`` branch is a fixed 502.
-            # The 500 is still deliberate, and for a reason that does not depend
-            # on what the others return: an exception that is neither an
-            # ``UploadError`` (the storage answered) nor a ``CONNECTION_ERRORS``
-            # member (the link failed) did not come from upstream at all -- it
-            # is a defect on this side, and any upstream-attributing status
-            # would blame the storage for it.  Pinned by
-            # ``test_chunked_upload_unexpected_error_is_a_500``.
+            # Unrecognised error; default 500, not 502 (not proven to be upstream).
             raise exceptions.UploadError(
                 '{}{}{}'.format(msg, self._commit_outcome_note(err),
                                 abort_message)) from None
@@ -1017,25 +777,17 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             await resp.release()
         try:
             session_data = xmltodict.parse(upload_session_metadata, strip_whitespace=False)
-            # Session upload id is the only info we need
             session_upload_id = session_data['InitiateMultipartUploadResult']['UploadId']
             if not isinstance(session_upload_id, str) or not session_upload_id.strip():
                 # An empty ``<UploadId/>`` parses to ``None`` and an attribute-only
                 # element to a dict.  Returning either would make every following
                 # request use a bogus upload id.
                 raise ValueError('UploadId is missing or blank')
-            # ``strip_whitespace=False`` keeps the indentation of a
-            # pretty-printed body inside the element, and the id goes straight
-            # into the ``uploadId`` query parameter of every following request
-            # (and into its SigV4 signature).
+            # strip_whitespace=False: the UploadId must not contain surrounding whitespace.
             return session_upload_id.strip()
         except (ExpatError, KeyError, TypeError, ValueError) as err:
-            # The storage returned 200/201 but the body is not the expected XML.
-            # NOTE: at this point a multipart session MAY have been created on
-            # the storage side but its UploadId is unknown, so it cannot be
-            # aborted here.  Log enough information for manual clean-up.
-            # Type only, and the body bounded by the shared constant: a second
-            # hard-coded limit here would drift away from the translator's.
+            # Body was not the expected XML.  The session may exist but its
+            # UploadId is unknown, so it cannot be aborted.
             logger.error('Failed to parse the CreateMultipartUpload response: key=%s '
                          'error_type=%s body=%s', path.full_path, type(err).__name__,
                          _bounded_body(upload_session_metadata))
@@ -1099,22 +851,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
     @staticmethod
     def _log_abort_failure(err, session_upload_id, s3_error_code=None):
-        """Log an abort attempt that failed, by *kind* rather than by content.
+        """Log an abort attempt that failed, by kind rather than by content.
 
-        ``'{!r}'.format(err)`` renders ``WaterButlerError.__repr__``, which
-        embeds the whole message -- and for an error built from a storage
-        response that message is the raw body serialised as JSON.  It is
-        unbounded, it carries the storage's ``Resource`` paths, and it is
-        emitted once per retry.  ``_translate_upload_error`` already logs the
-        body once, bounded by ``ERROR_BODY_LOG_LIMIT``, so repeating it here
-        buys nothing.  The type and status are what actually identify the
-        failure when reading the log.
-
-        Dropping the body still has to leave the log able to say *which* S3
-        error this was.  The caller has already parsed the code to test for
-        ``NoSuchUpload``, so passing it on costs nothing; ``error_code=``
-        then means the same thing here as it does in the entry log, and the
-        HTTP status gets its own name.
+        Avoids repr(err): err.message may contain presigned URLs.
         """
         status = getattr(err, 'code', None)
         logger.error('An unexpected error has occurred during the aborting a multipart '
@@ -1138,34 +877,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     async def _abort_confirmed_by_list_parts(self, path, session_upload_id):
         """Ask LIST PARTS whether an abort that reported ``NoSuchUpload`` took effect.
 
-        This is the same criterion the success path applies, asked of the same
-        endpoint -- the point is precisely that it is *not* the DELETE's own
-        word for it.
-
-        A failure to obtain the answer returns ``False``.  The whole reason this
-        check exists is that declaring success on an unestablished claim is what
-        suppresses the "please remove the parts manually" warning; an
-        unanswerable question has to keep the claim unestablished, not resolve
-        it by default.  The caller then logs and retries, which is what it would
-        have done without this branch at all.
-
-        ``retry=0`` keeps this to exactly one round trip.  ``make_request``
-        would otherwise retry 408/502/503/504 twice, sleeping 2s then 4s, so an
-        unobtainable confirmation would stall the upload's error response for
-        six seconds -- inside a check that falls through to the caller's own
-        retry anyway.
-
-        The bare ``except Exception`` below does swallow
-        ``asyncio.CancelledError``: on Python 3.6 it derives from ``Exception``,
-        not from ``BaseException``, so this clause and the four other broad
-        handlers in this module all catch it.  That is accepted, not overlooked.
-        It is harmless here only because ``waterbutler/`` contains no
-        ``on_connection_close`` handler, no ``.cancel()`` call and no
-        ``CancelledError`` reference at all, so nothing in the running service
-        cancels this task.  On Python 3.8+ ``CancelledError`` moved under
-        ``BaseException`` and the clause stops catching it, which is also the
-        behaviour that would be wanted -- so this needs no code change, only
-        re-checking if a cancellation path is ever introduced.
+        A failure to obtain the answer returns ``False``, keeping the "please
+        remove the parts manually" warning active rather than suppressing it
+        on an unconfirmed claim.
         """
         try:
             resp_xml, session_deleted = await self._list_uploaded_chunks(
@@ -1177,22 +891,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             return False
 
     async def _abort_chunked_upload(self, path, session_upload_id):
-        """This operation aborts a multipart upload. After a multipart upload is aborted, no
-        additional parts can be uploaded using that upload ID. The storage consumed by any
-        previously uploaded parts will be freed. However, if any part uploads are currently in
-        progress, those part uploads might or might not succeed. As a result, it might be necessary
-        to abort a given multipart upload multiple times in order to completely free all storage
-        consumed by all parts. To verify that all parts have been removed, so you don't get charged
-        for the part storage, you should call the List Parts operation and ensure the parts list is
-        empty.
+        """Abort a multipart upload with DELETE + retry, then confirm via LIST PARTS.
 
-        Docs: https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadAbort.html
-
-        Quirks:
-
-        If the ABORT request is successful, the session may be deleted when the LIST PARTS request
-        is made.  The criteria for successful abort thus is ether LIST PARTS request returns 404 or
-        returns 200 with an empty parts list.
+        Success means LIST PARTS returns 404 or 200 with an empty parts list.
+        Returns ``True`` on confirmed abort, ``False`` otherwise.
         """
 
         headers = {}
@@ -1206,7 +908,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         is_aborted = False
         while iteration_count < settings.CHUNKED_UPLOAD_MAX_ABORT_RETRIES:
             try:
-                # ABORT
                 resp = await self._make_upload_request(
                     'DELETE',
                     functools.partial(
@@ -1222,36 +923,15 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 )
                 await resp.release()
 
-                # LIST PARTS
                 resp_xml, session_deleted = await self._list_uploaded_chunks(path, session_upload_id)
 
-                # Abort is successful if the session has been deleted, or when
-                # there is no part left.
                 if session_deleted or self._no_parts_left(resp_xml):
                     is_aborted = True
                     break
             except exceptions.UploadError as err:
-                # ``NoSuchUpload`` means the session is already gone, which is
-                # exactly the state abort is trying to reach.  Retrying to the
-                # cap and then reporting failure sends the user hunting for
-                # parts that do not exist -- which is what happens whenever the
-                # commit actually succeeded and only its response was
-                # unreadable.
-                #
-                # But "the session is gone" is not the same claim as "the parts
-                # are gone".  The docstring's own success criterion is LIST
-                # PARTS returning 404 or an empty list, and ``NoSuchUpload`` on
-                # the DELETE does not establish either -- a storage that has
-                # dropped the session record while parts are still billable
-                # would answer exactly this way.  So confirm it with the same
-                # LIST PARTS check the success path uses, and fall through to
-                # log-and-retry when the check disagrees.
-                #
-                # Only on the first iteration: the check is worth one round
-                # trip, and re-asking it on every retry multiplies requests
-                # against a storage that has already shown it is struggling.  A
-                # first answer of "not confirmed" is not going to be overturned
-                # by asking the same endpoint again a moment later.
+                # NoSuchUpload means the session is gone -- confirm via LIST
+                # PARTS before treating as success.  Only on the first
+                # iteration (retries use DELETE again).
                 s3_error_code = self._parse_s3_error_body(err)[0]
                 if s3_error_code == 'NoSuchUpload' and iteration_count == 0 and \
                         await self._abort_confirmed_by_list_parts(path, session_upload_id):
@@ -1341,14 +1021,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id
         }
 
-        # Every failure from here on is a failure of the commit itself, and the
-        # commit is the one request whose outcome WaterButler cannot infer:
-        # the parts are already stored, so "did the assemble happen?" is
-        # answered only by the response.  Marking at both of the places the
-        # commit can fail -- the request itself, and the reading of its answer
-        # -- is what lets ``_translate_upload_error`` tell the user before they
-        # upload the file a second time.  Which marks actually produce the
-        # notice is decided there, not here.
+        # From here on, parts are stored; failures leave the outcome unknown.
         try:
             resp = await self._make_upload_request(
                 'POST',
@@ -1366,35 +1039,11 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     HTTPStatus.CREATED,
                 ),
                 throws=exceptions.UploadError,
-                # ``retry=0`` is a precondition of ``_commit_outcome_note``, not
-                # a tuning choice.  ``make_request`` would otherwise re-send the
-                # commit twice on 408/502/503/504 -- and a re-sent commit
-                # consumes the UploadId, so a first attempt that *succeeded*
-                # comes back from the second as ``NoSuchUpload``.  The code the
-                # notice classifies would then describe the retry rather than
-                # the upload, and the classification would be wrong in the
-                # unrecoverable direction: silently telling the user nothing was
-                # stored when it was.  Same reasoning as the abort confirmation
-                # in ``_abort_confirmed_by_list_parts``.
-                #
-                # The cost is that a transient 503 now fails the upload instead
-                # of being retried.  That failure carries the UNKNOWN notice, so
-                # the user is told to check the file list -- which is better
-                # than retrying silently and then asserting the wrong outcome.
+                # retry=0: a re-sent commit consumes the UploadId even if it
+                # fails, so outcome classification becomes meaningless.
                 retry=0,
-                # ``retry=0`` alone does not deliver that precondition: it stops
-                # WaterButler's own retry loop, not the HTTP client's.  307 and
-                # 308 mean "re-send, method and body intact", and aiohttp obeys
-                # them by default -- a second commit POST that costs no retry
-                # budget at all.  Everything said above about a re-sent commit
-                # applies verbatim to that one.
-                #
-                # Refusing to follow means a storage that legitimately answers
-                # the commit with a 307 now fails the upload.  That failure is
-                # an unclassifiable status, so it carries the UNKNOWN notice:
-                # the user is told to check the file list for a file that was in
-                # fact stored.  Over-noticing is inside the tolerance this
-                # provider accepts; asserting the wrong outcome is not.
+                # allow_redirects=False: aiohttp 3.6.2 follows 307/308
+                # redirects by default, which would re-send the POST.
                 allow_redirects=False,
             )
         except Exception as err:
@@ -1406,17 +1055,11 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # is exactly what a struggling storage does, and leaving the read
             # outside meant that case skipped the release entirely.
             response_body = await resp.read()
-            # S3 reports CompleteMultipartUpload failures as HTTP 200 plus an
-            # <Error> body, so this raises on what looks like a success -- and
-            # that is exactly the path a quota-exhausted storage takes for
-            # every upload.  Without the finally, each one leaks a connection.
+            # S3 reports failures as HTTP 200 + <Error> body.
             self._check_for_200_error(response_body, "CompleteMultipartUpload",
                                       exceptions.UploadError)
         except Exception as err:
-            # ``Exception`` rather than ``UploadError``: the storage did answer
-            # the commit and we could not read the answer, which arrives as an
-            # aiohttp error.  Narrowing this to ``UploadError`` meant the one
-            # case the notice exists for was the one case that never got it.
+            # Broad except: also catches aiohttp errors during resp.read().
             _mark_commit_outcome_unknown(err)
             raise
         finally:
@@ -1454,7 +1097,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 )
         logger.debug('Deleting path: %s', path.full_path)
         if path.is_file:
-            # Retrieve and delete all versions (batched) similar to S3 provider
             try:
                 prefix = path.full_path.lstrip('/')
                 query_params = {
@@ -1480,7 +1122,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                         delete_list = [
                             {'Key': path.full_path, 'VersionId': vid} for vid in batch
                         ]
-                        # Run synchronous boto3 call in executor to avoid blocking
                         loop = asyncio.get_event_loop()
                         response = await loop.run_in_executor(
                             None,
@@ -1488,7 +1129,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                                 Delete={'Objects': d, 'Quiet': False}
                             ),
                         )
-                        # Check for errors in response
                         if 'Errors' in response and response['Errors']:
                             error_count = len(response['Errors'])
                             error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
@@ -1501,7 +1141,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                         deleted_count = len(response.get('Deleted', []))
                         logger.debug('Batch deleted %d versions', deleted_count)
                 else:
-                    # No versions -> delete current object directly
                     query_parameters = {
                         'Bucket': self.bucket_name,
                         'Key': path.full_path,
@@ -1595,20 +1234,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         return False
 
     async def _delete_folder(self, path, **kwargs):
-        """Query for recursive contents of folder and delete in batches of 1000
-
-        Called from: func: delete if not path.is_file
-
-        Calls: func: self.make_request
-               func: self.connection.generate_presigned_url
+        """Query for recursive contents of folder and delete in batches of 1000.
 
         :param *ProviderPath path: Path to be deleted
-
-        On S3, folders are not first-class objects, but are instead inferred
-        from the names of their children.  A regular DELETE request issued
-        against a folder will not work unless that folder is completely empty.
-        To fully delete an occupied folder, we must delete all of the comprising
-        objects.  Amazon provides a bulk delete operation to simplify this.
         """
         if not path.full_path.endswith('/'):
             raise exceptions.InvalidParameters('not a folder: {}'.format(str(path)))
@@ -1672,7 +1300,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                         raise exceptions.DeleteError(
                             'Failed to delete some objects: {} error(s)'.format(error_count)
                         )
-            # Also clean up folder prefix
             try:
                 await self._delete_folder_prefix(prefix)
             except exceptions.DeleteError:
@@ -1698,10 +1325,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         all_objects = [
             {'Key': k, 'VersionId': v} for k, vids in version_map.items() for v in vids
         ] + keys_without_version
-        # AWS allows max 1000 objects per delete_objects call
         for i in range(0, len(all_objects), 1000):
             batch = all_objects[i: i + 1000]
-            # Run synchronous boto3 call in executor to avoid blocking
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
@@ -1709,7 +1334,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     Delete={'Objects': b, 'Quiet': False}
                 ),
             )
-            # Check for errors in response
             if 'Errors' in response and response['Errors']:
                 error_count = len(response['Errors'])
                 error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
@@ -1754,7 +1378,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             response_body = await resp.read()
             parsed = xmltodict.parse(response_body.decode('utf-8'), strip_whitespace=False)['ListVersionsResult']
 
-            # Append current page's versions and delete markers
             current_versions = parsed.get('Version', [])
             current_delete_markers = parsed.get('DeleteMarker', [])
 
@@ -1778,7 +1401,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             versions.extend(current_versions)
             delete_markers.extend(current_delete_markers)
 
-            # Check if more pages are available
             more_to_come = parsed.get('IsTruncated') == 'true'
             if more_to_come:
                 query_params['KeyMarker'] = parsed.get('NextKeyMarker')

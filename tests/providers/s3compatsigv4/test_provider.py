@@ -61,15 +61,8 @@ from waterbutler.providers.s3compatsigv4.metadata import (S3CompatSigV4Revision,
                                                      )
 from hmac import compare_digest
 
-# --- Material for the commit-notice cartesian product ----------------------
-#
-# Invariant: for the same operation and the same *observed* code, every
-# transport reaches the same verdict.  Eight representative codes: 3
-# definitive rejections (no notice), 3 indeterminate, 1 unknown, 1 missing.
-#
-# An unknown code and a missing code both fall to UNKNOWN.  That is the
-# fail-safe direction: an over-reported notice costs the user a re-check,
-# an under-reported one silently claims nothing was stored.
+# Invariant: same operation + same observed code -> same verdict on every transport.
+# Unknown/missing codes fall to UNKNOWN (fail-safe: over-report rather than under-report).
 COMMIT_CODE_CASES = [
     ('AccessDenied', False),
     ('InvalidPart', False),
@@ -81,9 +74,7 @@ COMMIT_CODE_CASES = [
     (None, True),
 ]
 
-# The classification table, written out independently of the implementation's
-# ``DEFINITIVE_REJECTION_CODES``.  Generating it from the implementation would
-# let a deleted row delete its own parameter, leaving that row unguarded.
+# Independent copy -- generating from the implementation would let a deleted row delete its own test.
 DEFINITIVE_REJECTION_CODES = [
     'AccessDenied',
     'InvalidPart',
@@ -96,19 +87,12 @@ DEFINITIVE_REJECTION_CODES = [
     'NoSuchBucket',
 ]
 
-# Transports where the code is observable.  3 x 8 = 24 cells.
 OBSERVED_TRANSPORTS = ['direct_4xx', 'direct_5xx', 'complete_200_error']
-# Transports where it is not.  2 x 8 = 16 cells: whatever the storage meant
-# to say never reaches WaterButler, so the verdict is UNKNOWN regardless.
 LATENT_TRANSPORTS = ['disconnect', 'broken_xml']
 
 
 def commit_error_xml(error_code):
-    """An S3 error body for CompleteMultipartUpload.
-
-    An ``error_code`` of ``None`` yields a body with no ``<Code>`` element:
-    the "missing code" cell, parsable but carrying no verdict.
-    """
+    """An S3 error body; ``None`` yields a body with no ``<Code>`` element."""
     if error_code is None:
         return ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<Error><Message>boom</Message></Error>')
@@ -131,16 +115,12 @@ def arrange_commit_failure(provider, transport, error_code):
         resp.release = MockCoroutine()
         provider.make_request = MockCoroutine(return_value=resp)
     elif transport == 'disconnect':
-        # No response arrived, so no code is observable.  The S3 error XML is
-        # put in the exception's ``message`` on purpose: ``_raw_error_body``
-        # falls back to ``message``, so an implementation that reads a code
-        # from there rather than from a response body has to fail here.
+        # Error XML placed in ``message`` on purpose: catches implementations
+        # that read a code from the message fallback instead of a parsed body.
         provider.make_request = MockCoroutine(
             side_effect=aiohttp.ServerDisconnectedError(commit_error_xml(error_code)))
     elif transport == 'broken_xml':
-        # The body arrived but is truncated.  The code string is present in it
-        # yet cannot be parsed, so it is not observed -- a substring match must
-        # never pick it up.
+        # Truncated body: code string present but unparsable -- substring match must not pick it up.
         truncated = commit_error_xml(error_code)[:-12].encode('utf-8')
         resp = mock.Mock()
         resp.read = MockCoroutine(return_value=truncated)
@@ -160,24 +140,10 @@ def arrange_chunked_commit(provider):
 
 
 class commit_server:
-    """An ``aiohttp.web`` server that accepts a single commit.
+    """Real-socket server for commit tests.
 
-    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so
-    the redirect following that happens *inside* that call cannot be
-    reproduced with it, and pinning it needs a real socket.  The real socket
-    also pins, against a real ``ClientResponse``, the premise the three
-    mock-injection cells lean on -- that the injection point is correct.
-
-    Startup and teardown are owned here.  With ``runner.setup()`` through URL
-    assembly left outside the ``finally``, a failure after the server started
-    would carry a listening socket and the provider's sessions into the next
-    test.
-
-    ``runner.setup()`` itself is not guarded.  In aiohttp 3.6.2
-    ``BaseRunner.cleanup()`` returns immediately while ``self._server is
-    None``, so calling it after a failed setup does nothing, and the
-    ``Application`` used here registers no ``on_startup``/``on_cleanup`` --
-    there is no path by which a partial setup leaves resources behind.
+    Needed because ``aiohttpretty`` cannot reproduce redirects, and a real
+    ``ClientResponse`` pins the injection-point premise the mock cells rely on.
     """
 
     def __init__(self, provider, app):
@@ -191,9 +157,7 @@ class commit_server:
         try:
             site = web.TCPSite(self.runner, '127.0.0.1', 0)
             await site.start()
-            # aiohttp 3.6.2 exposes the bound port only here.  If this private
-            # attribute disappears the AttributeError is deliberate: a test
-            # that visibly breaks beats one that quietly skips.
+            # Deliberate use of private attr: an AttributeError is better than a silent skip.
             sockets = site._server.sockets
             assert sockets, 'the test server bound no socket'
             self.url = 'http://127.0.0.1:{}/first'.format(sockets[0].getsockname()[1])
@@ -206,9 +170,7 @@ class commit_server:
     async def __aexit__(self, *exc_info):
         first = None
         try:
-            # One failing close must not strand the rest: letting the loop
-            # raise would leave every later session open and carry it into
-            # the next test.
+            # One failing close must not strand the rest.
             for session in self.provider.session_list:
                 try:
                     await session.close()
@@ -259,8 +221,6 @@ def mock_time(monkeypatch):
     mock_time_value = mock.Mock(return_value=1454684930.0)
     monkeypatch.setattr(time, 'time', mock_time_value)
     
-    # Mock datetime for boto3/botocore signature generation
-    # 1454684930.0 corresponds to 2016-02-05 15:08:50 UTC
     fixed_datetime = datetime.datetime(2016, 2, 5, 15, 8, 50, tzinfo=datetime.timezone.utc)
     
     class MockDateTime(datetime.datetime):
@@ -284,27 +244,13 @@ def provider(auth, credentials, settings):
 
 @pytest.fixture
 def generate_url_helper(provider):
-    """Helper to generate presigned URLs for boto3-based S3CompatSigV4Provider
-    
-    """
-    def _generate_url(key=None, method='GET', expires=100, query_parameters=None, 
+    """Generate presigned URLs for boto3-based S3CompatSigV4Provider."""
+    def _generate_url(key=None, method='GET', expires=100, query_parameters=None,
                      response_headers=None, headers=None, encrypt_key=False):
-        """
-        Generate a presigned URL for S3CompatSigV4Provider
-        
-        :param key: S3 object key (None for bucket-level operations like list_objects)
-        :param method: HTTP method ('GET', 'HEAD', 'PUT', 'POST', 'DELETE')
-        :param expires: Expiration time in seconds
-        :param query_parameters: Additional query parameters dict (e.g., {'versions': '', 'delete': ''})
-        :param response_headers: Response headers dict for presigned URLs
-        :param headers: Request headers dict
-        :param encrypt_key: Whether to use encryption (adds SSE headers)
-        """
+        """Generate a presigned URL for S3CompatSigV4Provider."""
         method_upper = method.upper()
         
-        # Map HTTP method to boto3 client method
         if key:
-            # Object-level operations
             if method_upper == 'POST':
                 if query_parameters and any(k.lower() == 'delete' for k in query_parameters.keys()):
                     client_method = 'delete_objects'
@@ -313,22 +259,18 @@ def generate_url_helper(provider):
                 elif query_parameters and 'uploadId' in query_parameters:
                     client_method = 'complete_multipart_upload'
                 else:
-                    # Default POST operation (shouldn't happen in practice)
                     client_method = 'put_object'
             elif method_upper == 'DELETE':
-                # Check if this is an abort multipart upload
                 if query_parameters and 'uploadId' in query_parameters:
                     client_method = 'abort_multipart_upload'
                 else:
                     client_method = 'delete_object'
             elif method_upper == 'GET':
-                # Check if this is a list parts operation
                 if query_parameters and 'uploadId' in query_parameters:
                     client_method = 'list_parts'
                 else:
                     client_method = 'get_object'
             elif method_upper == 'PUT':
-                # Check if this is an upload part operation
                 if query_parameters and 'uploadId' in query_parameters and 'partNumber' in query_parameters:
                     client_method = 'upload_part'
                 else:
@@ -340,7 +282,6 @@ def generate_url_helper(provider):
                 client_method = method_map.get(method_upper, 'get_object')
             params = {'Bucket': provider.bucket_name, 'Key': key}
         else:
-            # Bucket-level operations (list, bulk delete, etc.)
             if query_parameters and 'versions' in query_parameters:
                 client_method = 'list_object_versions'
             elif query_parameters and any(k.lower() == 'delete' for k in query_parameters.keys()):
@@ -349,14 +290,10 @@ def generate_url_helper(provider):
                 client_method = 'list_objects_v2'
             params = {'Bucket': provider.bucket_name}
         
-        # Add query parameters to params
         if query_parameters:
-            # Handle special query parameters
             for key_param, value_param in query_parameters.items():
-                # Skip query params that are only used to determine the boto3 method
                 if key_param.lower() in ['versions', 'delete', 'uploads']:
                     continue
-                # Convert S3 query parameter names to boto3 parameter names
                 if key_param == 'uploadId':
                     params['UploadId'] = value_param
                 elif key_param == 'partNumber':
@@ -364,23 +301,17 @@ def generate_url_helper(provider):
                 elif key_param in ['prefix', 'delimiter']:
                     params[key_param.capitalize()] = value_param
                 elif key_param in ['Prefix', 'Delimiter', 'VersionIdMarker', 'KeyMarker', 'VersionId']:
-                    # Already in boto3 format
                     params[key_param] = value_param
                 else:
                     params[key_param] = value_param
         
-        # Add response headers (for download URLs)
         if response_headers:
             for rh_key, rh_value in response_headers.items():
-                # Convert to boto3 format (e.g., 'response-content-disposition' -> 'ResponseContentDisposition')
                 param_key = ''.join(word.capitalize() for word in rh_key.replace('response-', '').split('-'))
                 param_key = 'Response' + param_key
                 params[param_key] = rh_value
         
-        # Add encryption headers if needed
         if encrypt_key or headers:
-            # Note: Encryption and custom headers in presigned URLs work differently in boto3
-            # They need to be included when making the request, not in the presigned URL itself
             pass
         
         return provider.connection.generate_presigned_url(
@@ -1212,8 +1143,6 @@ class TestCRUD:
         head_url = generate_url_helper(key=path.full_path, method='HEAD', expires=100)
         aiohttpretty.register_uri('HEAD', head_url, headers=file_header_metadata)
 
-        # aiohttpretty.register_uri uses shallow copy for headers.
-        # Therefore, we need to use a deep copied dictionary for GET.
         no_content_length_metadata = file_header_metadata.copy()
         del no_content_length_metadata['Content-Length']
 
@@ -1282,7 +1211,6 @@ class TestCRUD:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_upload_encrypted(self, provider, file_content, file_stream, file_header_metadata, mock_time, generate_url_helper):
-        # Set trigger for encrypt_key=True in s3compatsigv4.provider.upload
         provider.encrypt_uploads = True
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         content_md5 = hashlib.md5(file_content).hexdigest()
@@ -1307,7 +1235,6 @@ class TestCRUD:
         assert aiohttpretty.has_call(method='PUT', uri=url)
         assert aiohttpretty.has_call(method='HEAD', uri=metadata_url)
 
-        # Fixtures are shared between tests. Need to revert the settings back.
         provider.encrypt_uploads = False
 
     @pytest.mark.asyncio
@@ -1325,7 +1252,6 @@ class TestCRUD:
 
         provider._chunked_upload.assert_called_with(file_stream, path)
 
-        # Fixtures are shared between tests. Need to revert the settings back.
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = pd_settings.CONTIGUOUS_UPLOAD_SIZE_LIMIT
         provider.CHUNK_SIZE = pd_settings.CHUNK_SIZE
 
@@ -1369,12 +1295,8 @@ class TestCRUD:
 
         provider._create_upload_session = MockCoroutine()
         provider._create_upload_session.return_value = upload_id
-        # NOTE: the failure must be injected into ``_upload_parts``, not
-        # ``_upload_part``.  ``_chunked_upload`` only ever calls the former, so
-        # a ``side_effect`` on the latter never fires.  (An earlier revision did
-        # exactly that and the test passed only because the unmocked
-        # ``_complete_multipart_upload`` hit aiohttpretty's "No URLs matching
-        # POST ..." error -- i.e. it asserted nothing about the abort path.)
+        # Inject into ``_upload_parts`` (not ``_upload_part``): ``_chunked_upload``
+        # only calls the plural form.
         provider._upload_parts = MockCoroutine()
         provider._upload_parts.side_effect = Exception('error')
         provider._complete_multipart_upload = MockCoroutine()
@@ -1383,27 +1305,21 @@ class TestCRUD:
 
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._chunked_upload(file_stream, path)
-        # The abort has SUCCEEDED (return value True), so the "manual clean-up"
-        # warning must NOT be appended to the error message.
+        # Abort succeeded, so no manual clean-up warning.
         msg = 'An unexpected error has occurred during the multi-part upload.'
         assert str(exc.value) == ', '.join(['500', msg])
 
         provider._create_upload_session.assert_called_with(path)
         provider._upload_parts.assert_called_with(file_stream, path, upload_id)
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
-        # The parts upload failed, so the commit step must never be attempted.
         provider._complete_multipart_upload.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_unexpected_error_is_a_500(self, provider, file_stream,
                                                             mock_time):
-        # Every other raise on this path is a 502, so the bare ``UploadError``
-        # at the end looks like a missed ``code=``.  It is not: an exception
-        # that is neither an ``UploadError`` (the storage answered) nor a
-        # connection error (the link failed) did not come from upstream, and a
-        # 502 would blame the storage for a defect on this side.  Pin it so the
-        # difference stays a decision rather than an oversight.
+        # The bare 500 (not 502) is deliberate: the exception came from this side,
+        # not from upstream.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -1431,17 +1347,8 @@ class TestCRUD:
     ])
     async def test_chunked_upload_500_branch_notices_only_a_commit_failure(
             self, provider, file_stream, mock_time, fails_at, expect_notice):
-        # The third exit of ``_chunked_upload``: an exception that is neither
-        # ``UploadError`` nor a connection error lands in the 500 arm.  It is
-        # reachable -- ``asyncio.CancelledError`` derives from ``Exception``
-        # but from neither ``aiohttp.ClientError`` nor ``asyncio.TimeoutError``.
-        #
-        # Injection stays at the *boundaries* of ``_complete_multipart_upload``
-        # (the commit request and the commit answer) and never replaces the
-        # method with a mock raising an already-marked exception.  The code
-        # under test has to be the thing that applies the mark, or narrowing
-        # its ``except Exception``, or moving the mark inside an ``isinstance``
-        # guard, leaves this test green.
+        # The 500 arm: exception is neither ``UploadError`` nor connection error.
+        # Injection at boundaries only -- the code under test must apply the mark.
         assert issubclass(asyncio.CancelledError, Exception)
         assert not issubclass(asyncio.CancelledError, pd_provider.CONNECTION_ERRORS)
 
@@ -1465,21 +1372,15 @@ class TestCRUD:
                 released.append(True)
 
         if fails_at == 'parts':
-            # Cancelled during the parts: no commit was sent, so no assembly
-            # can have started and the notice must stay off.
             provider._upload_parts = MockCoroutine(
                 side_effect=asyncio.CancelledError('cancelled during the parts'))
             provider._make_upload_request = MockCoroutine()
         else:
             provider._upload_parts = MockCoroutine(return_value=[{'ETAG': '"e"'}])
             if fails_at == 'commit-request':
-                # Cancelled while sending: no answer came back, so whether
-                # the storage began assembling is unknowable.
                 provider._make_upload_request = MockCoroutine(
                     side_effect=asyncio.CancelledError('cancelled while sending the commit'))
             else:
-                # The answer came back but could not be read, and the body
-                # is the only place the commit's outcome is written.
                 provider._make_upload_request = MockCoroutine(
                     return_value=_AnswerWeCannotRead())
 
@@ -1489,11 +1390,9 @@ class TestCRUD:
         assert exc.value.code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert (provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message) is expect_notice
         if fails_at == 'parts':
-            # Not one byte of the commit went out.
             provider._make_upload_request.assert_not_called()
         else:
             assert provider._make_upload_request.call_count == 1
-        # Where an answer arrived, the connection is released even unread.
         assert released == ([True] if fails_at == 'commit-read' else [])
 
     @pytest.mark.asyncio
@@ -1517,8 +1416,7 @@ class TestCRUD:
 
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._chunked_upload(file_stream, path)
-        # The abort has FAILED (return value False), so the "manual clean-up"
-        # warning must be appended to the error message.
+        # Abort failed, so manual clean-up warning is present.
         msg = 'An unexpected error has occurred during the multi-part upload.'
         msg += '  The abort action failed to clean up the temporary file parts generated ' \
                'during the upload process.  Please manually remove them.'
@@ -1550,8 +1448,6 @@ class TestCRUD:
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._chunked_upload(file_stream, path)
 
-        # A storage-side quota error must surface as HTTP 507 with an explicit,
-        # user-readable message, and the multipart session must be aborted.
         assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
         assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
         assert 'QuotaExceeded' in exc.value.message
@@ -1561,10 +1457,7 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_quota_exceeded_and_abort_fails(self, provider, file_stream,
                                                                  mock_time):
-        # Worst case: the quota error and the abort failure have
-        # to be reported together.  The abort warning is threaded through
-        # _translate_upload_error as ``extra_message``, so it is easy to drop
-        # while keeping both single-fault tests green.
+        # Worst case: quota error + abort failure reported together.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -1586,7 +1479,6 @@ class TestCRUD:
         assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
         assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
         assert 'QuotaExceeded' in exc.value.message
-        # The abort FAILED, so the manual clean-up warning must also be present.
         assert 'Please manually remove them.' in exc.value.message
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
 
@@ -1599,8 +1491,6 @@ class TestCRUD:
                      '<Error><Code>QuotaExceeded</Code>'
                      '<Message>The bucket quota has been exceeded</Message></Error>')
 
-        # ``make_request`` raises ``UploadError`` built by
-        # ``exception_from_response`` when the storage rejects the PUT.
         provider.make_request = MockCoroutine()
         provider.make_request.side_effect = exceptions.UploadError({'response': error_xml},
                                                                    code=403)
@@ -1608,8 +1498,6 @@ class TestCRUD:
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._contiguous_upload(file_stream, path)
 
-        # A storage-side quota error must surface as HTTP 507 with an explicit,
-        # user-readable message.
         assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
         assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
         assert 'QuotaExceeded' in exc.value.message
@@ -1630,8 +1518,6 @@ class TestCRUD:
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._contiguous_upload(file_stream, path)
 
-        # Non-quota errors keep the storage's status code but get a readable
-        # message (not the raw XML body).
         assert exc.value.code == 403
         assert 'AccessDenied' in exc.value.message
         assert '<Error' not in exc.value.message
@@ -1644,8 +1530,6 @@ class TestCRUD:
 
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
 
-        # Some storages close the connection mid-upload when the quota has been
-        # exceeded; the raw client error must not propagate as an HTTP 500.
         provider.make_request = MockCoroutine()
         provider.make_request.side_effect = aiohttp.ClientOSError('Connection reset by peer')
 
@@ -1658,9 +1542,7 @@ class TestCRUD:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_contiguous_upload_timeout(self, provider, file_stream, mock_time):
-        # ``asyncio.TimeoutError`` is NOT an ``aiohttp.ClientError``, so the
-        # whole-request timeout (AIOHTTP_TIMEOUT) used to escape untranslated
-        # and reach the user as an unexplained HTTP 500.
+        # TimeoutError is not a ClientError and must not escape as HTTP 500.
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
 
         provider.make_request = MockCoroutine()
@@ -1671,19 +1553,14 @@ class TestCRUD:
 
         assert exc.value.code == HTTPStatus.BAD_GATEWAY
         assert provider.CONNECTION_INTERRUPTED_MESSAGE in exc.value.message
-        # Only quota exhaustion is the user's to resolve.  A
-        # dropped connection is an infrastructure fault and must keep paging.
         assert exc.value.is_user_error is False
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_exception_from_response_contract_xml(self, provider, mock_time,
                                                         generate_url_helper):
-        # The whole quota translation depends on exception_from_response putting
-        # an XML body into ``data['response']``.  Every other quota test builds
-        # that shape by hand, so this one pins down the actual contract: if
-        # ``exception_from_response`` ever changes (e.g. resp.json() starts
-        # succeeding), the translation breaks silently and only this test fails.
+        # Pins the contract that exception_from_response puts XML into
+        # ``data['response']`` -- every other quota test builds that by hand.
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         url = generate_url_helper(key=path.full_path, method='PUT', expires=100,
                                   headers={}, query_parameters={})
@@ -1705,9 +1582,7 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_exception_from_response_contract_head(self, provider, mock_time,
                                                          generate_url_helper):
-        # HEAD responses have no body, so exception_from_response produces a
-        # plain string message.  _parse_s3_error_body must degrade to
-        # (None, None) rather than raising on that shape.
+        # No body on HEAD -- _parse_s3_error_body must degrade to (None, None).
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         url = generate_url_helper(key=path.full_path, method='HEAD', expires=100,
                                   headers={}, query_parameters={})
@@ -1725,9 +1600,7 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_contiguous_upload_quota_exceeded_over_http(self, provider, file_stream,
                                                               mock_time, generate_url_helper):
-        # End-to-end over a simulated HTTP exchange: no hand-built UploadError,
-        # so make_request / exception_from_response / _parse_s3_error_body /
-        # _translate_upload_error are all exercised together.
+        # End-to-end: all layers exercised together (no hand-built UploadError).
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         url = generate_url_helper(key=path.full_path, method='PUT', expires=100,
                                   headers={}, query_parameters={})
@@ -1782,26 +1655,19 @@ class TestCRUD:
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._chunked_upload(file_stream, path)
 
-        # A timeout is a connection-level failure, not an "unexpected error".
         assert exc.value.code == HTTPStatus.BAD_GATEWAY
         assert provider.CONNECTION_INTERRUPTED_MESSAGE in exc.value.message
         assert exc.value.is_user_error is False
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
-        # The parts never finished uploading, so no commit was ever sent.  This
-        # path *does* consult ``_commit_outcome_note``, so the absence has to be
-        # asserted here rather than assumed.
+        # No commit was sent, so no "may have completed" notice.
         assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE not in exc.value.message
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_entry_log_omits_raw_body(self, provider, file_stream,
                                                            mock_time, caplog):
-        # ``'{!r}'.format(UploadError(...))`` renders the *whole* message, and
-        # for a dict message that message is the storage's raw body serialised
-        # as JSON -- unbounded, and duplicated a few lines later by
-        # ``_translate_upload_error``.  The entry log must only say what kind of
-        # failure it was; the body belongs to the single bounded log in the
-        # translator.
+        # The entry log must identify the failure by type/status only,
+        # not render the unbounded raw body.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -1825,23 +1691,18 @@ class TestCRUD:
         assert len(records) == 2
 
         entry, translated = records
-        # The entry log identifies the failure by type and status only.
         assert 'UploadError' in entry
         assert str(int(HTTPStatus.FORBIDDEN)) in entry
         assert upload_id in entry
         assert 'TESTREQUESTID' not in entry
         assert 'y' * 64 not in entry
-        # The body survives exactly once, bounded by ERROR_BODY_LOG_LIMIT.
         assert 'TESTREQUESTID' in translated
         assert 'y' * pd_provider.ERROR_BODY_LOG_LIMIT not in translated
-        # Neither record may be unbounded.
         for record in records:
             assert len(record) < 1024
 
     def test_connection_interrupted_message_does_not_assert_capacity(self, provider):
-        # A dropped connection is only *evidence* of a full
-        # storage -- it is equally often a network fault.  The message must not
-        # send the user off to free up space when nothing is full.
+        # Must name the network as a possible cause, not assert capacity.
         message = provider.CONNECTION_INTERRUPTED_MESSAGE
         assert 'network' in message.lower()
         assert 'may indicate' in message
@@ -1849,15 +1710,10 @@ class TestCRUD:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     @pytest.mark.parametrize('error_code,status,expected_level', [
-        # Quota exhaustion is expected and the user can fix it themselves --
-        # ``_translate_upload_error`` already logs it at WARNING and marks it
-        # ``is_user_error``.  The entry log has to agree, or this line alone
-        # keeps paging oncall every time somebody fills a bucket.
+        # Quota: entry log must also use WARNING, not ERROR.
         ('QuotaExceeded', HTTPStatus.FORBIDDEN, logging.WARNING),
         ('XMinioStorageFull', HTTPStatus.FORBIDDEN, logging.WARNING),
-        # ...including the 507 fallback, where the code is unrecognised.
         ('SomeVendorCode', HTTPStatus.INSUFFICIENT_STORAGE, logging.WARNING),
-        # A real fault must still be an error: the downgrade must not be blanket.
         ('AccessDenied', HTTPStatus.FORBIDDEN, logging.ERROR),
         ('InternalError', HTTPStatus.INTERNAL_SERVER_ERROR, logging.ERROR),
     ])
@@ -1890,19 +1746,14 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_entry_log_requires_the_storage_tag(
             self, provider, file_stream, mock_time, caplog):
-        # Every other case above builds its error with ``storage_error``, which
-        # tags it.  So deleting the ``_is_storage_response`` guard from
-        # ``_is_quota_exhaustion`` leaves the whole suite green while the
-        # predicate silently starts trusting messages WaterButler wrote itself.
-        # A 507 that carries no tag must stay an ERROR.
+        # Untagged 507 must stay ERROR -- guards against removing the storage-tag check.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
 
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         provider._create_upload_session = MockCoroutine(return_value='EXAMPLEUPLOADID')
-        # Deliberately untagged: this is the shape of an error WaterButler
-        # authored, not one built from a storage response.
+        # Deliberately untagged: WaterButler-authored error, not from storage.
         provider._upload_parts = MockCoroutine(side_effect=exceptions.UploadError(
             'WaterButler wrote this', code=HTTPStatus.INSUFFICIENT_STORAGE))
         provider._abort_chunked_upload = MockCoroutine(return_value=True)
@@ -1917,9 +1768,7 @@ class TestCRUD:
         assert entry[0].levelno == logging.ERROR
 
     def test_passthrough_preserves_is_user_error(self, provider):
-        # The untagged branch rebuilds the exception to append the abort
-        # warning.  Dropping ``is_user_error`` there promotes a failure the user
-        # caused from Sentry's info level to error (server/api/v1/core.py).
+        # Dropping ``is_user_error`` would promote user failures to Sentry error level.
         err = exceptions.UploadError('WaterButler wrote this', code=HTTPStatus.CONFLICT,
                                      is_user_error=True)
 
@@ -1948,11 +1797,8 @@ class TestCRUD:
     @pytest.mark.parametrize('stage', ['contiguous', 'create-session', 'chunked'])
     async def test_translated_error_does_not_chain_the_raw_body(self, provider, file_stream,
                                                                 mock_time, stage):
-        # ``raise translated`` inside an ``except`` block sets ``__context__``
-        # to the untranslated error, so the raw body comes back in the rendered
-        # traceback -- which is what the logs and Sentry show.  Stripping the
-        # body from the message accomplishes nothing if the chained exception
-        # carries it anyway.
+        # The translated error must suppress ``__context__`` to keep the raw
+        # body out of the traceback/Sentry.
         import traceback
 
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
@@ -1985,9 +1831,7 @@ class TestCRUD:
         assert 'secret-key-name' not in rendered
 
     def test_translate_upload_error_logs_raw_body(self, provider, caplog):
-        # The translated error only carries a summary message, so the raw body
-        # (RequestId / Resource) is the only way to investigate afterwards.  It
-        # used to be dropped entirely on the contiguous path.
+        # Raw body (RequestId/Resource) must survive in the log for investigation.
         error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
                      '<Error><Code>AccessDenied</Code><Message>Access Denied</Message>'
                      '<RequestId>TESTREQUESTID</RequestId>'
@@ -2004,18 +1848,11 @@ class TestCRUD:
         assert '/bucket/foobah' in logged
         assert 'AccessDenied' in logged
         assert str(int(HTTPStatus.FORBIDDEN)) in logged
-        # A non-quota storage rejection is a genuine error.
         assert records[0].levelno == logging.ERROR
 
     def test_translate_upload_error_log_truncates_body(self, provider, caplog):
-        # An unbounded body would flood the log; storages can return very large
-        # error documents (or a proxy's HTML error page).
-        #
-        # The bound is declared here as a literal rather than read from the
-        # module: deriving it from the constant makes the test agree with
-        # whatever the constant happens to say, so shrinking it to 10 (or
-        # growing it to 1 MB) would keep this green.  512 is the reviewed
-        # value, so changing it has to be a deliberate edit here too.
+        # Literal 512, not derived from the constant: changing the limit must be
+        # a deliberate edit here too.
         limit = 512
         assert pd_provider.ERROR_BODY_LOG_LIMIT == limit
         error_xml = '<Error><Code>AccessDenied</Code><Message>{}</Message></Error>'.format(
@@ -2026,20 +1863,13 @@ class TestCRUD:
             provider._translate_upload_error(err)
 
         logged = [r for r in caplog.records if r.name == PROVIDER_LOGGER][0].getMessage()
-        # Pin the bound itself, not just "shorter than the input": the body is
-        # cut at exactly ERROR_BODY_LOG_LIMIT bytes and no further.
         assert error_xml[:limit] in logged
         assert error_xml[:limit + 1] not in logged
-        # Nothing else in the record may reintroduce the rest of the body.
         assert len(logged) < limit * 2
 
     def test_translate_upload_error_log_bound_is_in_bytes(self, provider, caplog):
-        # The constant is declared as "how much of the raw error body is written
-        # to the log", and the scenario its comment names -- a misconfigured
-        # proxy answering with an HTML page -- is measured in bytes.  A
-        # character-based cut lets a multibyte body through at three times the
-        # declared size, which is exactly the case a non-English deployment
-        # hits first.
+        # The limit is in bytes; a character-based cut would let multibyte
+        # bodies through at 3x the declared size.
         limit = 512
         assert pd_provider.ERROR_BODY_LOG_LIMIT == limit
         error_xml = '<Error><Code>AccessDenied</Code><Message>{}</Message></Error>'.format(
@@ -2050,88 +1880,50 @@ class TestCRUD:
             provider._translate_upload_error(err)
 
         logged = [r for r in caplog.records if r.name == PROVIDER_LOGGER][0].getMessage()
-        # The body contribution is bounded in bytes, so it cannot exceed the
-        # limit however wide the characters are.  (The prefix the log line adds
-        # is ASCII and well under 512 bytes.)
         assert len(logged.encode('utf-8')) < limit * 2
 
     @pytest.mark.parametrize('body', [
-        # Decodes to 1536 bytes, three times the declared limit: ``replace``
-        # emits one U+FFFD per undecodable byte and U+FFFD is 3 bytes in
-        # UTF-8.  Truncating bytes and then decoding is not enough.
         b'\xff' * 512,
         b'\xff' * 4096,
-        # Valid multi-byte text: a cut inside a character adds 1-2 bytes.
         '\u3042' * 512,
         ('\u3042' * 512).encode('utf-8'),
-        # Invalid bytes mixed with valid text, as a real proxy reply looks.
         b'<html>' + b'\xc3\x28' * 300 + '\u3042'.encode('utf-8') * 100,
-        # Under the limit the body passes through: the over-trimming control.
         b'<Error><Code>AccessDenied</Code></Error>',
         '<Error><Code>AccessDenied</Code></Error>',
         b'',
         '',
     ])
     def test_bounded_body_never_exceeds_the_declared_limit(self, body):
-        # The constant declares "the first ERROR_BODY_LOG_LIMIT *bytes* of the
-        # raw error body", so the only way to check the declaration is to weigh
-        # the return value in UTF-8 again.  Bounding the whole log line instead
-        # misses inputs that inflate threefold on decode.
+        # Weigh the return value in UTF-8: bounding the log line would miss 3x inflate on decode.
         bounded = pd_provider._bounded_body(body)
 
         assert len(bounded.encode('utf-8')) <= pd_provider.ERROR_BODY_LOG_LIMIT
-        # Over-trimming check, decided on the *decoded* size.  Measuring the
-        # input instead would make ``b'\xff' * 512`` (512 in, 1536 out)
-        # contradict the assertion above and the test unsatisfiable.
         source = body if isinstance(body, bytes) else body.encode('utf-8')
         decoded = source.decode('utf-8', 'replace')
         if len(decoded.encode('utf-8')) <= pd_provider.ERROR_BODY_LOG_LIMIT:
             assert bounded == decoded
         else:
-            # Size alone would also accept an implementation returning ``''``.
-            # Staying under the limit and keeping the body are two separate
-            # requirements and ``_bounded_body`` exists for the second one.
-            #
-            # "It is the leading part" is pinned as a prefix, not as a length:
-            # where the cut lands depends on character width and on where the
-            # invalid bytes sit.
+            # Must keep the leading part, not just be under the limit.
             assert bounded
             assert decoded.startswith(bounded)
-            # Most of the budget has to be used, which kills an implementation
-            # returning a single character: even 3-byte units fill a third.
             assert len(bounded.encode('utf-8')) > pd_provider.ERROR_BODY_LOG_LIMIT // 3
 
     @pytest.mark.parametrize('body, expected', [
-        # Invalid bytes: ``replace`` emits one U+FFFD per byte and U+FFFD is
-        # 3 bytes in UTF-8, so 512 // 3 = 170 characters fit.
         (b'\xff' * 512, '\ufffd' * 170),
-        # However long the input, the same amount survives.
         (b'\xff' * 4096, '\ufffd' * 170),
-        # Valid 3-byte characters; the 2 leftover bytes go in the ``ignore`` pass.
         ('\u3042' * 512, '\u3042' * 170),
         (('\u3042' * 512).encode('utf-8'), '\u3042' * 170),
     ])
     def test_bounded_body_keeps_exactly_the_leading_bytes(self, body, expected):
-        # "Is a prefix" plus "larger than a third of the limit" bottoms out at
-        # 170 bytes, which an implementation trimming multi-byte bodies to 256
-        # -- about half of what is kept today -- would still satisfy.
-        #
-        # Representative inputs therefore carry a complete expected value.  The
-        # 170 is computed by hand from the declaration (U+FFFD is 3 bytes, the
-        # limit is 512), not derived from the implementation.
+        # Expected values computed by hand (U+FFFD=3 bytes, limit=512, so 170 fit).
         assert pd_provider.ERROR_BODY_LOG_LIMIT == 512
         assert pd_provider._bounded_body(body) == expected
 
     def test_bounded_body_passes_none_through(self):
-        # An error built without a body yields ``None``.  Collapsing that to
-        # ``''`` would make "the body was empty" and "there was no body"
-        # indistinguishable in the log.
         assert pd_provider._bounded_body(None) is None
 
     def test_translate_upload_error_quota_logged_as_warning(self, provider, caplog):
-        # Quota exhaustion is an expected, user-resolvable failure (see the
-        # is_user_error handling), so it must not be logged at ERROR level and
-        # trip the on-call alerting.
+        # Quota must be logged at WARNING, not ERROR, to avoid alerting.
         error_xml = ('<Error><Code>QuotaExceeded</Code>'
                      '<Message>The bucket quota has been exceeded</Message>'
                      '<RequestId>QUOTAREQUESTID</RequestId></Error>')
@@ -2165,23 +1957,12 @@ class TestCRUD:
         assert 'StorageFull' not in codes
 
     @pytest.mark.parametrize('label,raw,expected', [
-        # ``get_object`` is ``json.loads`` with no type check, so the envvar can
-        # legitimately decode to any JSON type.  Every one of them has to end up
-        # as a set of strings, because the only consumer is ``code in codes``.
         ('json-array', '["XMinioStorageFull"]', {'XMinioStorageFull'}),
-        # A quoted JSON scalar decodes to ``str``.  Feeding that to ``frozenset``
-        # explodes it into one entry per character, so the configured code stops
-        # matching entirely -- and nothing fails loudly.
         ('json-scalar-string', '"QuotaExceeded"', {'QuotaExceeded'}),
-        # A JSON number is not iterable at all: ``frozenset(507)`` raises
-        # ``TypeError`` while the settings module is being imported, which takes
-        # the whole provider down rather than just mis-classifying an error.
         ('json-number', '507', {'507'}),
     ])
     def test_quota_exceeded_error_codes_env_types(self, label, raw, expected):
-        # This must exercise the *real* path: envvar -> ``get_object`` ->
-        # whatever normalisation the settings module does.  Patching the
-        # already-computed attribute would skip exactly the code under test.
+        # Exercise the real path (envvar -> get_object -> normalisation), not the computed attr.
         env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': raw}
         try:
             with mock.patch.dict(os.environ, env):
@@ -2195,20 +1976,13 @@ class TestCRUD:
             assert code[:-1] not in codes
 
     @pytest.mark.parametrize('label,raw', [
-        # The value operators are most likely to write: the bare error code,
-        # without the JSON quoting ``get_object`` requires.
         ('bare-word', 'QuotaExceeded'),
         ('comma-separated', 'QuotaExceeded,XMinioStorageFull'),
         ('empty-string', ''),
         ('truncated-json', '["QuotaExceeded"'),
     ])
     def test_malformed_json_falls_back_instead_of_killing_the_import(self, label, raw):
-        # ``_normalise_error_codes`` is applied to the *return value* of
-        # ``get_object``, so it never sees a value that ``json.loads`` refused.
-        # An import-time ``JSONDecodeError`` is not a loud failure: stevedore
-        # turns the entry-point load error into ``ProviderNotFound``, so every
-        # s3compatsigv4 request answers 404 while the process stays up and the
-        # other providers keep working.  A quota-code typo must not do that.
+        # Malformed JSON must fall back to defaults, not kill the import.
         env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': raw}
         try:
             with mock.patch.dict(os.environ, env):
@@ -2216,17 +1990,11 @@ class TestCRUD:
         finally:
             importlib.reload(pd_settings)
 
-        # Falling back to the defaults keeps quota detection working rather
-        # than leaving it configured with a half-parsed value.
         assert 'QuotaExceeded' in codes
         assert 'XMinioStorageFull' in codes
 
     def test_malformed_json_warns(self, caplog):
-        # The fallback is silent from the operator's point of view: quota
-        # detection keeps working with the *defaults*, so the codes they
-        # configured simply never match.  The warning is the only thing that
-        # connects that symptom to its cause, and asserting the fallback value
-        # alone does not notice it being demoted to DEBUG.
+        # The WARNING is the only signal connecting a misconfiguration to its symptom.
         with caplog.at_level(logging.WARNING, logger=pd_settings.__name__):
             env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': 'QuotaExceeded'}
             with mock.patch.dict(os.environ, env):
@@ -2239,8 +2007,6 @@ class TestCRUD:
         assert 'not valid JSON' in records[0].getMessage()
 
     def test_mapping_config_warns(self, caplog):
-        # Same reasoning as above, for the branch that silently reduced a
-        # mapping to its keys before R4-B.
         with caplog.at_level(logging.WARNING, logger=pd_settings.__name__):
             pd_settings._normalise_error_codes({'QuotaExceeded': 507})
 
@@ -2250,19 +2016,12 @@ class TestCRUD:
         assert 'mapping' in records[0].getMessage()
 
     def test_null_config_falls_back_to_the_defaults(self):
-        # ``null`` is valid JSON, so it reaches ``_normalise_error_codes``
-        # intact.  ``None`` is not a ``Mapping``, not a ``str`` and not
-        # ``Iterable``, so the scalar branch wrapped it and produced
-        # ``frozenset({'None'})`` -- a configuration under which no storage
-        # error code can ever match.  "Unset" is the only sane reading.
+        # ``null`` from JSON must fall back to defaults, not produce ``frozenset({'None'})``.
         assert pd_settings._normalise_error_codes(None) == frozenset(
             pd_settings.QUOTA_EXCEEDED_ERROR_CODE_DEFAULTS)
 
     def test_mapping_config_is_rejected_rather_than_silently_degraded(self):
-        # A ``dict`` satisfies ``Iterable``, so it slips past the scalar branch
-        # and ``frozenset(str(code) for code in ...)`` quietly reduces it to its
-        # *keys*.  That is indistinguishable from a working configuration until
-        # a quota error fails to be recognised in production.
+        # A dict must be rejected, not silently reduced to its keys.
         env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': '{"QuotaExceeded": 507}'}
         try:
             with mock.patch.dict(os.environ, env):
@@ -2273,8 +2032,6 @@ class TestCRUD:
         assert 'XMinioStorageFull' in codes
 
     def test_quota_error_codes_env_types_reach_the_provider(self, provider):
-        # The normalisation is only useful if the value the provider actually
-        # reads is the normalised one.
         env = {'S3COMPAT_PROVIDER_CONFIG_QUOTA_EXCEEDED_ERROR_CODES': '"QuotaExceeded"'}
         try:
             with mock.patch.dict(os.environ, env):
@@ -2298,12 +2055,7 @@ class TestCRUD:
 
     @pytest.mark.parametrize('label,configured,expected', [
         ('list', ['QuotaExceeded'], {'QuotaExceeded'}),
-        # A bare ``str`` must be wrapped, not iterated: iterating it yields one
-        # entry per character and ``'Quota' in 'QuotaExceeded'`` would have
-        # turned the membership test into substring matching.
         ('bare-string', 'QuotaExceeded', {'QuotaExceeded'}),
-        # A JSON number is not iterable, so it has to be wrapped before the
-        # ``frozenset`` call rather than after it.
         ('bare-int', 507, {'507'}),
         ('mixed-list', ['QuotaExceeded', 507], {'QuotaExceeded', '507'}),
         ('tuple', ('QuotaExceeded',), {'QuotaExceeded'}),
@@ -2313,7 +2065,6 @@ class TestCRUD:
 
         assert isinstance(codes, frozenset)
         assert codes == expected
-        # Every element is a ``str``, so ``code in codes`` can never raise.
         assert all(isinstance(code, str) for code in codes)
 
     @pytest.mark.parametrize('configured,warns', [
@@ -2322,9 +2073,7 @@ class TestCRUD:
         (507, True),
     ])
     def test_normalise_error_codes_warns_on_scalar(self, caplog, configured, warns):
-        # A scalar is coerced, not rejected: raising here would happen at import
-        # time and take the provider down over a typo.  The warning is the only
-        # signal the operator gets, so it must actually be emitted.
+        # Scalar is coerced (not rejected), but a warning must be emitted.
         with caplog.at_level(logging.WARNING, logger=pd_settings.__name__):
             pd_settings._normalise_error_codes(configured)
 
@@ -2334,18 +2083,8 @@ class TestCRUD:
             assert 'QUOTA_EXCEEDED_ERROR_CODES' in records[0].getMessage()
 
     def test_user_facing_messages_keep_their_wording(self, provider):
-        # Every other assertion in this file spells the expected text as
-        # ``provider.<CONSTANT>``, so changing a constant changes the assertion
-        # with it.  Setting one to ``''`` makes ``'' in message`` vacuously true
-        # and so deletes every positive-form assertion that names it, without
-        # failing any of them.
-        #
-        # Pinning the wording once, here, is what gives those assertions teeth.
-        # It is deliberately partial (phrases, not the full string) so that
-        # rewording for clarity stays cheap while deletion and replacement do
-        # not.  This is the same guard H-7 added for
-        # UPLOAD_MAY_HAVE_COMPLETED_MESSAGE, which had not been carried across
-        # to the other three constants.
+        # Pin partial wording so that emptying a constant or replacing its text
+        # is caught -- ``'' in message`` is vacuously true otherwise.
         assert 'quota or capacity' in provider.QUOTA_EXCEEDED_MESSAGE
         assert 'free up storage space' in provider.QUOTA_EXCEEDED_MESSAGE
 
@@ -2355,16 +2094,12 @@ class TestCRUD:
 
         assert 'connection to the cloud storage was interrupted' \
             in provider.CONNECTION_INTERRUPTED_MESSAGE
-        # The message must keep naming the network as a possible cause: a
-        # dropped connection is evidence of exhausted capacity, never proof.
         assert 'network problem' in provider.CONNECTION_INTERRUPTED_MESSAGE
 
         assert 'may in fact have completed' in provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
         assert 'check the file list' in provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
 
     def test_translate_upload_error_507_fallback(self, provider):
-        # The storage may answer 507 with an error code we do not know.  The
-        # status alone is enough to treat it as a quota failure.
         error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
                      '<Error><Code>SomeVendorSpecificCode</Code>'
                      '<Message>no space left</Message></Error>')
@@ -2374,12 +2109,9 @@ class TestCRUD:
         assert translated.code == HTTPStatus.INSUFFICIENT_STORAGE
         assert provider.QUOTA_EXCEEDED_MESSAGE in translated.message
         assert 'SomeVendorSpecificCode' in translated.message
-        # The 507 fallback is a quota failure like any other, so
-        # it must get the same non-paging treatment as a recognised code.
         assert translated.is_user_error is True
 
     def test_translate_upload_error_507_without_xml_body(self, provider):
-        # A 507 with an unparsable body must still become a quota message.
         err = storage_error('Insufficient Storage', code=HTTPStatus.INSUFFICIENT_STORAGE)
 
         translated = provider._translate_upload_error(err)
@@ -2388,8 +2120,6 @@ class TestCRUD:
         assert translated.is_user_error is True
 
     def test_translate_upload_error_quota_is_user_error(self, provider):
-        # Filling up a bucket is an expected user-side failure: it must not be
-        # reported to Sentry at error level nor page oncall via 5xx alerts.
         error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
                      '<Error><Code>QuotaExceeded</Code>'
                      '<Message>The bucket quota has been exceeded</Message></Error>')
@@ -2397,35 +2127,27 @@ class TestCRUD:
 
         assert provider._translate_upload_error(err).is_user_error is True
 
-        # Non-quota storage errors are not the user's doing.
         other_xml = error_xml.replace('QuotaExceeded', 'AccessDenied')
         other = storage_error({'response': other_xml}, code=403)
         assert provider._translate_upload_error(other).is_user_error is False
 
     @pytest.mark.parametrize('label,err_factory', [
-        # Quota, by error code.
         ('quota-code', lambda: storage_error(
             {'response': '<Error><Code>QuotaExceeded</Code>'
                          '<Message>quota</Message>'
                          '<Resource>/bucket/secret-key-name</Resource></Error>'}, code=403)),
-        # Quota, by HTTP 507 fallback.
         ('quota-507', lambda: storage_error(
             {'response': '<Error><Code>Whatever</Code>'
                          '<Resource>/bucket/secret-key-name</Resource></Error>'},
             code=HTTPStatus.INSUFFICIENT_STORAGE)),
-        # Classified, but not quota.
         ('other-code', lambda: storage_error(
             {'response': '<Error><Code>AccessDenied</Code><Message>nope</Message>'
                          '<Resource>/bucket/secret-key-name</Resource></Error>'}, code=403)),
-        # Unclassifiable XML.
         ('unclassifiable', lambda: storage_error(
             {'response': '<Error><Resource>/bucket/secret-key-name</Resource></Error>'},
             code=HTTPStatus.BAD_GATEWAY)),
-        # Not XML at all.
         ('non-xml', lambda: storage_error(
             {'response': '/bucket/secret-key-name is over quota'}, code=403)),
-        # ``exception_from_response`` builds this shape for a HEAD/no-body
-        # response: a *string* message that embeds the presigned URL.
         ('default-msg', lambda: storage_error(
             'An error occurred while making a PUT request to '
             'https://host/bucket/secret-key-name?X-Amz-Signature=deadbeef', code=403)),
@@ -2433,12 +2155,8 @@ class TestCRUD:
     @pytest.mark.parametrize('extra_message', ['', '  abort failed'])
     def test_translate_upload_error_never_leaks_raw_body(self, provider, label, err_factory,
                                                          extra_message):
-        # ``BaseHandler.write_error`` (server/api/v1/core.py:28) writes
-        # ``exc.data`` verbatim as the response body when it is truthy, and
-        # otherwise writes ``exc.message``.  Either way, anything left on the
-        # translated exception is shown to the user -- including the storage's
-        # Resource paths and, on the string-message path, the presigned URL and
-        # its signature.  The translated error must carry a summary only.
+        # ``write_error`` exposes ``exc.data`` or ``exc.message`` verbatim -- no
+        # Resource paths or presigned URLs may survive on the translated error.
         err = err_factory()
         translated = provider._translate_upload_error(err, extra_message=extra_message)
 
@@ -2449,9 +2167,7 @@ class TestCRUD:
             assert translated.message.endswith(extra_message)
 
     def test_check_for_200_error_preserves_error_body(self, provider):
-        # S3 signals CompleteMultipartUpload failures with HTTP 200 plus an
-        # <Error> body.  The raw body must survive on the exception, otherwise
-        # the quota translation downstream has nothing to work with.
+        # 200-with-<Error>: raw body must survive for quota translation downstream.
         error_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
                      '<Error><Code>QuotaExceeded</Code>'
                      '<Message>The bucket quota has been exceeded</Message></Error>')
@@ -2466,18 +2182,13 @@ class TestCRUD:
             HTTPStatus.INSUFFICIENT_STORAGE
 
     @pytest.mark.parametrize('label,error_xml', [
-        # ``xmltodict`` collapses all three of these to ``{'Error': None}``, so a
-        # lookup that returns ``None`` cannot tell "no <Error> element" from
-        # "<Error> element we failed to classify".  Conflating the two makes a
-        # failed CompleteMultipartUpload look like a success.
+        # All three collapse to ``{'Error': None}`` -- must not be treated as success.
         ('empty-element', '<?xml version="1.0" encoding="UTF-8"?><Error/>'),
         ('empty-pair', '<?xml version="1.0" encoding="UTF-8"?><Error></Error>'),
         ('whitespace-only', '<?xml version="1.0" encoding="UTF-8"?><Error>   </Error>'),
     ])
     def test_check_for_200_error_fails_closed_on_empty_error_element(self, provider, label,
                                                                     error_xml):
-        # An <Error> element is present: the request failed.  Not being able to
-        # classify it is no reason to report success.
         with pytest.raises(exceptions.UploadError):
             provider._check_for_200_error(error_xml.encode('utf-8'),
                                           'CompleteMultipartUpload',
@@ -2493,9 +2204,7 @@ class TestCRUD:
     ])
     def test_check_for_200_error_unclassifiable_is_not_a_server_fault(self, provider, label,
                                                                      error_xml):
-        # The user must never see a bare HTTP 500.  An <Error>
-        # body we cannot classify is the *storage* answering unintelligibly, so
-        # it is a bad-gateway condition, not a WaterButler bug.
+        # Unclassifiable <Error> is a bad-gateway, not a 500 bug.
         with pytest.raises(exceptions.UploadError) as exc:
             provider._check_for_200_error(error_xml.encode('utf-8'),
                                           'CompleteMultipartUpload',
@@ -2505,9 +2214,7 @@ class TestCRUD:
         assert int(exc.value.code) == int(HTTPStatus.BAD_GATEWAY)
 
     def test_check_for_200_error_malformed_xml_is_controlled(self, provider):
-        # A truncated body raises ExpatError out of ``xmltodict``.  Letting it
-        # escape means an HTTP 500 with a stack trace (``_translate_upload_error``
-        # then trips over the missing ``.message``).
+        # Truncated body must not escape as an uncontrolled HTTP 500.
         with pytest.raises(exceptions.UploadError) as exc:
             provider._check_for_200_error(b'<Error><Code>QuotaExceeded',
                                           'CompleteMultipartUpload',
@@ -2516,7 +2223,6 @@ class TestCRUD:
         assert int(exc.value.code) == int(HTTPStatus.BAD_GATEWAY)
 
     def test_check_for_200_error_accepts_success_body(self, provider):
-        # Guard the other direction: a genuine success body must stay silent.
         body = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<CompleteMultipartUploadResult><ETag>"etag"</ETag>'
                 '</CompleteMultipartUploadResult>')
@@ -2533,11 +2239,8 @@ class TestCRUD:
     ])
     async def test_chunked_upload_complete_200_with_unclassifiable_error(
             self, provider, file_stream, mock_time, error_body):
-        # The regression this pins down: on a *replace* upload the old object is
-        # still in the bucket, so ``upload()`` would return its metadata and the
-        # caller would record a successful upload of data that was never
-        # committed.  The session must be aborted and the caller must see an
-        # error.
+        # A failed commit on a replace upload must not silently return the old
+        # object's metadata.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -2564,11 +2267,8 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_session_error_keeps_waterbutler_message(
             self, provider, file_stream, mock_time):
-        # ``_create_upload_session`` authors its own 502: a session may exist on
-        # the storage but its UploadId is unknown, so it cannot be aborted and
-        # an administrator has to remove it by hand.  That message has no
-        # storage body behind it, so ``_translate_upload_error`` must not
-        # replace it with the generic "could not be interpreted" text.
+        # Session creation's own 502 message must not be replaced by the
+        # generic translator text.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -2591,15 +2291,8 @@ class TestCRUD:
     @pytest.mark.parametrize('stage', ['create-session', 'upload-part', 'complete'])
     async def test_every_upload_stage_tags_its_storage_errors(self, provider, file_stream,
                                                               mock_time, stage):
-        # ``_translate_upload_error`` only translates errors the upload path
-        # tagged in ``_make_upload_request``.  A call site that reaches for
-        # ``make_request`` directly therefore stops being translated *silently*:
-        # the user gets the storage's raw 403 instead of the quota message.
-        #
-        # Every other test for these three stages mocks above ``make_request``
-        # (``_create_upload_session`` / ``_upload_parts`` are replaced wholesale),
-        # so none of them would notice the tag going missing.  This one mocks the
-        # boundary itself, which keeps each real call site under test.
+        # Mocks ``make_request`` itself (not the higher-level methods) to verify
+        # that every call site goes through ``_make_upload_request`` and gets tagged.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -2657,25 +2350,17 @@ class TestCRUD:
             await provider._chunked_upload(file_stream, path)
 
         assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message
-        # Asserting against the constant alone passes for *any* value of it,
-        # including ``''``.  Pinning the wording here is what makes the
-        # assertion above detect the message being emptied (the same failure
-        # mode the ERROR_BODY_LOG_LIMIT test was fixed for).
+        # Pin wording: ``'' in message`` is vacuously true.
         assert 'may in fact have completed' in provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
         assert 'check the file list' in provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
-        # The raw body must still not reach the user.
         assert 'Error' not in exc.value.message
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_chunked_upload_complete_read_failure_warns_upload_may_exist(
             self, provider, file_stream, mock_time):
-        # The commit was sent and the storage answered -- we just could not read
-        # the answer.  This is the case the notice exists for, yet it
-        # was the one case that did not get it: ``_mark_commit_outcome_unknown``
-        # sat behind ``except exceptions.UploadError``, which a dropped
-        # connection does not satisfy.  The user was told the upload was
-        # "interrupted before the upload completed" and asked to retry.
+        # Connection dropped while reading the commit answer -- the notice must
+        # still appear since the commit may have succeeded.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -2694,25 +2379,15 @@ class TestCRUD:
             await provider._chunked_upload(file_stream, path)
 
         assert provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message
-        # The connection message must not contradict the notice it now carries.
         assert 'before the upload completed' not in exc.value.message
-        # The connection was still released despite the read blowing up.
         assert resp.release.called
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_parts_connection_error_does_not_claim_a_commit(
             self, provider, file_stream, mock_time):
-        # This test used to break the connection at *session creation*, which
-        # raises out of ``_chunked_upload``'s first ``except`` -- a branch that
-        # never calls ``_commit_outcome_note`` at all.  Asserting the notice's
-        # absence there asserted nothing: the mutation that makes the note
-        # unconditional left this test green.
-        #
-        # The branch that does consult the note is the connection-error arm of
-        # the outer handler, so break the connection during ``_upload_parts``
-        # instead.  The parts never finished, so no commit was ever sent and
-        # the notice must stay off.
+        # Break the connection during parts (not session creation) to reach the
+        # branch that consults ``_commit_outcome_note``.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -3004,12 +2679,8 @@ class TestCRUD:
         assert (provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message) is expect_notice
 
     def test_the_xml_parser_is_what_strips_the_code(self, provider):
-        # xmltodict strips text nodes by default, which makes the ``.strip()``
-        # in ``_parse_s3_error_body`` redundant today, and therefore invisible
-        # to the matching-rule test above.  That is only acceptable while
-        # "somebody strips" stays observable: if a dependency bump stops
-        # xmltodict from stripping, this test fails and the ``.strip()`` is
-        # the only thing still holding the rule up.
+        # Invariant guard: if xmltodict stops stripping, the ``.strip()`` in
+        # ``_parse_s3_error_body`` becomes the only defence.
         parsed = xmltodict.parse('<Error><Code>\n  AccessDenied\n</Code></Error>')
         assert parsed['Error']['Code'] == 'AccessDenied'
 
@@ -3121,17 +2792,8 @@ class TestCRUD:
     @pytest.mark.parametrize('chunked', [False, True])
     async def test_connection_error_log_does_not_leak_the_signature(
             self, provider, file_stream, mock_time, caplog, chunked):
-        # aiohttp 3.6.2 builds this exact message in ``ClientRequest.write_bytes``
-        # when the socket dies mid-body:
-        #
-        #     new_exc = ClientOSError(exc.errno,
-        #                             'Can not write request body for %s' % self.url)
-        #
-        # and ``self.url`` is the presigned URL this provider signs with SigV4.
-        # A dropped connection during the upload is precisely the event this PR
-        # exists to handle, so this is the common path, not a corner case:
-        # logging the exception renders the signature into the log and, through
-        # the exception chain, into the traceback Sentry keeps.
+        # aiohttp embeds the presigned URL in ClientOSError on socket death;
+        # the signature must not reach the log or traceback.
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5 if chunked else 4096
         provider.CHUNK_SIZE = 2
@@ -3155,12 +2817,8 @@ class TestCRUD:
         assert 'X-Amz-Signature' not in logged
         assert 'X-Amz-Credential' not in logged
         assert 'SECRETSIG' not in logged
-        # The type is what the log is for, so it still has to be there.
         assert 'ClientOSError' in logged
-        # The chained ``__context__`` renders the original exception -- and its
-        # message -- into the traceback, so suppressing the log alone is not
-        # enough.  The translation paths already use ``from None``; the
-        # connection paths have to match.
+        # ``from None`` must also be used on connection paths.
         assert exc.value.__cause__ is None
         assert exc.value.__suppress_context__ is True
 
@@ -3172,16 +2830,8 @@ class TestCRUD:
     ])
     async def test_commit_failure_does_not_chain_the_presigned_url(
             self, provider, file_stream, mock_time, failure, expected_code):
-        # ``_chunked_upload`` has five ``raise ... from None`` sites.  The two
-        # taken when the *commit* fails -- the ``CONNECTION_ERRORS`` arm and
-        # the 500 arm -- are guarded nowhere else:
-        # ``test_connection_error_log_does_not_leak_the_signature`` kills
-        # ``make_request`` outright and so never gets past
-        # ``_create_upload_session``.  This test reaches the commit.
-        #
-        # What leaks is the signature query of the presigned SigV4 URL,
-        # carried into the traceback through ``__context__`` and kept by
-        # Sentry.  Suppressing it is observable: ``__suppress_context__``.
+        # The two ``from None`` sites taken on commit failure are not reached by
+        # the session-creation test.  Pin ``__suppress_context__`` here.
         presigned = ('https://minio.example/bkt/key?X-Amz-Algorithm=AWS4-HMAC-SHA256'
                      '&X-Amz-Credential=AKIAEXAMPLE%2F20260913%2Fus-east-1%2Fs3%2Faws4_request'
                      '&X-Amz-Signature=1f2e3d4c5b6a7988SECRETSIG')
