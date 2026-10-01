@@ -1,6 +1,9 @@
 import hashlib
 
+import pytest
+
 from tests import utils
+from waterbutler.core import metadata
 
 
 class TestBaseMetadata:
@@ -114,3 +117,28 @@ class TestBaseMetadata:
             'modified_utc': 'never',
             'versionIdentifier': 'versions',
         }
+
+
+class TestNoPayloadDrivenConstruction:
+    """CL M-1 / 決定-21: core carries no way to build a metadata class named by a payload.
+
+    The ``dehydrate``/``rehydrate`` pair came from COS's Celery serialization work (ENG-7534)
+    and has nothing to do with SigV4.  ``rehydrate`` read a dotted name out of the payload and
+    turned it into a class -- ``importlib.import_module(...)`` then ``getattr`` -- so anything
+    that ever reached it with attacker-shaped input would be choosing which class WaterButler
+    instantiates and what it is called with.  Nothing in GRDM calls either method, so the
+    gadget sat there earning nothing.
+
+    ``core`` is inherited by every provider, so this is also the one place where the S3 branch
+    was widening its blast radius beyond S3.  These assertions are what keeps a later merge
+    from restoring the pair without the decision being revisited (台帳 U-11).
+    """
+
+    @pytest.mark.parametrize('name', ['dehydrate', '_dehydrate', 'rehydrate', '_rehydrate'])
+    def test_base_metadata_has_no_hydration_hooks(self, name):
+        assert not hasattr(metadata.BaseMetadata, name)
+
+    def test_core_metadata_does_not_import_importlib(self):
+        """The import is the gadget's only ingredient; its absence is what makes the removal
+        real rather than a rename."""
+        assert not hasattr(metadata, 'importlib')
