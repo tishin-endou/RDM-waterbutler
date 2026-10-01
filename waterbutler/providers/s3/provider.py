@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import logging
 
 from urllib.parse import unquote
+import aiohttp
 import xmltodict
 import xml.sax.saxutils
 from aiobotocore.config import AioConfig
@@ -198,49 +200,16 @@ class S3Provider(provider.BaseProvider):
 
         return response_contents, response_prefixes
 
-    async def delete_s3_bucket_folder_objects(self, path):
-        continuation_token = None
-        delete_requests = []
-        while True:
-            list_params = {
-                'Bucket': self.bucket_name,
-                'Prefix': path,
-            }
-            if continuation_token:
-                list_params['ContinuationToken'] = continuation_token
+    async def delete_objects_in_chunks(self, path, delete_requests):
+        """Send ``delete_requests`` to DeleteObjects in batches of 1000, the API maximum.
 
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_objects_v2.html
-            list_url = await self.generate_generic_presigned_url(
-                '', 'list_objects_v2', query_parameters=list_params, default_params=False
-            )
-
-            resp = await self.make_request(
-                'GET', list_url,
-                expects=(200, 206),
-                throws=exceptions.DownloadError
-            )
-            xml_body = await resp.text()
-            doc = xmltodict.parse(xml_body)
-            result = doc.get('ListBucketResult', {})
-
-            contents = result.get('Contents') or []
-
-            if isinstance(contents, dict):
-                contents = [contents]
-            for content in contents:
-                key = content['Key']
-                if key:
-                    # on testing it was seen that folders with name xml encoding are not deleted (though files are)
-                    # so casting is needed on using xml approach with aiobotocore
-                    key = key.replace('+', ' ')
-                    content['Key'] = unquote(key)
-                    delete_requests.append({"Key": content['Key']})
-
-            # handle pagination
-            if result.get('IsTruncated') == 'true':
-                continuation_token = result.get('NextContinuationToken')
-            else:
-                break
+        :param str path: the path being deleted, used for error messages only
+        :param list delete_requests: ``{'Key': ...}`` or ``{'Key': ..., 'VersionId': ...}`` dicts
+        :raises: :class:`.DeleteError` if any object in any batch was not deleted
+        """
+        if not delete_requests:
+            # DeleteObjects rejects an empty object list.
+            return
 
         session = get_session()
         region_name = {"region_name": self.region} if self.region else {}
@@ -255,25 +224,45 @@ class S3Provider(provider.BaseProvider):
             for index in range(0, len(delete_requests), 1000):
                 chunk = delete_requests[index:index + 1000]
                 try:
-                    await s3_client.delete_objects(
+                    result = await s3_client.delete_objects(
                         Bucket=self.bucket_name,
-                        Delete={"Objects": chunk}
+                        # GRDM: Quiet=False so that per-object failures are reported back.
+                        Delete={"Objects": chunk, "Quiet": False}
                     )
                 except Exception as e:
                     raise exceptions.DeleteError(f"{path} {e}")
 
-    async def get_object_versions(self, query_parameters):
+                # GRDM: DeleteObjects answers 200 even when individual objects were refused.
+                # Fail closed, and name the survivors so the caller can retry them.
+                errors = (result or {}).get('Errors') or []
+                if errors:
+                    survivors = ', '.join(
+                        '{}({}) {}'.format(error.get('Key'),
+                                           error.get('VersionId') or 'null',
+                                           error.get('Code'))
+                        for error in errors
+                    )
+                    raise exceptions.DeleteError(
+                        'Failed to delete {} of {} objects under {}: {}'.format(
+                            len(errors), len(chunk), path, survivors)
+                    )
 
-        continuation_token = None
+    async def get_object_versions(self, query_parameters, include_delete_markers=False):
+        """List every version of the keys matched by ``query_parameters``.
+
+        :param dict query_parameters: ListObjectVersions parameters, e.g. ``Prefix``
+        :param bool include_delete_markers: also return the ``DeleteMarker`` entries.  Off by
+            default so that :func:`revisions` keeps returning real revisions only; a delete
+            marker is not something a user can restore or download.
+        :rtype: list of dict
+        """
         query_parameters = dict(query_parameters)
         query_parameters.setdefault('Bucket', self.bucket_name)
 
         versions_result = []
         while True:
 
-            if continuation_token:
-                query_parameters['ContinuationToken'] = continuation_token
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_objects_v2.html
+            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_object_versions.html
             list_url = await self.generate_generic_presigned_url(
                 '', 'list_object_versions', query_parameters=query_parameters, default_params=False
             )
@@ -288,26 +277,40 @@ class S3Provider(provider.BaseProvider):
 
             result = doc.get('ListVersionsResult', {})
 
-            versions = result.get('Version') or []
+            element_names = ['Version', 'DeleteMarker'] if include_delete_markers else ['Version']
+            for element_name in element_names:
+                entries = result.get(element_name) or []
 
-            if isinstance(versions, dict):
-                versions = [versions]
+                if isinstance(entries, dict):
+                    entries = [entries]
 
-            for version in versions:
-                key = version.get('Key')
-                if key:
-                    # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
-                    # have tried yarl and furl but not see it to be helpful
-                    # Todo: maybe there is a better approach (not confident all encoding is casted)
-                    key = key.replace('+', ' ')
-                    version['Key'] = unquote(key)
-                    versions_result.append(version)
+                for entry in entries:
+                    key = entry.get('Key')
+                    if key:
+                        # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
+                        # have tried yarl and furl but not see it to be helpful
+                        # Todo: maybe there is a better approach (not confident all encoding is casted)
+                        key = key.replace('+', ' ')
+                        entry['Key'] = unquote(key)
+                        versions_result.append(entry)
 
-            # handle pagination
-            if result.get('IsTruncated') == 'true':
-                continuation_token = result.get('NextContinuationToken')
-            else:
+            # handle pagination.  ListObjectVersions does not use the ListObjectsV2
+            # continuation token; it resumes from the last key *and* version id reported.
+            if result.get('IsTruncated') != 'true':
                 break
+
+            next_key_marker = result.get('NextKeyMarker')
+            next_version_id_marker = result.get('NextVersionIdMarker')
+            if not next_key_marker:
+                # Truncated but no marker to resume from: repeating the request would return
+                # this same page forever.  Stop rather than loop.
+                break
+
+            query_parameters['KeyMarker'] = next_key_marker
+            if next_version_id_marker:
+                query_parameters['VersionIdMarker'] = next_version_id_marker
+            else:
+                query_parameters.pop('VersionIdMarker', None)
 
         return versions_result
 
@@ -712,19 +715,42 @@ class S3Provider(provider.BaseProvider):
                 )
 
         if path.is_file:
-            # Docs: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
-            delete_url = await self.generate_generic_presigned_url(path.path, method='delete_object')
-
-            resp = await self.make_request(
-                'DELETE',
-                delete_url,
-                expects=(200, 204,),
-                throws=exceptions.DeleteError,
-            )
-
-            await resp.release()
+            # GRDM: purge every version of the key rather than issuing a plain DELETE.  On a
+            # versioned bucket a plain DELETE only writes a new delete marker, leaving all the
+            # previous versions -- and the storage they occupy -- behind.
+            await self._delete_file_versions(path)
         else:
             await self._delete_folder(path, **kwargs)
+
+    async def _delete_file_versions(self, path):
+        """GRDM: delete every version and delete marker of a single key.
+
+        :param *ProviderPath path: the file to purge
+        :raises: :class:`.DeleteError` if the versions cannot be listed or not all of them
+            could be deleted
+        """
+        try:
+            versions = await self.get_object_versions({'Prefix': path.path},
+                                                      include_delete_markers=True)
+        except exceptions.WaterButlerError as exc:
+            # Report the failure, not the provider's raw error document.
+            raise exceptions.DeleteError(
+                'Failed to list the versions of {}: {}'.format(path.path, type(exc).__name__),
+                code=exc.code
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise exceptions.DeleteError(
+                'Failed to list the versions of {}: {}'.format(path.path, type(exc).__name__)
+            )
+
+        # ``Prefix`` is a prefix match, so a listing for 'foo' also returns 'foo.bak'.
+        delete_requests = [
+            {'Key': version['Key'], 'VersionId': version['VersionId']}
+            for version in versions
+            if version.get('Key') == path.path and version.get('VersionId')
+        ]
+
+        await self.delete_objects_in_chunks(path.path, delete_requests)
 
     async def _delete_folder(self, path, **kwargs):
         """Query for recursive contents of folder and delete in batches of 1000
@@ -734,6 +760,7 @@ class S3Provider(provider.BaseProvider):
         Calls: func: self._check_region
 
         :param *ProviderPath path: Path to be deleted
+        :raises: :class:`.NotFoundError` if nothing at all is stored under the prefix
 
         On S3, folders are not first-class objects, but are instead inferred
         from the names of their children.  A regular DELETE request issued
@@ -741,9 +768,30 @@ class S3Provider(provider.BaseProvider):
         To fully delete an occupied folder, we must delete all of the comprising
         objects.  Amazon provides a bulk delete operation to simplify this.
         # docs https://boto3.amazonaws.com/v1/documentation/api/1.28.0/reference/services/s3/client/delete_objects.html#delete-objects
+
+        GRDM: every version and delete marker under the prefix has to go, not just the live
+        keys.  On a versioned bucket a listing of live keys misses both the superseded
+        versions and the keys that are already delete-marked, so deleting a folder that way
+        leaves its whole history -- and the storage it occupies -- behind.
         """
         await self._check_region()
-        await self.delete_s3_bucket_folder_objects(path.path)
+
+        versions = await self.get_object_versions({'Prefix': path.path},
+                                                  include_delete_markers=True)
+
+        # Neither a version nor a delete marker under the prefix: the folder does not exist.
+        # An empty folder is not this case -- S3 stores it as a 0-byte 'prefix/' key, which is
+        # one version of its own.
+        if not versions:
+            raise exceptions.NotFoundError(str(path))
+
+        delete_requests = [
+            {'Key': version['Key'], 'VersionId': version['VersionId']}
+            for version in versions
+            if version.get('Key') and version.get('VersionId')
+        ]
+
+        await self.delete_objects_in_chunks(path.path, delete_requests)
 
     async def revisions(self, path, **kwargs):
         """Get past versions of the requested key
