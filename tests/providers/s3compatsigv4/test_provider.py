@@ -2368,6 +2368,7 @@ class TestCRUD:
         assert (provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in exc.value.message) is expect_notice
         if not expect_notice and error_code in pd_settings.QUOTA_EXCEEDED_ERROR_CODES:
             assert exc.value.code == HTTPStatus.INSUFFICIENT_STORAGE
+            assert len(provider.QUOTA_EXCEEDED_MESSAGE) > 10
             assert provider.QUOTA_EXCEEDED_MESSAGE in exc.value.message
 
     @pytest.mark.asyncio
