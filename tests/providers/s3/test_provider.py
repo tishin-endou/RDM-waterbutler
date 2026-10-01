@@ -11,11 +11,13 @@ import logging
 import aiohttp
 import datetime
 import traceback
+import xmltodict
 import aiohttpretty
 import botocore.auth
 import botocore.exceptions
 from aiohttp import web
 from aiobotocore import session as aiobotocore_session
+from aiobotocore.client import AioBaseClient
 from http import client
 from urllib import parse
 from unittest import mock
@@ -66,26 +68,38 @@ def mock_time(monkeypatch):
     monkeypatch.setattr(time, 'time', mock_time)
 
 
+@pytest.fixture(autouse=True)
+def pinned_signing_clock():
+    """Pin the clock botocore signs with, for every test in this module.
+
+    T-1 / CX1-11: a test that answers the *real* presigner has to name the URL the presigner
+    produces, and the only thing that moves between two otherwise identical signings is
+    ``X-Amz-Date`` and the signature derived from it.  Freezing it here rather than at each call
+    site means a test can go back to the real presigner by deleting the stub, without also
+    having to re-indent its body into a ``with`` block.  Nothing else about signing is touched:
+    parameter validation, serialisation and the HMAC all still run.
+    """
+    with frozen_signing_clock():
+        yield
+
+
 @pytest.fixture
 def provider(auth, credentials, settings):
-    prov = S3Provider(auth, credentials, settings)
-    prov._check_region = MockCoroutine()
+    """The shared provider, with only the region lookup stubbed.
 
-    async def _gen_presigned(path, method='head_object', query_parameters=None, default_params=True):
-        clean = path.lstrip('/')
-        if clean:
-            return f'https://that-kerning.s3.amazonaws.com/{clean}'
-        return 'https://that-kerning.s3.amazonaws.com/'
+    T-1 / CX1-11: this fixture used to install a hand-written ``generate_generic_presigned_url``
+    and ``check_key_existence`` -- the first returned ``https://<bucket>.s3.amazonaws.com/<key>``
+    from the path alone, ignoring the operation and the parameters entirely; the second re-made
+    the same string.  Every test reached through it therefore asserted against a URL the test
+    suite had invented, and the real presigner never ran.  Three ROUND1 majors lived in exactly
+    that gap (CX1-1/2/3).  The stubs are gone; ``region`` is pinned so the endpoint the presigner
+    signs against is stable, and :func:`pinned_signing_clock` pins the clock, which is what lets
+    a test name the signed URL in advance.
 
-    prov.generate_generic_presigned_url = _gen_presigned
-
-    async def _check_key(path, expects=(200,), query_parameters=None):
-        url = f'https://that-kerning.s3.amazonaws.com/{path}'
-        return await prov.make_request('HEAD', url, expects=expects, throws=exceptions.MetadataError)
-
-    prov.check_key_existence = _check_key
-
-    return prov
+    Identical to :func:`raw_provider`, which the tests that build a second provider -- a copy
+    destination, a differently configured bucket -- call directly.
+    """
+    return raw_provider(auth, credentials, settings)
 
 
 @pytest.fixture
@@ -201,46 +215,20 @@ def list_upload_chunks_body(parts_metadata):
     return payload, headers
 
 
-def build_folder_params(path):
-    return {'prefix': path.path, 'delimiter': '/'}
+def folder_listing_params(path, max_keys=None, continuation_token=None):
+    """The ListObjectsV2 parameters ``_metadata_folder`` signs for ``path``.
 
-
-BUCKET_URL = 'https://that-kerning.s3.amazonaws.com/'
-
-
-def install_query_encoding_presigned_url(provider):
-    """Replace the ``provider`` fixture's presigned-URL stub with one that encodes the query
-    parameters into the URL, which is what a real presigned URL does.  The default stub throws
-    the parameters away, so every page of a paged listing would collapse onto a single URL and
-    aiohttpretty would be unable to tell one page request from the next.
-
-    :return: the list of query-parameter dicts, one per call, in call order
+    T-1 / CX1-11: these are the parameters the provider passes, in the casing botocore wants --
+    ``MaxKeys`` an int, because botocore validates parameter types before it signs (CX1-1).
+    They go to the signing call, not to an assertion about the query string: the query string
+    is now whatever botocore signed, and the test matches it by naming the whole URL.
     """
-    calls = []
-
-    async def _gen_presigned(path, method='head_object', query_parameters=None,
-                             default_params=True):
-        params = dict(query_parameters or {})
-        calls.append(params)
-        url = BUCKET_URL + (path or '').lstrip('/')
-        if params:
-            url += '?' + parse.urlencode(sorted(params.items()))
-        return url
-
-    provider.generate_generic_presigned_url = _gen_presigned
-    return calls
-
-
-def versions_url(**params):
-    """The URL that :func:`install_query_encoding_presigned_url` produces for a
-    ``list_object_versions`` call made with ``params``."""
-    return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
-
-
-def objects_url(**params):
-    """The URL that :func:`install_query_encoding_presigned_url` produces for a
-    ``list_objects_v2`` call made with ``params``."""
-    return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
+    params = {'Bucket': 'that-kerning', 'Prefix': path.path, 'Delimiter': '/'}
+    if max_keys is not None:
+        params['MaxKeys'] = max_keys
+    if continuation_token:
+        params['ContinuationToken'] = continuation_token
+    return params
 
 
 def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=None,
@@ -314,34 +302,58 @@ def list_versions_response(versions=(), delete_markers=(), is_truncated=False,
     return body.encode('utf-8')
 
 
-class _AsyncClientCtx:
-    """``session.create_client()`` returns an async context manager, and ``mock.AsyncMock``
-    needs Python 3.8+."""
+class _OverriddenClientCtx:
+    """The real ``create_client()`` context manager, with ``methods`` bound over the client it
+    yields.  ``mock.AsyncMock`` needs Python 3.8+, hence the hand-written protocol."""
 
-    def __init__(self, client):
-        self._client = client
+    def __init__(self, inner, methods):
+        self._inner = inner
+        self._methods = methods
 
     async def __aenter__(self):
-        return self._client
+        client = await self._inner.__aenter__()
+        # botocore builds the API methods onto the client's class, so an instance attribute
+        # shadows the one being replaced and leaves the rest of the client alone.
+        for name, coroutine in self._methods.items():
+            setattr(client, name, coroutine)
+        return client
 
     async def __aexit__(self, *args):
-        return False
+        return await self._inner.__aexit__(*args)
 
 
 def patch_aiobotocore_client(**methods):
-    """Patch the aiobotocore session the provider builds its clients from, so that
-    ``create_client()`` yields a mock client with ``methods`` bound on it.  This injects at the
-    aiobotocore boundary only; the provider method under test still runs for real.
+    """Let the provider build a *real* aiobotocore client, then raise from ``methods`` on it.
 
-    :return: ``(patcher, client)`` -- use the patcher as a context manager
+    T-1 / CX1-11: client creation is not stubbed and ``generate_presigned_url`` is left alone,
+    so a provider method that signs a URL on its way to the call under test still signs it with
+    the real presigner.
+
+    T-1 / CX2-3: **failure injection only.**  A method bound here shadows ``_make_api_call``,
+    so nothing below it -- serialisation, signing, the ``needs-retry`` chain, the rest-xml
+    parser -- runs at all.  That is the point when the failure being measured is one the SDK
+    itself raises (a ``ClientError`` the provider has to convert, a cancellation), and it is a
+    hole when the call is expected to succeed: the request S3 would have received is never
+    built, so nothing about it can be asserted.  Success and partial-failure answers therefore
+    belong to ``patch_session_with_before_send``, which replaces the transport and leaves the
+    SDK to run.
+
+    :return: ``(patcher, handle)`` -- use the patcher as a context manager; ``handle`` carries
+        the same coroutine objects that were bound onto the client
     """
-    client = mock.Mock()
+    handle = mock.Mock()
     for name, coroutine in methods.items():
-        setattr(client, name, coroutine)
-    session = mock.Mock()
-    session.create_client = mock.Mock(return_value=_AsyncClientCtx(client))
-    patcher = mock.patch('waterbutler.providers.s3.provider.get_session', return_value=session)
-    return patcher, client
+        setattr(handle, name, coroutine)
+
+    def _get_session():
+        session = aiobotocore_session.get_session()
+        real_create_client = session.create_client
+        session.create_client = lambda *a, **kw: _OverriddenClientCtx(
+            real_create_client(*a, **kw), methods)
+        return session
+
+    patcher = mock.patch('waterbutler.providers.s3.provider.get_session', _get_session)
+    return patcher, handle
 
 
 def raw_provider(auth, credentials, settings):
@@ -545,22 +557,16 @@ class TestValidatePath:
     async def test_validate_v1_path_file(self, provider, file_header_metadata, mock_time):
         file_path = 'foobah'
 
-        root_listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/'
-        file_head_url = f'https://that-kerning.s3.amazonaws.com/my-subfolder/{file_path}'
-        bucket_listing_url = 'https://that-kerning.s3.amazonaws.com/'
-
-        aiohttpretty.register_uri(
-            'GET',
-            root_listing_url,
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2', path='/my-subfolder/',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': '/my-subfolder/',
+                              'Delimiter': '/', 'MaxKeys': 1},
             body=b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><Prefix>my-subfolder/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>',
             headers={'Content-Type': 'application/xml'},
-            match_querystring=False,
         )
-        aiohttpretty.register_uri(
-            'HEAD',
-            file_head_url,
-            headers=file_header_metadata,
-            match_querystring=False,
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=f'my-subfolder/{file_path}',
+            default_params=True, headers=file_header_metadata,
         )
 
         assert WaterButlerPath('/my-subfolder/', prepend=None) == await provider.validate_v1_path('/')
@@ -579,21 +585,16 @@ class TestValidatePath:
     async def test_validate_v1_path_file_with_subfolder(self, provider, file_header_metadata, mock_time):
         file_path = '/foobah'
 
-        listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/'
-        file_head_url = f'https://that-kerning.s3.amazonaws.com/my-subfolder{file_path}'
-
-        aiohttpretty.register_uri(
-            'GET',
-            listing_url,
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2', path='/my-subfolder/',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': '/my-subfolder/',
+                              'Delimiter': '/', 'MaxKeys': 1},
             body=b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><Prefix>my-subfolder/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>',
             headers={'Content-Type': 'application/xml'},
-            match_querystring=False,
         )
-        aiohttpretty.register_uri(
-            'HEAD',
-            file_head_url,
-            headers=file_header_metadata,
-            match_querystring=False,
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=f'my-subfolder{file_path}',
+            default_params=True, headers=file_header_metadata,
         )
 
         assert WaterButlerPath('/my-subfolder/') == await provider.validate_v1_path('/')
@@ -607,20 +608,17 @@ class TestValidatePath:
     async def test_validate_v1_path_folder(self, provider, folder_metadata, mock_time):
         folder_path = '/Photos'
 
-        listing_url = 'https://that-kerning.s3.amazonaws.com/my-subfolder/Photos/'
-
-        aiohttpretty.register_uri(
-            'GET',
-            listing_url,
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2', path=f'/my-subfolder{folder_path}/',
+            query_parameters={'Bucket': 'that-kerning',
+                              'Prefix': f'/my-subfolder{folder_path}/',
+                              'Delimiter': '/', 'MaxKeys': 1},
             body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
             headers={'Content-Type': 'application/xml'},
-            match_querystring=False,
         )
-        aiohttpretty.register_uri(
-            'HEAD',
-            f'https://that-kerning.s3.amazonaws.com/my-subfolder{folder_path}',
-            status=404,
-            match_querystring=False,
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=f'my-subfolder{folder_path}',
+            default_params=True, status=404,
         )
 
         wb_path_v1 = await provider.validate_v1_path(folder_path + '/')
@@ -679,9 +677,10 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True,
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'get_object', path=path.path, default_params=True,
+            query_parameters={'ResponseContentDisposition': make_disposition(path.name)},
+            body=b'delicious', auto_length=True)
 
         result = await provider.download(path)
         content = await result.read()
@@ -692,9 +691,10 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_range(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', url, body=b'de', auto_length=True, status=206,
-                                  match_querystring=False)
+        url = await register_presigned(
+            provider, 'GET', 'get_object', path=path.path, default_params=True,
+            query_parameters={'ResponseContentDisposition': make_disposition(path.name)},
+            body=b'de', auto_length=True, status=206)
 
         result = await provider.download(path, range=(0, 1))
         assert result.partial
@@ -706,9 +706,11 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_download_version(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True,
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'get_object', path=path.path, default_params=True,
+            query_parameters={'VersionId': 'someversion',
+                              'ResponseContentDisposition': make_disposition(path.name)},
+            body=b'delicious', auto_length=True)
 
         result = await provider.download(path, revision='someversion')
         content = await result.read()
@@ -725,21 +727,27 @@ class TestCRUD:
     async def test_download_with_display_name(self, provider, mock_time, display_name_arg,
                                               expected_name):
         path = WaterButlerPath('/muhtriangle')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', url, body=b'delicious', auto_length=True,
-                                  match_querystring=False)
+        # The disposition is signed into the URL, so naming the expected one here is what makes
+        # this test about which name S3 is asked to hand back.
+        url = await register_presigned(
+            provider, 'GET', 'get_object', path=path.path, default_params=True,
+            query_parameters={'ResponseContentDisposition': make_disposition(expected_name)},
+            body=b'delicious', auto_length=True)
 
         result = await provider.download(path, display_name=display_name_arg)
         content = await result.read()
 
         assert content == b'delicious'
+        assert aiohttpretty.has_call(method='GET', uri=url)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_download_not_found(self, provider, mock_time):
         path = WaterButlerPath('/muhtriangle')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', url, status=404, match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'get_object', path=path.path, default_params=True,
+            query_parameters={'ResponseContentDisposition': make_disposition(path.name)},
+            status=404)
 
         with pytest.raises(exceptions.DownloadError):
             await provider.download(path)
@@ -766,13 +774,14 @@ class TestCRUD:
 
         content_md5 = hashlib.md5(file_content).hexdigest()
 
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata,
-                                  match_querystring=False)
-        header = {'ETag': f'"{content_md5}"'}
-        aiohttpretty.register_uri('PUT', url, status=201, headers=header,
-                                  match_querystring=False)
+        # PUT and HEAD are signed separately -- the HTTP method is part of the canonical request,
+        # so these are two different URLs even though they name the same key.
+        metadata_url = await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
+            headers=file_header_metadata)
+        url = await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True,
+            status=201, headers={'ETag': f'"{content_md5}"'})
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -793,13 +802,12 @@ class TestCRUD:
 
         path = WaterButlerPath('/foobah')
         content_md5 = hashlib.md5(file_content).hexdigest()
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('HEAD', metadata_url, headers=file_header_metadata,
-                                  match_querystring=False)
-        header = {'ETag': f'"{content_md5}"'}
-        aiohttpretty.register_uri('PUT', url, status=201, headers=header,
-                                  match_querystring=False)
+        metadata_url = await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
+            headers=file_header_metadata)
+        url = await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True,
+            status=201, headers={'ETag': f'"{content_md5}"'})
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -821,20 +829,19 @@ class TestCRUD:
         provider.encrypt_uploads = True
         path = WaterButlerPath('/foobah')
         content_md5 = hashlib.md5(file_content).hexdigest()
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri(
-            'HEAD',
-            metadata_url,
+        metadata_url = await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
             responses=[
                 {'status': 404},
                 {'headers': file_header_metadata},
             ],
-            match_querystring=False,
         )
-        headers={'ETag': f'"{content_md5}"'}
-        aiohttpretty.register_uri('PUT', url, status=200, headers=headers,
-                                  match_querystring=False)
+        # `encrypt_uploads` puts `ServerSideEncryption` into the signed parameters as well as
+        # into the header, so the encrypted upload is a different URL from the plain one.
+        url = await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True,
+            query_parameters={'ServerSideEncryption': 'AES256'},
+            status=200, headers={'ETag': f'"{content_md5}"'})
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -890,10 +897,9 @@ class TestCRUD:
                                                                       create_session_resp,
                                                                       mock_time):
         path = WaterButlerPath('/foobah')
-        init_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-
-        aiohttpretty.register_uri('POST', init_url, body=create_session_resp, status=200,
-                                  match_querystring=False)
+        init_url = await register_presigned(
+            provider, 'POST', 'create_multipart_upload', path=path.path, default_params=True,
+            body=create_session_resp, status=200)
 
         session_id = await provider._create_upload_session(path)
         expected_session_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
@@ -910,10 +916,13 @@ class TestCRUD:
                                                                         mock_time):
         provider.encrypt_uploads = True
         path = WaterButlerPath('/foobah')
-        init_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-
-        aiohttpretty.register_uri('POST', init_url, body=create_session_resp, status=200,
-                                  match_querystring=False)
+        # `ServerSideEncryption` is a header parameter, so botocore signs it into
+        # ``X-Amz-SignedHeaders`` rather than into the query -- which is why the encrypted
+        # session is a different signature from the plain one above.
+        init_url = await register_presigned(
+            provider, 'POST', 'create_multipart_upload', path=path.path, default_params=True,
+            query_parameters={'ServerSideEncryption': 'AES256'},
+            body=create_session_resp, status=200)
 
         session_id = await provider._create_upload_session(path)
         expected_session_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
@@ -1030,15 +1039,10 @@ class TestCRUD:
         payload += '</CompleteMultipartUpload>'
         payload = payload.encode('utf-8')
 
-        complete_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-
-        aiohttpretty.register_uri(
-            'POST',
-            complete_url,
-            status=200,
-            body=complete_upload_resp,
-            match_querystring=False,
-        )
+        complete_url = await register_presigned(
+            provider, 'POST', 'complete_multipart_upload', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            status=200, body=complete_upload_resp)
 
         await provider._complete_multipart_upload(path, upload_id, headers_list)
 
@@ -1051,11 +1055,13 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        abort_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('DELETE', abort_url, status=204, match_querystring=False)
-        aiohttpretty.register_uri('GET', list_url, body=generic_http_404_resp, status=404,
-                                  match_querystring=False)
+        abort_url = await register_presigned(
+            provider, 'DELETE', 'abort_multipart_upload', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id}, status=204)
+        await register_presigned(
+            provider, 'GET', 'list_parts', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            body=generic_http_404_resp, status=404)
 
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
@@ -1069,11 +1075,13 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        abort_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('DELETE', abort_url, status=204, match_querystring=False)
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_empty, status=200,
-                                  match_querystring=False)
+        abort_url = await register_presigned(
+            provider, 'DELETE', 'abort_multipart_upload', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id}, status=204)
+        list_url = await register_presigned(
+            provider, 'GET', 'list_parts', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            body=list_parts_resp_empty, status=200)
 
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
@@ -1090,11 +1098,13 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        abort_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('DELETE', abort_url, status=204, match_querystring=False)
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_not_empty, status=200,
-                                  match_querystring=False)
+        abort_url = await register_presigned(
+            provider, 'DELETE', 'abort_multipart_upload', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id}, status=204)
+        await register_presigned(
+            provider, 'GET', 'list_parts', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            body=list_parts_resp_not_empty, status=200)
 
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
@@ -1110,9 +1120,10 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', list_url, body=generic_http_404_resp, status=404,
-                                  match_querystring=False)
+        list_url = await register_presigned(
+            provider, 'GET', 'list_parts', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            body=generic_http_404_resp, status=404)
 
         resp_xml, session_deleted = await provider._list_uploaded_chunks(path, upload_id)
 
@@ -1129,9 +1140,10 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_empty, status=200,
-                                  match_querystring=False)
+        list_url = await register_presigned(
+            provider, 'GET', 'list_parts', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            body=list_parts_resp_empty, status=200)
 
         resp_xml, session_deleted = await provider._list_uploaded_chunks(path, upload_id)
 
@@ -1148,9 +1160,10 @@ class TestCRUD:
         path = WaterButlerPath('/foobah')
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        list_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', list_url, body=list_parts_resp_not_empty, status=200,
-                                  match_querystring=False)
+        list_url = await register_presigned(
+            provider, 'GET', 'list_parts', path=path.path, default_params=True,
+            query_parameters={'UploadId': upload_id},
+            body=list_parts_resp_not_empty, status=200)
 
         resp_xml, session_deleted = await provider._list_uploaded_chunks(path, upload_id)
 
@@ -1160,132 +1173,161 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete(self, provider, mock_time):
+    async def test_delete(self, provider, monkeypatch, mock_time):
         """GRDM: deleting a file purges every version of the key, not only the current one.
 
         A plain DELETE only writes a new delete marker, so the old versions keep occupying the
         user's quota forever.
         """
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(
-                versions=[('some-file', 'version-two'), ('some-file', 'version-one')],
-                delete_markers=[('some-file', 'marker-one')],
-            ),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(
+                    versions=[('some-file', 'version-two'), ('some-file', 'version-one')],
+                    delete_markers=[('some-file', 'marker-one')],
+                ),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-file', 'VersionId': 'version-two'},
-                                {'Key': 'some-file', 'VersionId': 'version-one'},
-                                {'Key': 'some-file', 'VersionId': 'marker-one'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-file', 'VersionId': 'version-two'},
+                         {'Key': 'some-file', 'VersionId': 'version-one'},
+                         {'Key': 'some-file', 'VersionId': 'marker-one'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_leaves_keys_that_merely_share_the_prefix(self, provider, mock_time):
+    async def test_a_successful_delete_is_a_real_sdk_call(self, provider, monkeypatch, mock_time):
+        """CX2-3 / T-1: a delete that succeeds still runs the SDK end to end.
+
+        The delete tests here used to bind a coroutine over ``delete_objects`` on a real client,
+        which reads like a real call and is not one: ``_make_api_call`` never runs, so nothing is
+        serialised, signed or parsed and the expectations are checked against the dict the
+        provider passed in.  Injecting at ``before-send`` leaves all of that in place.  This
+        counts the operations the client actually dispatched, so re-introducing a client-level
+        stub anywhere in this file would show up here as a zero rather than as a silent loss of
+        coverage.
+        """
+        path = WaterButlerPath('/some-file')
+
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+            body=list_versions_response(versions=[('some-file', 'v1')]),
+            status=200)
+
+        api_calls = []
+        real_make_api_call = AioBaseClient._make_api_call
+
+        async def _counting(client, operation_name, api_params):
+            api_calls.append(operation_name)
+            return await real_make_api_call(client, operation_name, api_params)
+
+        monkeypatch.setattr(AioBaseClient, '_make_api_call', _counting)
+        sent = patch_delete_objects(monkeypatch)
+
+        await provider.delete(path)
+
+        assert api_calls == ['DeleteObjects']
+        assert len(sent) == 1
+        assert b'AWS4-HMAC-SHA256' in sent[0].headers['Authorization']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_delete_file_leaves_keys_that_merely_share_the_prefix(self, provider,
+                                                                        monkeypatch, mock_time):
         """Prefix= is a prefix match, so 'some-file.bak' comes back alongside 'some-file'."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(
-                versions=[('some-file', 'version-one'), ('some-file.bak', 'version-bak')],
-            ),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(
+                    versions=[('some-file', 'version-one'), ('some-file.bak', 'version-bak')],
+                ),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-file', 'VersionId': 'version-one'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-file', 'VersionId': 'version-one'}], 'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_on_bucket_without_versioning(self, provider, mock_time):
+    async def test_delete_file_on_bucket_without_versioning(self, provider, monkeypatch,
+                                                            mock_time):
         """V-3: a bucket with versioning disabled reports the single live object with the
         literal version id 'null', which DeleteObjects accepts verbatim."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(versions=[('some-file', 'null')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(versions=[('some-file', 'null')]),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-file', 'VersionId': 'null'}], 'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-file', 'VersionId': 'null'}], 'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_with_no_versions_makes_no_delete_call(self, provider, mock_time):
+    async def test_delete_file_with_no_versions_makes_no_delete_call(self, provider, monkeypatch,
+                                                                     mock_time):
         """DeleteObjects rejects an empty object list, so there is nothing to send."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        assert s3_client.delete_objects.called is False
+        await provider.delete(path)
+
+        assert sent == []
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_file_partial_failure_raises(self, provider, mock_time):
+    async def test_delete_file_partial_failure_raises(self, provider, monkeypatch, mock_time):
         """V-4: DeleteObjects reports per-object failures in the 200 body.  Fail closed, and
         name the objects that survived so the caller can retry them."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=list_versions_response(
-                versions=[('some-file', 'version-two'), ('some-file', 'version-one')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=list_versions_response(
+                    versions=[('some-file', 'version-two'), ('some-file', 'version-one')]),
+            status=200)
 
-        delete_result = {
-            'Deleted': [{'Key': 'some-file', 'VersionId': 'version-two'}],
-            'Errors': [{'Key': 'some-file', 'VersionId': 'version-one',
-                        'Code': 'AccessDenied', 'Message': 'Access Denied'}],
-        }
-        patcher, _ = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value=delete_result))
-        with patcher:
-            with pytest.raises(exceptions.DeleteError) as exc_info:
-                await provider.delete(path)
+        patch_delete_objects(monkeypatch, _FakeHTTPResponse(200, delete_objects_response(
+            deleted=[('some-file', 'version-two')],
+            errors=[('some-file', 'version-one', 'AccessDenied')])))
+
+        with pytest.raises(exceptions.DeleteError) as exc_info:
+            await provider.delete(path)
 
         message = exc_info.value.message
         assert 'some-file' in message
@@ -1302,14 +1344,13 @@ class TestCRUD:
         """V-5: a failed version listing must surface as a DeleteError, not as whatever the
         listing helper happens to throw, and must not leak the raw S3 error document."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-file'),
-            body=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code>'
-                 b'<Message>Access Denied</Message></Error>',
-            status=status,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-file'},
+                body=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code>'
+                     b'<Message>Access Denied</Message></Error>',
+            status=status)
 
         with pytest.raises(exceptions.DeleteError) as exc_info:
             await provider.delete(path)
@@ -1327,7 +1368,6 @@ class TestCRUD:
         """V-5: transport failures are not WaterButlerErrors and would otherwise escape
         delete() unconverted."""
         path = WaterButlerPath('/some-file')
-        install_query_encoding_presigned_url(provider)
 
         async def _fail(*args, **kwargs):
             raise transport_error()
@@ -1346,250 +1386,271 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_confirm_delete(self, provider, mock_time):
+    async def test_delete_confirm_delete(self, provider, monkeypatch, mock_time):
         path = WaterButlerPath('/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix=''),
-            body=list_versions_response(
-                versions=[('some-folder/', 'v1'), ('some-folder/file.txt', 'v2')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': ''},
+                body=list_versions_response(
+                    versions=[('some-folder/', 'v1'), ('some-folder/file.txt', 'v2')]),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            with pytest.raises(exceptions.DeleteError):
-                await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-            assert s3_client.delete_objects.called is False
+        with pytest.raises(exceptions.DeleteError):
+            await provider.delete(path)
 
-            await provider.delete(path, confirm_delete=1)
+        assert sent == []
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'some-folder/', 'VersionId': 'v1'},
-                                {'Key': 'some-folder/file.txt', 'VersionId': 'v2'}],
-                    'Quiet': False},
+        await provider.delete(path, confirm_delete=1)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'some-folder/', 'VersionId': 'v1'},
+                         {'Key': 'some-folder/file.txt', 'VersionId': 'v2'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_with_versions(self, provider, mock_time):
+    async def test_delete_folder_with_versions(self, provider, monkeypatch, mock_time):
         """V-6: deleting a folder purges every version and every delete marker under the
         prefix.  Deleting only the live keys leaves the folder's whole history -- and the
         storage it occupies -- behind on a versioned bucket.
         """
         path = WaterButlerPath('/folder-to-delete/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='folder-to-delete/'),
-            body=list_versions_response(
-                versions=[('folder-to-delete/file1.txt', '111'),
-                          ('folder-to-delete/file1.txt', '222')],
-                delete_markers=[('folder-to-delete/file2.txt', '333')],
-            ),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'folder-to-delete/'},
+                body=list_versions_response(
+                    versions=[('folder-to-delete/file1.txt', '111'),
+                              ('folder-to-delete/file1.txt', '222')],
+                    delete_markers=[('folder-to-delete/file2.txt', '333')],
+                ),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'folder-to-delete/file1.txt', 'VersionId': '111'},
-                                {'Key': 'folder-to-delete/file1.txt', 'VersionId': '222'},
-                                {'Key': 'folder-to-delete/file2.txt', 'VersionId': '333'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'folder-to-delete/file1.txt', 'VersionId': '111'},
+                         {'Key': 'folder-to-delete/file1.txt', 'VersionId': '222'},
+                         {'Key': 'folder-to-delete/file2.txt', 'VersionId': '333'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_single_item_folder_delete(self, provider, mock_time):
+    async def test_single_item_folder_delete(self, provider, monkeypatch, mock_time):
         path = WaterButlerPath('/single-thing-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='single-thing-folder/'),
-            body=list_versions_response(versions=[('single-thing-folder/item', 'v1')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'single-thing-folder/'},
+                body=list_versions_response(versions=[('single-thing-folder/item', 'v1')]),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'single-thing-folder/item', 'VersionId': 'v1'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'single-thing-folder/item', 'VersionId': 'v1'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_empty_folder_delete(self, provider, mock_time):
+    async def test_empty_folder_delete(self, provider, monkeypatch, mock_time):
         """V-6: an empty folder still exists as the 0-byte ``prefix/`` key, which is one
         version of its own.  Deleting it must remove that key, not report the folder missing.
         """
         path = WaterButlerPath('/empty-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='empty-folder/'),
-            body=list_versions_response(versions=[('empty-folder/', 'v1')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'empty-folder/'},
+                body=list_versions_response(versions=[('empty-folder/', 'v1')]),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'empty-folder/', 'VersionId': 'v1'}], 'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'empty-folder/', 'VersionId': 'v1'}], 'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_not_found(self, provider, mock_time):
+    async def test_delete_folder_not_found(self, provider, monkeypatch, mock_time):
         """V-6: a prefix with neither a version nor a delete marker under it is a folder that
         does not exist, and must not be reported as a successful delete."""
         path = WaterButlerPath('/not-found-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='not-found-folder/'),
-            body=list_versions_response(),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'not-found-folder/'},
+                body=list_versions_response(),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            with pytest.raises(exceptions.NotFoundError):
-                await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        assert s3_client.delete_objects.called is False
+        with pytest.raises(exceptions.NotFoundError):
+            await provider.delete(path)
+
+        assert sent == []
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_of_delete_markers_only(self, provider, mock_time):
+    async def test_delete_folder_of_delete_markers_only(self, provider, monkeypatch, mock_time):
         """V-6: a folder whose keys have all been delete-marked still has versions to purge."""
         path = WaterButlerPath('/tombstone-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='tombstone-folder/'),
-            body=list_versions_response(
-                delete_markers=[('tombstone-folder/file1.txt', '111')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'tombstone-folder/'},
+                body=list_versions_response(
+                    delete_markers=[('tombstone-folder/file1.txt', '111')]),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'tombstone-folder/file1.txt', 'VersionId': '111'}],
-                    'Quiet': False},
+        await provider.delete(path)
+
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'tombstone-folder/file1.txt', 'VersionId': '111'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_large_folder_delete(self, provider, mock_time):
+    async def test_large_folder_delete(self, provider, monkeypatch, mock_time):
         """DeleteObjects takes at most 1000 objects per call."""
         path = WaterButlerPath('/some-folder/')
-        install_query_encoding_presigned_url(provider)
 
         keys = [f'some-folder/file-{index:05d}' for index in range(1001)]
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='some-folder/'),
-            body=list_versions_response(versions=[(key, 'v1') for key in keys]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'some-folder/'},
+                body=list_versions_response(versions=[(key, 'v1') for key in keys]),
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
 
-        batches = [call[1]['Delete']['Objects'] for call in s3_client.delete_objects.call_args_list]
+        await provider.delete(path)
+
+        batches = [sent_delete_objects(request)[1]['Objects'] for request in sent]
         assert [len(batch) for batch in batches] == [1000, 1]
         assert [entry['Key'] for batch in batches for entry in batch] == keys
 
     @pytest.mark.asyncio
+    async def test_a_refusal_in_a_later_batch_is_reported(self, auth, credentials, settings,
+                                                          monkeypatch, mock_time):
+        """CX2-2 / V-4: every batch's body is read, not just the first one's.
+
+        DeleteObjects answers 200 and lists the refusals inside the body, so the check belongs
+        to each call rather than to the loop's outcome.  The partial-failure tests above use a
+        single batch, where "the last response" and "every response" cannot be told apart --
+        code that checked only the first, or only the last, or that broke out of the loop after
+        the first success would pass them all.  This sends 1001 objects so that the loop runs
+        twice and puts the refusal in the *second* answer.
+
+        The responses are injected at ``before-send``, so botocore serialises the 1001-object
+        request, signs it and parses the XML back into the ``Errors`` list the provider reads.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        delete_requests = [{'Key': 'some-folder/file-{:05d}'.format(index), 'VersionId': 'v1'}
+                           for index in range(1001)]
+        sent = patch_session_with_before_send(
+            monkeypatch,
+            serve_in_order(
+                _FakeHTTPResponse(200, delete_objects_response(
+                    deleted=[(entry['Key'], 'v1') for entry in delete_requests[:1000]])),
+                _FakeHTTPResponse(200, delete_objects_response(
+                    errors=[('some-folder/file-01000', 'v1', 'AccessDenied')])),
+            ),
+            operation='DeleteObjects')
+
+        with pytest.raises(exceptions.DeleteError) as exc_info:
+            await provider.delete_objects_in_chunks('/some-folder/', delete_requests)
+
+        assert len(sent) == 2
+        assert 'some-folder/file-01000' in exc_info.value.message
+        assert 'AccessDenied' in exc_info.value.message
+        # The count names the batch, not the whole listing: "1 of 1" says the survivor is the
+        # only object in the second batch.
+        assert '1 of 1 objects' in exc_info.value.message
+
+    @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_folder_truncated_response(self, provider, mock_time):
+    async def test_delete_folder_truncated_response(self, provider, monkeypatch, mock_time):
         """V-6: a folder holding more than one page of versions must be listed to the end
         before any of it is deleted, otherwise the tail of the folder silently survives.
         ListObjectVersions resumes from the last key *and* version id, not a continuation
         token."""
         path = WaterButlerPath('/large-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        page_one_url = versions_url(Bucket='that-kerning', Prefix='large-folder/')
-        page_two_url = versions_url(Bucket='that-kerning', Prefix='large-folder/',
-                                    KeyMarker='large-folder/file2.txt', VersionIdMarker='222')
-
-        aiohttpretty.register_uri(
-            'GET', page_one_url,
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'large-folder/'},
             body=list_versions_response(versions=[('large-folder/file1.txt', '111')],
                                         is_truncated=True,
                                         next_key_marker='large-folder/file2.txt',
                                         next_version_id_marker='222'),
-            status=200,
-        )
-        aiohttpretty.register_uri(
-            'GET', page_two_url,
+            status=200)
+        page_two_url = await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'large-folder/',
+                              'KeyMarker': 'large-folder/file2.txt',
+                              'VersionIdMarker': '222'},
             body=list_versions_response(versions=[('large-folder/file2.txt', '222')]),
-            status=200,
-        )
+            status=200)
 
-        patcher, s3_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [], 'Errors': []}))
-        with patcher:
-            await provider.delete(path)
+        sent = patch_delete_objects(monkeypatch)
+
+        await provider.delete(path)
 
         assert aiohttpretty.has_call(method='GET', uri=page_two_url)
-        s3_client.delete_objects.assert_called_once_with(
-            Bucket='that-kerning',
-            Delete={'Objects': [{'Key': 'large-folder/file1.txt', 'VersionId': '111'},
-                                {'Key': 'large-folder/file2.txt', 'VersionId': '222'}],
-                    'Quiet': False},
+        assert len(sent) == 1
+        assert sent_delete_objects(sent[0]) == (
+            'that-kerning',
+            {'Objects': [{'Key': 'large-folder/file1.txt', 'VersionId': '111'},
+                         {'Key': 'large-folder/file2.txt', 'VersionId': '222'}],
+             'Quiet': False},
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_folder_delete_partial_failure_raises(self, provider, mock_time):
+    async def test_folder_delete_partial_failure_raises(self, provider, monkeypatch, mock_time):
         """V-4, folder side: refusals reported inside the 200 body must not read as success."""
         path = WaterButlerPath('/error-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
-            body=list_versions_response(versions=[('error-folder/file1.txt', '111'),
-                                                  ('error-folder/file2.txt', '222')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'error-folder/'},
+                body=list_versions_response(versions=[('error-folder/file1.txt', '111'),
+                                                      ('error-folder/file2.txt', '222')]),
+            status=200)
 
-        delete_result = {
-            'Deleted': [{'Key': 'error-folder/file1.txt', 'VersionId': '111'}],
-            'Errors': [{'Key': 'error-folder/file2.txt', 'VersionId': '222',
-                        'Code': 'AccessDenied', 'Message': 'Access Denied'}],
-        }
-        patcher, _ = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value=delete_result))
-        with patcher:
-            with pytest.raises(exceptions.DeleteError) as exc_info:
-                await provider.delete(path)
+        patch_delete_objects(monkeypatch, _FakeHTTPResponse(200, delete_objects_response(
+            deleted=[('error-folder/file1.txt', '111')],
+            errors=[('error-folder/file2.txt', '222', 'AccessDenied')])))
+
+        with pytest.raises(exceptions.DeleteError) as exc_info:
+            await provider.delete(path)
 
         assert 'error-folder/file2.txt' in exc_info.value.message
         assert 'AccessDenied' in exc_info.value.message
@@ -1599,13 +1660,12 @@ class TestCRUD:
     async def test_delete_folder_delete_error(self, provider, mock_time):
         """V-6: a refused DeleteObjects call surfaces as a DeleteError."""
         path = WaterButlerPath('/error-folder/')
-        install_query_encoding_presigned_url(provider)
 
-        aiohttpretty.register_uri(
-            'GET', versions_url(Bucket='that-kerning', Prefix='error-folder/'),
-            body=list_versions_response(versions=[('error-folder/file1.txt', '111')]),
-            status=200,
-        )
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'error-folder/'},
+                body=list_versions_response(versions=[('error-folder/file1.txt', '111')]),
+            status=200)
 
         patcher, _ = patch_aiobotocore_client(
             delete_objects=MockCoroutine(side_effect=Exception('AccessDenied')))
@@ -1672,9 +1732,10 @@ class TestCRUD:
     async def test_download_without_accept_url_still_streams(self, provider, mock_time):
         """G-10: ``?direct`` -- the one case where the server asks for the bytes -- is unchanged."""
         path = WaterButlerPath('/my-image')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('GET', url, body=b'content', auto_length=True,
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'get_object', path=path.path, default_params=True,
+            query_parameters={'ResponseContentDisposition': make_disposition(path.name)},
+            body=b'content', auto_length=True)
 
         result = await provider.download(path, accept_url=False)
         content = await result.read()
@@ -1697,11 +1758,11 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_folder(self, provider, folder_metadata, mock_time):
         path = WaterButlerPath('/darp/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
-                                  headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path),
+            body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+            headers={'Content-Type': 'application/xml'})
 
         result = await provider.metadata(path)
 
@@ -1717,10 +1778,11 @@ class TestMetadata:
     async def test_metadata_have_next_token(self, provider, folder_metadata, mock_time):
         """P-1: ``metadata()`` accepts ``next_token`` instead of dropping it into ``**kwargs``."""
         path = WaterButlerPath('/darp/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
-                                  headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path, max_keys=1000),
+            body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+            headers={'Content-Type': 'application/xml'})
 
         result = await provider.metadata(path, revision=None, next_token='')
 
@@ -1735,10 +1797,11 @@ class TestMetadata:
     async def test_metadata_folder_have_next_token(self, provider, folder_metadata, mock_time):
         """P-1: ``_metadata_folder()`` takes the token positionally as well."""
         path = WaterButlerPath('/darp/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
-                                  headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path, max_keys=1000),
+            body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
+            headers={'Content-Type': 'application/xml'})
 
         result = await provider._metadata_folder(path, next_token='')
 
@@ -1753,10 +1816,10 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_folder_self_listing(self, provider, folder_and_contents, mock_time):
         path = WaterButlerPath('/thisfolder/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, body=folder_and_contents if isinstance(folder_and_contents, bytes) else folder_and_contents.encode('utf-8'),
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path),
+            body=folder_and_contents if isinstance(folder_and_contents, bytes) else folder_and_contents.encode('utf-8'))
 
         result = await provider.metadata(path)
 
@@ -1769,11 +1832,11 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_folder_metadata_folder_item(self, provider, folder_item_metadata, mock_time):
         path = WaterButlerPath('/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, body=folder_item_metadata if isinstance(folder_item_metadata, bytes) else folder_item_metadata.encode('utf-8'),
-                                  headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path),
+            body=folder_item_metadata if isinstance(folder_item_metadata, bytes) else folder_item_metadata.encode('utf-8'),
+            headers={'Content-Type': 'application/xml'})
 
         result = await provider.metadata(path)
 
@@ -1785,16 +1848,16 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_empty_metadata_folder(self, provider, folder_empty_metadata, mock_time):
         path = WaterButlerPath('/this-is-not-the-root/')
-        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, body=folder_empty_metadata if isinstance(folder_empty_metadata, bytes) else folder_empty_metadata.encode('utf-8'),
-                                  headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
-
-        aiohttpretty.register_uri('HEAD', metadata_url, headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path),
+            body=folder_empty_metadata if isinstance(folder_empty_metadata, bytes) else folder_empty_metadata.encode('utf-8'),
+            headers={'Content-Type': 'application/xml'})
+        # An empty listing sends `_metadata_folder` on to `check_key_existence`, to tell a folder
+        # that exists only as a trailing-slash key from one that is not there at all.
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
+            headers={'Content-Type': 'application/xml'})
 
         result = await provider.metadata(path)
 
@@ -1805,9 +1868,9 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_file(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/Foo/Bar/my-image.jpg')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata,
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
+            headers=file_header_metadata)
 
         result = await provider.metadata(path)
 
@@ -1821,9 +1884,11 @@ class TestMetadata:
     @pytest.mark.aiohttpretty
     async def test_metadata_file_lastest_revision(self, provider, file_header_metadata, mock_time):
         path = WaterButlerPath('/Foo/Bar/my-image.jpg')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata,
-                                  match_querystring=False)
+        # ``Latest`` is normalised away before the signing call, so this is the plain
+        # ``head_object`` -- no ``VersionId`` in the signed parameters.
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
+            headers=file_header_metadata)
 
         result = await provider.metadata(path, revision='Latest')
 
@@ -1836,11 +1901,20 @@ class TestMetadata:
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_metadata_file_missing(self, provider, mock_time):
-        path = WaterButlerPath('/notfound.txt')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri('HEAD', url, status=404, match_querystring=False)
+        """A HEAD that answers 404 reaches the caller as ``NotFoundError``.
 
-        with pytest.raises(exceptions.MetadataError):
+        T-1 / CX1-11: this used to assert ``MetadataError``, which is what the *stub*
+        ``check_key_existence`` raised -- it called ``make_request(..., throws=MetadataError)``
+        and stopped there.  The real one wraps that call in the ``except`` that re-raises
+        through ``_raise_from_client_error`` as ``NotFoundError``, because ``BaseProvider.exists``
+        reads a ``NotFoundError`` of any status as "no" and every caller arrives through it.
+        So the exception the provider actually produces is the one named here.
+        """
+        path = WaterButlerPath('/notfound.txt')
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True, status=404)
+
+        with pytest.raises(exceptions.NotFoundError):
             await provider.metadata(path)
 
     @pytest.mark.asyncio
@@ -1854,20 +1928,17 @@ class TestMetadata:
 
         path = WaterButlerPath('/foobah')
         content_md5 = hashlib.md5(file_content).hexdigest()
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri(
-            'HEAD',
-            metadata_url,
+        # PUT and HEAD are signed separately -- the HTTP method is part of the canonical
+        # request, so these are two different URLs even though they name the same key.
+        metadata_url = await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
             responses=[
                 {'status': 404},
                 {'headers': file_header_metadata},
-            ],
-            match_querystring=False,
-        )
-        headers = {'ETag': f'"{content_md5}"'}
-        aiohttpretty.register_uri('PUT', url, status=200, headers=headers,
-                                  match_querystring=False),
+            ])
+        url = await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True,
+            status=200, headers={'ETag': f'"{content_md5}"'})
 
         metadata, created = await provider.upload(file_stream, path)
 
@@ -1884,19 +1955,15 @@ class TestMetadata:
                                             file_header_metadata,
                                             mock_time):
         path = WaterButlerPath('/foobah')
-        url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        metadata_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        aiohttpretty.register_uri(
-            'HEAD',
-            metadata_url,
+        metadata_url = await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
             responses=[
                 {'status': 404},
                 {'headers': file_header_metadata},
-            ],
-            match_querystring=False,
-        )
-        aiohttpretty.register_uri('PUT', url, status=200, headers={'ETag': '"bad hash"'},
-                                  match_querystring=False)
+            ])
+        url = await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True,
+            status=200, headers={'ETag': '"bad hash"'})
 
         with pytest.raises(exceptions.UploadChecksumMismatchError):
             await provider.upload(file_stream, path)
@@ -2078,11 +2145,12 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_raise_409(self, provider, folder_metadata, mock_time):
         path = WaterButlerPath('/alreadyexists/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, body=folder_metadata if isinstance(folder_metadata, bytes) else folder_metadata.encode('utf-8'),
-                                  headers={'Content-Type': 'application/xml'},
-                                  match_querystring=False)
+        body = folder_metadata if isinstance(folder_metadata, bytes) \
+            else folder_metadata.encode('utf-8')
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path), body=body,
+            headers={'Content-Type': 'application/xml'})
 
         with pytest.raises(exceptions.FolderNamingConflict) as e:
             await provider.create_folder(path)
@@ -2119,16 +2187,17 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_errors_out(self, provider, mock_time):
         path = WaterButlerPath('/alreadyexists/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        create_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        head_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-
         empty_xml = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><IsTruncated>false</IsTruncated></ListBucketResult>'
-        aiohttpretty.register_uri('GET', url, status=200, body=empty_xml,
-                                  headers={'Content-Type': 'application/xml'}, match_querystring=False)
-        aiohttpretty.register_uri('HEAD', head_url, status=404, match_querystring=False)
-        aiohttpretty.register_uri('PUT', create_url, status=403, match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path), status=200, body=empty_xml,
+            headers={'Content-Type': 'application/xml'})
+        # The empty listing sends the precheck on to `check_key_existence`; 404 there is what
+        # makes `exists` answer "no" and lets the creation proceed to the PUT.
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True, status=404)
+        await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True, status=403)
 
         with pytest.raises(exceptions.CreateFolderError) as e:
             await provider.create_folder(path)
@@ -2139,10 +2208,9 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_errors_out_metadata(self, provider, mock_time):
         path = WaterButlerPath('/alreadyexists/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-
-        aiohttpretty.register_uri('GET', url, status=403, match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path), status=403)
 
         with pytest.raises(exceptions.DownloadError) as e:
             await provider.create_folder(path)
@@ -2153,16 +2221,15 @@ class TestCreateFolder:
     @pytest.mark.aiohttpretty
     async def test_creates(self, provider, mock_time):
         path = WaterButlerPath('/doesntalreadyexists/')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        create_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-        head_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
-
         empty_xml = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>that-kerning</Name><IsTruncated>false</IsTruncated></ListBucketResult>'
-        aiohttpretty.register_uri('GET', url, status=200, body=empty_xml,
-                                  headers={'Content-Type': 'application/xml'}, match_querystring=False)
-        aiohttpretty.register_uri('HEAD', head_url, status=404, match_querystring=False)
-        aiohttpretty.register_uri('PUT', create_url, status=200, match_querystring=False)
+        await register_presigned(
+            provider, 'GET', 'list_objects_v2',
+            query_parameters=folder_listing_params(path), status=200, body=empty_xml,
+            headers={'Content-Type': 'application/xml'})
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True, status=404)
+        await register_presigned(
+            provider, 'PUT', 'put_object', path=path.path, default_params=True, status=200)
 
         resp = await provider.create_folder(path)
 
@@ -2174,24 +2241,41 @@ class TestCreateFolder:
 class TestOperations:
 
     @pytest.mark.asyncio
-    async def test_get_object_versions_adds_bucket_to_presigned_params(self, provider):
-        provider.generate_generic_presigned_url = MockCoroutine(return_value='http://example.com')
-        provider.make_request = MockCoroutine(return_value=MockS3Response())
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_adds_bucket_to_presigned_params(self, provider, mock_time):
+        """The caller passes only a ``Prefix``.  ``Bucket`` has to be filled in here because
+        ListObjectVersions is signed over its parameters -- a missing bucket is not a default
+        botocore supplies later, the call fails to sign.
+
+        T-1 / CX1-11: asserted against the URL the real presigner produced and the request that
+        was actually made with it, rather than against the arguments it was called with.  In a
+        signed URL the bucket is the path and the prefix is a query parameter, so a test that
+        only inspects the call arguments cannot tell a bucket that was signed in from one that
+        was dropped on the way.
+        """
+        url = await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': provider.bucket_name, 'Prefix': 'my-image.jpg',
+                              'Delimiter': '/'},
+            body=list_versions_response(), status=200)
 
         await provider.get_object_versions({'Prefix': 'my-image.jpg', 'Delimiter': '/'})
 
-        _, kwargs = provider.generate_generic_presigned_url.call_args
-        assert kwargs['query_parameters']['Bucket'] == provider.bucket_name
-        assert kwargs['query_parameters']['Prefix'] == 'my-image.jpg'
-        assert kwargs['default_params'] is False
+        assert aiohttpretty.has_call(method='GET', uri=url)
+        split = parse.urlsplit(url)
+        assert split.path == '/{}'.format(provider.bucket_name)
+        assert 'versions' in split.query
+        query = parse.parse_qs(split.query)
+        assert query['prefix'] == ['my-image.jpg']
+        assert query['delimiter'] == ['/']
 
     @pytest.mark.asyncio
-    async def test_intra_copy(self, provider, file_metadata_object, mock_time):
+    async def test_intra_copy(self, provider, file_metadata_object, monkeypatch, mock_time):
         source_path = WaterButlerPath('/source')
         dest_path = WaterButlerPath('/dest')
 
-        # Mock dest_provider (exists=True → file already at dest, intra_copy returns not True=False)
-        # Original test registered HEAD 200 for dest → exists=True; assert not exists checks False
+        # The destination is a second provider, not the object under test; ``exists=True`` is what
+        # makes ``intra_copy`` report ``created`` False.
         dest_provider = mock.Mock()
         dest_provider.exists = MockCoroutine(return_value=True)
         dest_provider.metadata = MockCoroutine(return_value=file_metadata_object)
@@ -2202,40 +2286,36 @@ class TestOperations:
         dest_provider.region = provider.region
         dest_provider._check_region = MockCoroutine()
 
-        # Mock aiobotocore session → client (intra_copy uses copy_object directly)
-        # mock.AsyncMock requires Python 3.8+; use MockCoroutine + inline async ctx manager
-        mock_s3_client = mock.Mock()
-        mock_s3_client.copy_object = MockCoroutine(return_value={})
+        # T-1 / CX2-3: this used to hand `get_session` a bare `mock.Mock()`, so no aiobotocore
+        # client was ever built and the CopySource the provider assembles was checked against a
+        # client that would have accepted anything.  Injecting at `before-send` instead leaves
+        # the real client to serialise and sign the request, so what is asserted below is the
+        # PUT S3 would have received rather than the dict the provider passed in.
+        sent = patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
 
-        class _AsyncClientCtx:
-            async def __aenter__(self_):
-                return mock_s3_client
-            async def __aexit__(self_, *args):
-                return False
-
-        mock_session = mock.Mock()
-        mock_session.create_client = mock.Mock(return_value=_AsyncClientCtx())
-
-        with mock.patch('waterbutler.providers.s3.provider.get_session', return_value=mock_session):
-            metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
+        metadata, exists = await provider.intra_copy(dest_provider, source_path, dest_path)
 
         assert metadata.kind == 'file'
         assert not exists
         provider._check_region.assert_called()
-        mock_s3_client.copy_object.assert_called_once_with(
-            Bucket=provider.bucket_name,
-            Key=dest_path.path,
-            CopySource={'Bucket': provider.bucket_name, 'Key': source_path.path},
+        assert len(sent) == 1
+        assert sent_copy_object(sent[0]) == (
+            provider.bucket_name,
+            dest_path.path,
+            '{}/{}'.format(provider.bucket_name, source_path.path),
         )
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
     async def test_version_metadata(self, provider, version_metadata, mock_time):
         path = WaterButlerPath('/my-image.jpg')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-        aiohttpretty.register_uri('GET', url, body=version_metadata if isinstance(version_metadata, bytes) else version_metadata.encode('utf-8'),
-                                  status=200, match_querystring=False)
+        body = version_metadata if isinstance(version_metadata, bytes) \
+            else version_metadata.encode('utf-8')
+        url = await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': path.path, 'Delimiter': '/'},
+            status=200, body=body)
 
         data = await provider.revisions(path)
 
@@ -2253,14 +2333,12 @@ class TestOperations:
     @pytest.mark.aiohttpretty
     async def test_single_version_metadata(self, provider, single_version_metadata, mock_time):
         path = WaterButlerPath('/single-version.file')
-        url = 'https://that-kerning.s3.amazonaws.com/'
-        params = build_folder_params(path)
-
-        aiohttpretty.register_uri('GET',
-                                  url,
-                                  body=single_version_metadata if isinstance(single_version_metadata, bytes) else single_version_metadata.encode('utf-8'),
-                                  status=200,
-                                  match_querystring=False)
+        body = single_version_metadata if isinstance(single_version_metadata, bytes) \
+            else single_version_metadata.encode('utf-8')
+        url = await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': path.path, 'Delimiter': '/'},
+            status=200, body=body)
 
         data = await provider.revisions(path)
 
@@ -2405,6 +2483,91 @@ COPY_OBJECT_ERROR_BODY = (
 COPY_OBJECT_EMPTY_ERROR_BODY = b'<?xml version="1.0" encoding="UTF-8"?>\n<Error/>'
 
 
+def delete_objects_response(deleted=(), errors=()):
+    """Build a DeleteObjects response body.
+
+    ``deleted`` is an iterable of ``(key, version_id)``; ``errors`` one of
+    ``(key, version_id, code)``.  ``Quiet`` is false on every call the provider makes, so a
+    successful delete is reported element by element rather than by an empty body.
+    """
+    body = '<?xml version="1.0" encoding="UTF-8"?>'
+    body += '<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    for key, version_id in deleted:
+        body += ('<Deleted><Key>{}</Key><VersionId>{}</VersionId>'
+                 '</Deleted>'.format(key, version_id))
+    for key, version_id, code in errors:
+        body += ('<Error><Key>{}</Key><VersionId>{}</VersionId><Code>{}</Code>'
+                 '<Message>The operation was refused.</Message>'
+                 '</Error>'.format(key, version_id, code))
+    body += '</DeleteResult>'
+    return body.encode('utf-8')
+
+
+def serve_in_order(*responses):
+    """A ``before-send`` factory that answers with each of ``responses`` in turn.
+
+    The factory takes no arguments, so a test that needs the second call to differ from the
+    first has nowhere else to put the difference.  Running out is an error rather than a repeat
+    of the last response: a provider that sent one batch too many would otherwise be answered
+    as if it had not.
+    """
+    remaining = list(responses)
+
+    def factory():
+        assert remaining, 'more requests were sent than this test has answers for'
+        return remaining.pop(0)
+
+    return factory
+
+
+def patch_delete_objects(monkeypatch, *responses):
+    """Answer the provider's DeleteObjects calls at the transport boundary.
+
+    Given no ``responses``, every batch is answered with an empty ``DeleteResult`` -- a delete
+    that refused nothing, which is what the calls being asserted on here are about.  Tests that
+    need a refusal pass the bodies themselves.
+
+    :return: the list of sent requests, in order
+    """
+    factory = (serve_in_order(*responses) if responses
+               else lambda: _FakeHTTPResponse(200, delete_objects_response()))
+    return patch_session_with_before_send(monkeypatch, factory, operation='DeleteObjects')
+
+
+def sent_delete_objects(request):
+    """Read a DeleteObjects call back off the wire.
+
+    T-1 / CX2-3: these calls used to be asserted on a coroutine bound over the client, which
+    told the test what the *provider* passed and nothing about what botocore made of it.  The
+    request examined here has been serialised into rest-xml and signed, so an argument the SDK
+    would have dropped or renamed shows up as a difference rather than as a pass.
+
+    :return: ``(bucket, {'Objects': [...], 'Quiet': bool})`` -- the shape ``delete_objects``
+        was called with, so the expectations read the same either side of the move
+    """
+    document = xmltodict.parse(request.body)['Delete']
+    objects = document.get('Object') or []
+    if not isinstance(objects, list):
+        # A single-object batch has no list around it in XML.
+        objects = [objects]
+    return (parse.urlsplit(request.url).path.strip('/'),
+            {'Objects': [dict(entry) for entry in objects],
+             'Quiet': document.get('Quiet') == 'true'})
+
+
+def sent_copy_object(request):
+    """Read a CopyObject call back off the wire.
+
+    The ``CopySource`` dict the client is called with has no wire form of its own: botocore
+    renders it into the single ``x-amz-copy-source`` header, percent-encoding the key.  That
+    rendering is the part a test asserting on the call arguments never saw.
+
+    :return: ``(bucket, key, copy_source)``, ``copy_source`` percent-decoded
+    """
+    bucket, _, key = parse.urlsplit(request.url).path.lstrip('/').partition('/')
+    return bucket, key, parse.unquote(request.headers['x-amz-copy-source'].decode('utf-8'))
+
+
 class TestIntraCopy:
     """I-2〜I-5: the ``intra_copy`` contract and how it reports provider failures."""
 
@@ -2426,14 +2589,14 @@ class TestIntraCopy:
     @pytest.mark.asyncio
     async def test_intra_copy_reports_created_when_dest_is_absent(self, provider,
                                                                   file_metadata_object,
-                                                                  mock_time):
+                                                                  monkeypatch, mock_time):
         """I-5: ``(metadata, created)`` -- ``created`` is True only when nothing was overwritten."""
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
-        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+        patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
 
-        with patcher:
-            metadata_result, created = await provider.intra_copy(
-                dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+        metadata_result, created = await provider.intra_copy(
+            dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
 
         assert created is True
         assert metadata_result is file_metadata_object
@@ -2442,14 +2605,14 @@ class TestIntraCopy:
     @pytest.mark.asyncio
     async def test_intra_copy_reports_not_created_when_dest_exists(self, provider,
                                                                    file_metadata_object,
-                                                                   mock_time):
+                                                                   monkeypatch, mock_time):
         """I-5: an overwrite reports ``created`` False."""
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=True)
-        patcher, client = patch_aiobotocore_client(copy_object=MockCoroutine(return_value={}))
+        patch_session_with_before_send(
+            monkeypatch, lambda: _FakeHTTPResponse(200, COPY_OBJECT_SUCCESS_BODY))
 
-        with patcher:
-            metadata_result, created = await provider.intra_copy(
-                dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
+        metadata_result, created = await provider.intra_copy(
+            dest_provider, WaterButlerPath('/source'), WaterButlerPath('/dest'))
 
         assert created is False
         assert metadata_result is file_metadata_object
@@ -2462,7 +2625,7 @@ class TestIntraCopy:
         """
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
         error = make_client_error('AccessDenied', 'Access Denied', 403)
-        patcher, client = patch_aiobotocore_client(
+        patcher, _ = patch_aiobotocore_client(
             copy_object=MockCoroutine(side_effect=error))
 
         with patcher:
@@ -2492,7 +2655,7 @@ class TestIntraCopy:
         The other five aiobotocore call sites already catch ``Exception``; this is the sixth.
         """
         dest_provider = self._dest_provider(provider, file_metadata_object, exists=False)
-        patcher, client = patch_aiobotocore_client(
+        patcher, _ = patch_aiobotocore_client(
             copy_object=MockCoroutine(side_effect=error))
 
         with patcher:
@@ -2517,7 +2680,7 @@ class TestIntraCopy:
             'Access Denied for arn:aws:iam::123456789012:user/some-user',
             403,
         )
-        patcher, client = patch_aiobotocore_client(
+        patcher, _ = patch_aiobotocore_client(
             copy_object=MockCoroutine(side_effect=error))
 
         with patcher:
@@ -2648,22 +2811,27 @@ class TestIntraCopySizeLimit:
         provider.intra_copy, provider.intra_move = copy_spy, move_spy
         return calls
 
-    def _register_copy_traffic(self, provider, file_content, file_header_metadata):
-        src_url = 'https://that-kerning.s3.amazonaws.com/source.txt'
-        dest_url = 'https://that-kerning.s3.amazonaws.com/dest.txt'
+    async def _register_copy_traffic(self, provider, file_content, file_header_metadata):
+        """Answer the three requests a stream copy makes, each on its own signed URL.
+
+        T-1 / CX1-11: the download, the destination's existence check and the upload are three
+        different operations on two different keys, so the real presigner gives three distinct
+        URLs.  The old stub collapsed them to two strings derived from the path alone, which is
+        why ``match_querystring=False`` used to be needed here.
+        """
         headers = dict(file_header_metadata)
         headers['Content-Length'] = str(len(file_content))
 
-        aiohttpretty.register_uri('GET', src_url, body=file_content,
-                                  headers={'Content-Length': str(len(file_content))},
-                                  status=200, match_querystring=False)
-        aiohttpretty.register_uri('HEAD', dest_url,
-                                  responses=[{'status': 404}, {'headers': headers}],
-                                  match_querystring=False)
-        aiohttpretty.register_uri(
-            'PUT', dest_url, status=200,
-            headers={'ETag': '"{}"'.format(hashlib.md5(file_content).hexdigest())},
-            match_querystring=False)
+        src_url = await register_presigned(
+            provider, 'GET', 'get_object', path='source.txt', default_params=True,
+            query_parameters={'ResponseContentDisposition': make_disposition('source.txt')},
+            body=file_content, headers={'Content-Length': str(len(file_content))}, status=200)
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path='dest.txt', default_params=True,
+            responses=[{'status': 404}, {'headers': headers}])
+        dest_url = await register_presigned(
+            provider, 'PUT', 'put_object', path='dest.txt', default_params=True, status=200,
+            headers={'ETag': '"{}"'.format(hashlib.md5(file_content).hexdigest())})
         return src_url, dest_url
 
     @pytest.mark.asyncio
@@ -2671,8 +2839,8 @@ class TestIntraCopySizeLimit:
     async def test_copy_over_limit_falls_back_to_stream_copy(self, provider, file_content,
                                                              file_header_metadata, mock_time):
         calls = self._spy_on_intra(provider)
-        src_url, dest_url = self._register_copy_traffic(provider, file_content,
-                                                        file_header_metadata)
+        src_url, dest_url = await self._register_copy_traffic(provider, file_content,
+                                                              file_header_metadata)
 
         metadata_result, created = await provider.copy(
             provider,
@@ -2692,34 +2860,33 @@ class TestIntraCopySizeLimit:
     @pytest.mark.aiohttpretty
     async def test_move_over_limit_falls_back_to_copy_then_delete(self, provider, file_content,
                                                                   file_header_metadata,
-                                                                  mock_time):
+                                                                  monkeypatch, mock_time):
         calls = self._spy_on_intra(provider)
-        src_url, dest_url = self._register_copy_traffic(provider, file_content,
-                                                        file_header_metadata)
-        # the source is deleted after the copy; it has a single version and no delete markers.
-        # the fixture's presigned-url stub drops query parameters, so the version listing lands
-        # on the bare bucket url rather than on the source key's url.
-        aiohttpretty.register_uri(
-            'GET', BUCKET_URL,
-            body=list_versions_response(versions=[('source.txt', 'v1')]), status=200,
-            match_querystring=False)
-        delete_patcher, delete_client = patch_aiobotocore_client(
-            delete_objects=MockCoroutine(return_value={'Deleted': [{'Key': 'source.txt'}]}))
+        src_url, dest_url = await self._register_copy_traffic(provider, file_content,
+                                                              file_header_metadata)
+        # The source is deleted after the copy; it has a single version and no delete markers.
+        # T-1 / CX1-11: ListObjectVersions carries the prefix in the signed query string, so
+        # this is its own URL rather than the bare bucket one the stub used to produce.
+        await register_presigned(
+            provider, 'GET', 'list_object_versions',
+            query_parameters={'Bucket': 'that-kerning', 'Prefix': 'source.txt'},
+            body=list_versions_response(versions=[('source.txt', 'v1')]), status=200)
+        deleted = patch_delete_objects(monkeypatch, _FakeHTTPResponse(200, delete_objects_response(
+            deleted=[('source.txt', 'v1')])))
 
-        with delete_patcher:
-            metadata_result, created = await provider.move(
-                provider,
-                WaterButlerPath('/source.txt'),
-                WaterButlerPath('/dest.txt'),
-                handle_naming=False,
-                file_size=provider.FILE_SIZE_INTRA_COPY_LIMIT + 1,
-            )
+        metadata_result, created = await provider.move(
+            provider,
+            WaterButlerPath('/source.txt'),
+            WaterButlerPath('/dest.txt'),
+            handle_naming=False,
+            file_size=provider.FILE_SIZE_INTRA_COPY_LIMIT + 1,
+        )
 
         assert calls['move'] == []
         assert calls['copy'] == []
         assert created is True
         assert metadata_result.kind == 'file'
-        assert delete_client.delete_objects.called
+        assert len(deleted) == 1
 
     @pytest.mark.parametrize('method_name', ['can_intra_copy', 'can_intra_move'])
     @pytest.mark.parametrize('offset,expected', [
@@ -2779,9 +2946,9 @@ class TestFileSizeSource:
         metadata object that ``can_intra_copy`` is handed.
         """
         path = WaterButlerPath('/my-image.jpg')
-        url = 'https://that-kerning.s3.amazonaws.com/my-image.jpg'
-        aiohttpretty.register_uri('HEAD', url, headers=file_header_metadata,
-                                  match_querystring=False)
+        await register_presigned(
+            provider, 'HEAD', 'head_object', path=path.path, default_params=True,
+            headers=file_header_metadata)
 
         result = await provider.metadata(path)
 
@@ -2924,6 +3091,50 @@ class TestObjectVersionsPaging:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_a_marker_that_is_not_repeated_is_dropped(self, auth, credentials, settings):
+        """CX2-2 / T-3: a ``VersionIdMarker`` belongs to the page that announced it.
+
+        A page boundary can fall in the middle of one key's version history, and then S3 sends
+        both markers.  The next boundary need not: once the listing has moved on to whole keys
+        again it announces a ``NextKeyMarker`` alone.  Carrying the previous page's version id
+        into that request asks to resume from a version of the *earlier* key -- S3 rejects the
+        pair outright, and where it does not, the page returned is not the one after this one.
+
+        Three pages is the smallest listing that can show it: the marker has to be set by one
+        boundary and then not repeated by the next, so a two-page listing can only show it
+        being set.  The stale-marker form of the third request is registered as well, so that
+        carrying it forward fails on the assertion below rather than on "No URLs matching".
+        """
+        provider = raw_provider(auth, credentials, settings)
+        requested = record_request_urls(provider)
+        page_three_body = list_versions_response(versions=[('k3', 'v3')])
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('k1', 'v1')], is_truncated=True,
+                                       next_key_marker='k1', next_version_id_marker='v1'),
+                Prefix='k')
+            await self._register_versions(
+                provider,
+                # No NextVersionIdMarker: this boundary falls between two keys.
+                list_versions_response(versions=[('k2', 'v2')], is_truncated=True,
+                                       next_key_marker='k2'),
+                Prefix='k', KeyMarker='k1', VersionIdMarker='v1')
+            await self._register_versions(provider, page_three_body, Prefix='k', KeyMarker='k2')
+            await self._register_versions(provider, page_three_body, Prefix='k', KeyMarker='k2',
+                                          VersionIdMarker='v1')
+
+            versions = await provider.get_object_versions({'Prefix': 'k'})
+
+        assert [item['VersionId'] for item in versions] == ['v1', 'v2', 'v3']
+        assert len(requested) == 3
+        query = parse.parse_qs(parse.urlsplit(requested[2]).query)
+        assert query['key-marker'] == ['k2']
+        assert 'version-id-marker' not in query
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_a_listing_that_is_not_encoded_is_read_verbatim(self, auth, credentials,
                                                                   settings):
         """CX1-3: decoding is the response's declaration, not an assumption.
@@ -3023,15 +3234,6 @@ def assert_no_secrets(exc):
     blob += ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     leaked = [marker for marker in SECRET_MARKERS if marker in blob]
     assert leaked == [], 'exception exposes {}'.format(leaked)
-
-
-def raw_provider(auth, credentials, settings):
-    """A provider with only the region lookup stubbed, so that the real
-    ``generate_generic_presigned_url`` and ``check_key_existence`` run."""
-    prov = S3Provider(auth, credentials, settings)
-    prov._check_region = MockCoroutine()
-    prov.region = 'us-east-1'
-    return prov
 
 
 class local_server:
@@ -3148,11 +3350,15 @@ def arrange_chunked_commit(provider, aborted=True):
     ``_complete_multipart_upload`` itself is deliberately left real:
     NOTE_SEMANTICS_DESIGN v2.2 §4-2d -- a test that judges the notice must not mock any of
     the code that decides it.  The injection goes to the boundary below (``make_request``).
+
+    T-1 / CX1-11: which is also why the presigner is no longer stood in for here.  The commit
+    signs a URL on its way to the ``make_request`` that ``arrange_commit_failure`` replaces, so
+    the real presigner runs and its output is simply not read -- a stub bought nothing, and left
+    a signing failure invisible to the whole notice matrix.
     """
     provider._create_upload_session = MockCoroutine(return_value='SESSION')
     provider._upload_parts = MockCoroutine(return_value=[{'ETAG': 'abc'}])
     provider._abort_chunked_upload = MockCoroutine(return_value=aborted)
-    provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
 
 
 def arrange_commit_failure(provider, transport, error_code):
@@ -3742,14 +3948,15 @@ class TestChunkedUploadWireQuery:
     the merge.  These tests use a real socket and read the query the server received.
     """
 
-    async def _capture(self, provider, method, path, call):
+    async def _capture(self, provider, method, path, call, body=b''):
         """Run ``call`` against a loopback server and return the query string it received."""
         seen = {}
 
         async def handler(request):
             await request.read()
             seen['query'] = request.query_string
-            return web.Response(status=200, headers={'ETag': '"d41d8cd98f00b204e9800998ecf8"'})
+            return web.Response(status=200, body=body,
+                                headers={'ETag': '"d41d8cd98f00b204e9800998ecf8"'})
 
         app = web.Application()
         app.router.add_route(method, '/{tail:.*}', handler)
@@ -3758,6 +3965,20 @@ class TestChunkedUploadWireQuery:
             await call(path)
 
         return parse.parse_qs(seen['query'], keep_blank_values=True)
+
+    @staticmethod
+    def _folded_counts(query):
+        """How many times each parameter was sent, with the case of its name folded away.
+
+        CL 所見 1: ``parse_qs`` keys on the exact name, so counting under one catches only a
+        duplicate spelled the same way as the original.  A ``params={'PartNumber': ...}`` beside
+        a signed ``partNumber`` is the same bug -- two entries in the canonical query string and
+        so the same ``SignatureDoesNotMatch`` -- and would read as a pass.
+        """
+        counts = {}
+        for name, values in query.items():
+            counts[name.lower()] = counts.get(name.lower(), 0) + len(values)
+        return counts
 
     @pytest.mark.asyncio
     async def test_part_request_sends_each_parameter_once(self, auth, credentials, settings):
@@ -3776,7 +3997,10 @@ class TestChunkedUploadWireQuery:
         assert query['uploadId'] == ['SESSION']
         # The signature is signed over the canonical query; a duplicate breaks it even when
         # the two values agree, so the count is the thing to assert, not the value.
-        assert len(query['X-Amz-Signature']) == 1
+        counts = self._folded_counts(query)
+        assert counts['partnumber'] == 1
+        assert counts['uploadid'] == 1
+        assert counts['x-amz-signature'] == 1
 
     @pytest.mark.asyncio
     async def test_list_parts_request_sends_each_parameter_once(self, auth, credentials,
@@ -3793,7 +4017,30 @@ class TestChunkedUploadWireQuery:
                                     list_parts)
 
         assert query['uploadId'] == ['SESSION']
-        assert len(query['X-Amz-Signature']) == 1
+        counts = self._folded_counts(query)
+        assert counts['uploadid'] == 1
+        assert counts['x-amz-signature'] == 1
+
+    @pytest.mark.asyncio
+    async def test_create_session_request_sends_each_parameter_once(self, auth, credentials,
+                                                                    settings):
+        """CL 所見 1: ``uploads`` is what makes the POST an initiate, and it is in the signed
+        URL already.  It carries no value, so a second copy of it is invisible to a check that
+        reads ``query['uploads']`` -- and still breaks the signature.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        async def create_session(path):
+            await provider._create_upload_session(path)
+
+        query = await self._capture(
+            provider, 'POST', WaterButlerPath('/my-subfolder/f.txt'), create_session,
+            body=b'<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult>'
+                 b'<UploadId>SESSION</UploadId></InitiateMultipartUploadResult>')
+
+        counts = self._folded_counts(query)
+        assert counts['uploads'] == 1
+        assert counts['x-amz-signature'] == 1
 
     @pytest.mark.asyncio
     async def test_uploading_parts_logs_nothing_at_error_level(self, auth, credentials, settings,
@@ -3835,14 +4082,21 @@ class TestCommitPreconditions:
     async def test_commit_is_sent_exactly_once(self, auth, credentials, settings, mock_time,
                                                status):
         """Counting the POSTs pins that ``retry=0`` takes effect.  Inspecting the caller only
-        pins that it is written down."""
+        pins that it is written down.
+
+        T-1 / CX1-11: the URL being counted is the one the real presigner produced for this
+        commit, not a constant.  ``retry_on`` matches on the status, but core's retry re-sends
+        the *same* URL, so answering the real one is what makes "exactly once" a statement
+        about the commit request rather than about a string the test chose.
+        """
         provider = raw_provider(auth, credentials, settings)
-        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
         error_body = ('<?xml version="1.0" encoding="UTF-8"?>'
                       '<Error><Code>SlowDown</Code>'
                       '<Message>Please reduce your request rate.</Message></Error>')
-        aiohttpretty.register_uri('POST', SIGNED_URL, status=status,
-                                  body=error_body.encode('utf-8'))
+        await register_presigned(
+            provider, 'POST', 'complete_multipart_upload',
+            path='my-subfolder/thefile.txt', query_parameters={'UploadId': 'SESSION'},
+            default_params=True, status=status, body=error_body.encode('utf-8'))
 
         with pytest.raises(exceptions.UploadError):
             await provider._complete_multipart_upload(
@@ -3863,7 +4117,20 @@ class TestCommitPreconditions:
         ``allow_redirects=True``, so two commit POSTs go out without spending any of core's
         retry budget.
 
-        ``aiohttpretty`` cannot pin this; see ``local_server``."""
+        ``aiohttpretty`` cannot pin this; see ``local_server``.
+
+        T-1 / CX1-11: the first route is mounted on the path the real presigner signed, and the
+        request reaches it through ``redirect_presigned_origin`` -- only the scheme and host are
+        rewritten, because a test cannot listen on ``s3.amazonaws.com``.  So what the redirect is
+        offered is the commit's own URL, and a signing change that moved the path would be a
+        failure here rather than a test quietly measuring a constant.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        commit_url = await provider.generate_generic_presigned_url(
+            'my-subfolder/thefile.txt', method='complete_multipart_upload',
+            query_parameters={'UploadId': 'SESSION'})
+        commit_path = parse.urlsplit(commit_url).path
+
         calls = []
 
         async def first(request):
@@ -3886,19 +4153,18 @@ class TestCommitPreconditions:
                      '</Error>')
 
         app = web.Application()
-        app.router.add_post('/first', first)
+        app.router.add_post(commit_path, first)
         app.router.add_post('/second', second)
 
-        provider = raw_provider(auth, credentials, settings)
         async with local_server(provider, app) as server:
-            provider.generate_generic_presigned_url = MockCoroutine(return_value=server.url)
+            redirect_presigned_origin(provider, server.url)
             with pytest.raises(exceptions.UploadError):
                 await provider._complete_multipart_upload(
                     WaterButlerPath('/my-subfolder/thefile.txt'), 'SESSION', [{'ETAG': 'abc'}])
 
         # Exactly one commit POST.  A second one records ``/second``, so a failure here shows
         # how far the request got.
-        assert calls == ['/first']
+        assert calls == [commit_path]
 
     @pytest.mark.asyncio
     async def test_commit_request_states_both_preconditions(self, auth, credentials, settings,
@@ -3907,9 +4173,11 @@ class TestCommitPreconditions:
         through their effect.  The two counting tests above go through aiohttp, so a future
         change that keeps the observable single-send by accident -- core dropping the retry
         loop, say -- would leave them green while the commit stopped declaring what it needs.
+
+        T-1 / CX1-11: ``make_request`` is the boundary being watched, so the presigner above it
+        is left real -- its URL is signed and then simply not sent anywhere.
         """
         provider = raw_provider(auth, credentials, settings)
-        provider.generate_generic_presigned_url = MockCoroutine(return_value=SIGNED_URL)
         provider.make_request = MockCoroutine(
             side_effect=exceptions.UploadError('nope', code=500))
 
@@ -4109,6 +4377,58 @@ class TestCommitOutcome:
             await provider._chunked_upload(None, WaterButlerPath('/my-subfolder/thefile.txt'))
 
         assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('status', [200, 500])
+    async def test_a_commit_answered_in_invalid_utf8_claims_one(self, auth, credentials,
+                                                                settings, mock_time, status):
+        """CX2-2 / NOTE_SEMANTICS_DESIGN v2.2 §4-1: a body nobody can decode is UNKNOWN.
+
+        The matrix above reaches the general-exception cells by injecting a ``RuntimeError``
+        into ``make_request``, and the illegible-body cells with a synthetic ``UploadError``.
+        Neither goes through a socket, and the decoding happens below the provider -- so the
+        one thing that was never measured is the case that produces it: bytes that are not
+        UTF-8 arriving over real HTTP.  Both statuses are here because the byte sequence
+        surfaces as a different exception on each, and the verdict must not depend on that:
+
+        * **200** -- the body is read as bytes and handed to ``xmltodict``, which cannot parse
+          it.  Nothing contradicts success and nothing states it, so the commit's own
+          "does not report success" ``UploadError`` is what carries the mark;
+        * **500** -- ``exception_from_response`` builds the exception by calling
+          ``data.decode('utf-8')`` (``waterbutler/core/exceptions.py``), which raises
+          ``UnicodeDecodeError`` *instead of* returning an ``UploadError``.  That escapes
+          ``make_request`` as a type WaterButler does not recognise, and it reaches the notice
+          only because the commit marks every exception rather than the ones it knows.
+
+        The bytes are invalid UTF-8 in the middle of an otherwise well-formed success body, so
+        an implementation that decoded leniently -- or read the ``ETag`` out of the raw bytes --
+        would report the upload as completed instead.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        arrange_chunked_commit(provider)
+        commit_url = await provider.generate_generic_presigned_url(
+            'my-subfolder/thefile.txt', method='complete_multipart_upload',
+            query_parameters={'UploadId': 'SESSION'})
+        commit_path = parse.urlsplit(commit_url).path
+
+        async def commit(request):
+            await request.read()
+            return web.Response(
+                status=status, content_type='application/xml',
+                body=b'<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult>'
+                     b'<ETag>"\xff\xfe"</ETag></CompleteMultipartUploadResult>')
+
+        app = web.Application()
+        app.router.add_post(commit_path, commit)
+
+        async with local_server(provider, app) as server:
+            redirect_presigned_origin(provider, server.url)
+            with pytest.raises(exceptions.UploadError) as e:
+                await provider._chunked_upload(None,
+                                               WaterButlerPath('/my-subfolder/thefile.txt'))
+
+        assert S3Provider.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE in e.value.message
+        assert_no_secrets(e.value)
 
     @pytest.mark.parametrize('error_code', EXPECTED_DEFINITIVE_REJECTION_CODES)
     def test_every_definitive_rejection_code_suppresses_the_notice(self, auth, credentials,
