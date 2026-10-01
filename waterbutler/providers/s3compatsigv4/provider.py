@@ -333,18 +333,17 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
         try:
-            error = _local_name_lookup(result, 'Error') \
-                if isinstance(result, dict) else _MISSING
-        except KeyError:
-            return
-        if error is _MISSING:
+            error = _local_name_lookup(result, 'Error')
+        except (KeyError, TypeError):
             return
 
         error_code = None
-        if isinstance(error, dict):
-            code = _local_name_lookup(error, 'Code', None)
-            if isinstance(code, str) and code.strip():
-                error_code = code.strip()
+        try:
+            code = _local_name_lookup(error, 'Code').strip()
+            if code:
+                error_code = code
+        except (KeyError, TypeError, AttributeError):
+            pass
         logger.warning('%s returned with an error: %s', s3_api_name, error_code or 'Unknown')
 
         raise _mark_storage_response(
