@@ -99,16 +99,20 @@ def _is_commit_outcome_unknown(err):
     return getattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, False)
 
 
-def _local_name_lookup(mapping, local_name, default=None):
+def _local_name_lookup(mapping, local_name, default=_MISSING):
     """Look up ``local_name`` in an ``xmltodict`` mapping, ignoring any XML
-    namespace prefix on the keys.  Returns ``default`` when absent.
+    namespace prefix on the keys.
+
+    Raises ``KeyError`` when absent and no *default* is given.
     """
     if local_name in mapping:
         return mapping[local_name]
     for key, value in mapping.items():
         if isinstance(key, str) and key.rsplit(':', 1)[-1] == local_name:
             return value
-    return default
+    if default is not _MISSING:
+        return default
+    raise KeyError(local_name)
 
 
 def compute_md5(fp):
@@ -328,14 +332,17 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             raise _mark_storage_response(
                 exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
-        error = _local_name_lookup(result, 'Error', _MISSING) \
-            if isinstance(result, dict) else _MISSING
+        try:
+            error = _local_name_lookup(result, 'Error') \
+                if isinstance(result, dict) else _MISSING
+        except KeyError:
+            return
         if error is _MISSING:
             return
 
         error_code = None
         if isinstance(error, dict):
-            code = _local_name_lookup(error, 'Code')
+            code = _local_name_lookup(error, 'Code', None)
             if isinstance(code, str) and code.strip():
                 error_code = code.strip()
         logger.warning('%s returned with an error: %s', s3_api_name, error_code or 'Unknown')
@@ -460,26 +467,17 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         if body is None:
             return None, None
         try:
-            parsed = xmltodict.parse(body)
-        except ExpatError as exc:
-            logger.warning('_parse_s3_error_body: kind=xml_parse_failure '
-                           'exception=%s body=%s',
-                           type(exc).__name__, _bounded_body(body))
+            error = _local_name_lookup(xmltodict.parse(body), 'Error')
+            code = _local_name_lookup(error, 'Code').strip()
+            if not code:
+                raise ValueError('empty <Code>')
+            message = _local_name_lookup(error, 'Message', None)
+        except (ExpatError, KeyError, TypeError,
+                AttributeError, ValueError) as exc:
+            logger.warning('Unrecognised S3 error body (%s: %s): %s',
+                           type(exc).__name__, exc, _bounded_body(body))
             return None, None
-        if not isinstance(parsed, dict):
-            return None, None
-        error = _local_name_lookup(parsed, 'Error')
-        if not isinstance(error, dict):
-            logger.warning('_parse_s3_error_body: kind=error_not_dict '
-                           'body=%s', _bounded_body(body))
-            return None, None
-        code = _local_name_lookup(error, 'Code')
-        message = _local_name_lookup(error, 'Message')
-        if not isinstance(code, str) or not code.strip():
-            logger.warning('_parse_s3_error_body: kind=code_missing '
-                           'body=%s', _bounded_body(body))
-            return None, None
-        return code.strip(), message.strip() if isinstance(message, str) else None
+        return code, message.strip() if isinstance(message, str) else None
 
     @classmethod
     def _is_quota_exhaustion(cls, err):

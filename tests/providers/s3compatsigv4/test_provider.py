@@ -1678,15 +1678,22 @@ class TestCRUD:
         assert provider._parse_s3_error_body(err) == (None, None)
 
 
-    def test_parse_s3_error_body_logs_xml_parse_failure(self, provider, caplog):
-        err = storage_error({'response': 'not xml at all'}, code=500)
+    @pytest.mark.parametrize('body_xml, description', [
+        ('not xml at all', 'unparsable XML'),
+        ('<Root>no Error element</Root>', 'Error element absent'),
+        ('<Error/>',  'Error is an empty element'),
+        ('<Error><Message>oops</Message></Error>', 'Code absent'),
+        ('<Error><Code/><Message>oops</Message></Error>', 'Code empty'),
+    ])
+    def test_parse_s3_error_body_logs_unrecognised(self, provider, caplog,
+                                                    body_xml, description):
+        err = storage_error({'response': body_xml}, code=500)
         with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
-            provider._parse_s3_error_body(err)
+            result = provider._parse_s3_error_body(err)
+        assert result == (None, None), description
         records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
-        assert len(records) == 1
-        msg = records[0].getMessage()
-        assert 'ExpatError' in msg
-        assert 'xml_parse_failure' in msg
+        assert len(records) == 1, 'expected exactly one warning for: ' + description
+        assert 'Unrecognised S3 error body' in records[0].getMessage()
 
 
     @pytest.mark.asyncio
