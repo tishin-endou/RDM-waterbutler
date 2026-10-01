@@ -984,6 +984,15 @@ class TestValidatePath:
         assert path.is_dir
         assert not path.is_root
 
+    @pytest.mark.asyncio
+    async def test_root(self, provider, mock_time):
+        path = await provider.validate_path('/this/is/a/folder/')
+        assert path.name == 'folder'
+        assert path.parent.name == 'a'
+        assert not path.is_file
+        assert path.is_dir
+        assert not path.is_root
+
 
 class TestCRUD:
 
@@ -3057,6 +3066,17 @@ class TestCreateFolder:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
+    async def test_create_folder_with_folder_precheck_is_false(self, provider, mock_time):
+        path = WaterButlerPath('/alreadyexists', prepend=provider.prefix)
+
+        with pytest.raises(exceptions.CreateFolderError) as e:
+            await provider.create_folder(path, folder_precheck=False)
+
+        assert e.value.code == 400
+        assert e.value.message == 'Path must be a directory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
     async def test_errors_out(self, provider, mock_time, generate_url_helper):
         path = WaterButlerPath('/alreadyexists/')
         query_params = {
@@ -3181,6 +3201,24 @@ class TestOperations:
     async def test_equality(self, provider, mock_time):
         assert not provider.can_intra_copy(provider)
         assert not provider.can_intra_move(provider)
+
+    def test_can_intra_move(self, provider):
+
+        file_path = WaterButlerPath('/my-image.jpg', prepend=provider.prefix)
+        folder_path = WaterButlerPath('/folder/', folder=True, prepend=provider.prefix)
+
+        assert not provider.can_intra_move(provider)
+        assert not provider.can_intra_move(provider, file_path)
+        assert not provider.can_intra_move(provider, folder_path)
+
+    def test_can_intra_copy(self, provider):
+
+        file_path = WaterButlerPath('/my-image.jpg', prepend=provider.prefix)
+        folder_path = WaterButlerPath('/folder/', folder=True, prepend=provider.prefix)
+
+        assert not provider.can_intra_copy(provider)
+        assert not provider.can_intra_copy(provider, file_path)
+        assert not provider.can_intra_copy(provider, folder_path)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
