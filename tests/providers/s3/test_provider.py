@@ -871,7 +871,7 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_delete_comfirm_delete(self, provider, folder_and_contents, mock_time):
+    async def test_delete_confirm_delete(self, provider, folder_and_contents, mock_time):
         path = WaterButlerPath('/')
 
         provider.delete_s3_bucket_folder_objects = MockCoroutine()
@@ -1305,8 +1305,8 @@ class TestOperations:
         file_path = WaterButlerPath('/my-image.jpg')
         folder_path = WaterButlerPath('/folder/', folder=True)
 
-        assert provider.can_intra_move(provider)
-        assert provider.can_intra_move(provider, file_path)
+        assert not provider.can_intra_move(provider)
+        assert not provider.can_intra_move(provider, file_path)
         assert not provider.can_intra_move(provider, folder_path)
 
     def test_can_intra_copy(self, provider):
@@ -1314,8 +1314,8 @@ class TestOperations:
         file_path = WaterButlerPath('/my-image.jpg')
         folder_path = WaterButlerPath('/folder/', folder=True)
 
-        assert provider.can_intra_copy(provider)
-        assert provider.can_intra_copy(provider, file_path)
+        assert not provider.can_intra_copy(provider)
+        assert not provider.can_intra_copy(provider, file_path)
         assert not provider.can_intra_copy(provider, folder_path)
 
     def test_can_intra_copy_true_for_same_provider_and_small_file(self, provider):
