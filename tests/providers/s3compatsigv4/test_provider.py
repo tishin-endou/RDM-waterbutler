@@ -10,7 +10,6 @@ import datetime
 
 import aiohttp
 import aiohttpretty
-import xmltodict
 from aiohttp import web
 from http import client
 from http import HTTPStatus
@@ -2187,7 +2186,7 @@ class TestCRUD:
         aborted = await provider._abort_chunked_upload(path, upload_id)
 
         assert aborted is True
-        # Decision(B): ListParts confirms the abort; one extra request, no retry budget burned.
+        # ListParts confirms the abort; one extra request, no retry budget burned.
         assert len(aiohttpretty.calls) == 2
 
     @pytest.mark.asyncio
