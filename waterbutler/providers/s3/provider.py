@@ -4,6 +4,7 @@ import logging
 
 from urllib.parse import unquote
 import aiohttp
+import botocore.exceptions
 import xmltodict
 import xml.sax.saxutils
 from aiobotocore.config import AioConfig
@@ -362,14 +363,26 @@ class S3Provider(provider.BaseProvider):
         """
         await self._check_region()
         exists = await dest_provider.exists(dest_path)
-        region_name = {"region_name": self.region} if self.region else {}
-        endpoint_url = {'endpoint_url': f'https://s3.{self.region}.amazonaws.com'} if self.region else {'endpoint_url': 'https://s3.amazonaws.com'}
+
+        # GRDM (CX1-7 / 決定-20): signed by the *destination*, which is what the docstring above
+        # promises and what develop does -- it builds the URL from `dest_provider`'s key.  Signing
+        # with the source's key instead made the documented permission useless: granting the
+        # destination read access to the source did nothing, and what the copy actually needed
+        # was for the source to be able to write to the destination -- the opposite grant, which
+        # nothing tells an operator to make.  The region travels with the credentials: SigV4
+        # signs the region into the scope and the host into the request, and CopyObject is a
+        # write to the destination bucket, so a destination outside the source's region would
+        # otherwise be signed for the wrong one and refused before the object was ever read.
+        await dest_provider._check_region()
+        region = dest_provider.region
+        region_name = {"region_name": region} if region else {}
+        endpoint_url = {'endpoint_url': f'https://s3.{region}.amazonaws.com'} if region else {'endpoint_url': 'https://s3.amazonaws.com'}
 
         session = get_session()
         async with session.create_client(
                 's3',
-                aws_secret_access_key=self.aws_secret_access_key,
-                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=dest_provider.aws_secret_access_key,
+                aws_access_key_id=dest_provider.aws_access_key_id,
                 **region_name,
                 **endpoint_url
         ) as s3_client:
@@ -383,8 +396,23 @@ class S3Provider(provider.BaseProvider):
                     Key=dest_path.path,
                     CopySource=copy_source,
                 )
-            except Exception as e:
-                raise exceptions.IntraCopyError(f"IntraCopyError {e}")
+            except botocore.exceptions.ClientError as e:
+                # GRDM: report the failure without quoting S3's own message, which carries
+                # request ids, arns and bucket names, and keep the provider's status code
+                # instead of flattening everything to a 500.
+                response = e.response or {}
+                error_code = response.get('Error', {}).get('Code') or 'unknown'
+                status = response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+                if not isinstance(status, int) or status < 400:
+                    # S3 answers CopyObject with 200 and an <Error> body when the copy fails
+                    # part way through.  botocore rewrites the response's status code to 500 so
+                    # that the call raises, but leaves the original 200 in ResponseMetadata.
+                    # Passing that on would report a successful copy to the caller.
+                    status = 500
+                raise exceptions.IntraCopyError(
+                    'CopyObject failed: {} {}'.format(type(e).__name__, error_code),
+                    code=status
+                )
 
         return (await dest_provider.metadata(dest_path)), not exists
 
