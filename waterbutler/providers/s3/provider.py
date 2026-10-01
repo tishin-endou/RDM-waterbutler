@@ -410,6 +410,29 @@ class S3Provider(provider.BaseProvider):
 
         return result
 
+    @staticmethod
+    def _decoder_for(result):
+        """GRDM: the rule for reading key names out of ``result``.
+
+        botocore asks every listing for ``encoding-type=url``, so S3 answers with the values it
+        derived from key names -- the keys, the prefixes and the key markers -- percent-encoded,
+        and says so in ``EncodingType``.  Decoding has to follow what the response declares
+        rather than being assumed: a bucket that answers without ``EncodingType`` is reporting
+        the names verbatim, and decoding those would corrupt any key that legitimately contains
+        a ``%``.  Values S3 minted itself -- a version id, a continuation token -- are opaque
+        and are not encoded, so this decoder is not theirs to apply.
+
+        A key marker matters twice over.  It is read out of one response and sent back as a
+        query parameter on the next request, where the signer encodes it again -- so a marker
+        kept encoded is asked for as ``f%252Fa%252Bb`` and the page is never found.
+
+        :param dict result: the parsed listing
+        :return: a callable that turns a value from ``result`` back into the name
+        """
+        if result.get('EncodingType') == 'url':
+            return unquote
+        return lambda value: value
+
     async def get_folder_metadata(self, path, params, next_token=None):
         """List the keys and common prefixes under ``params['Prefix']``.
 
@@ -461,21 +484,18 @@ class S3Provider(provider.BaseProvider):
             if isinstance(common_prefixes, dict):
                 common_prefixes = [common_prefixes]
 
+            decode = self._decoder_for(result)
+
             for content in contents:
                 key = content.get('Key')
                 if key:
-                    # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
-                    # have tried yarl and furl but not see it to be helpful
-                    # Todo: maybe there is a better approach (not confident all encoding is casted)
-                    key = key.replace('+', ' ')
-                    content['Key'] = unquote(key)
+                    content['Key'] = decode(key)
                     response_contents.append(content)
 
             for common_prefix in common_prefixes:
                 prefix = common_prefix.get('Prefix')
                 if prefix:
-                    prefix = prefix.replace('+', ' ')
-                    common_prefix['Prefix'] = unquote(prefix)
+                    common_prefix['Prefix'] = decode(prefix)
                     response_prefixes.append(common_prefix)
 
             # handle pagination
@@ -566,6 +586,8 @@ class S3Provider(provider.BaseProvider):
             result = self._parse_listing(xml_body, 'ListVersionsResult',
                                          query_parameters.get('Prefix', ''))
 
+            decode = self._decoder_for(result)
+
             element_names = ['Version', 'DeleteMarker'] if include_delete_markers else ['Version']
             for element_name in element_names:
                 entries = result.get(element_name) or []
@@ -576,11 +598,7 @@ class S3Provider(provider.BaseProvider):
                 for entry in entries:
                     key = entry.get('Key')
                     if key:
-                        # cast xml string encoding to display the name user downloaded (to be it compatable with make_requests),
-                        # have tried yarl and furl but not see it to be helpful
-                        # Todo: maybe there is a better approach (not confident all encoding is casted)
-                        key = key.replace('+', ' ')
-                        entry['Key'] = unquote(key)
+                        entry['Key'] = decode(key)
                         versions_result.append(entry)
 
             # handle pagination.  ListObjectVersions does not use the ListObjectsV2
@@ -595,8 +613,11 @@ class S3Provider(provider.BaseProvider):
                 # this same page forever.  Stop rather than loop.
                 break
 
-            query_parameters['KeyMarker'] = next_key_marker
+            query_parameters['KeyMarker'] = decode(next_key_marker)
             if next_version_id_marker:
+                # GRDM: a version id is opaque and is not covered by `EncodingType=url`, which
+                # encodes only what S3 derived from a key name -- decoding one would resume from
+                # a version that does not exist.
                 query_parameters['VersionIdMarker'] = next_version_id_marker
             else:
                 query_parameters.pop('VersionIdMarker', None)
@@ -902,7 +923,9 @@ class S3Provider(provider.BaseProvider):
             data=cutoff_stream,
             skip_auto_headers={'CONTENT-TYPE'},
             headers={'Content-Length': str(chunk_size)},
-            params={'partNumber': str(chunk_number), 'uploadId': session_upload_id},
+            # No `params=`: `PartNumber` and `UploadId` are already in the presigned URL, and
+            # aiohttp extends a URL's query rather than overwriting it, so passing them again
+            # sends each one twice and breaks the signature.
             expects=(200, 201,),
             throws=exceptions.UploadError,
         )
@@ -945,7 +968,6 @@ class S3Provider(provider.BaseProvider):
                 abort_url,
                 skip_auto_headers={'CONTENT-TYPE'},
                 headers=headers,
-                params=headers,
                 expects=(204,),
                 throws=exceptions.UploadError,
             )
@@ -993,7 +1015,6 @@ class S3Provider(provider.BaseProvider):
             list_url,
             skip_auto_headers={'CONTENT-TYPE'},
             headers=headers,
-            params=headers,
             expects=(200, 201, 404,),
             throws=exceptions.UploadError
         )

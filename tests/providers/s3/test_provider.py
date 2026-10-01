@@ -241,15 +241,26 @@ def objects_url(**params):
     return BUCKET_URL + '?' + parse.urlencode(sorted(params.items()))
 
 
-def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=None):
-    """Build a ListObjectsV2 response body listing ``keys``."""
+def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=None,
+                             common_prefixes=(), encoding_type='url'):
+    """Build a ListObjectsV2 response body listing ``keys``.
+
+    ``encoding_type`` defaults to ``'url'`` because that is what S3 answers: botocore puts
+    ``encoding-type=url`` on every listing it signs, and S3 echoes the element back to say the
+    key names in the body are percent-encoded.  Pass ``None`` for the bucket that was listed
+    without it.
+    """
     body = '<?xml version="1.0" encoding="UTF-8"?>'
     body += '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
     body += '<Name>that-kerning</Name>'
     body += '<MaxKeys>1000</MaxKeys>'
+    if encoding_type is not None:
+        body += f'<EncodingType>{encoding_type}</EncodingType>'
     body += '<IsTruncated>{}</IsTruncated>'.format('true' if is_truncated else 'false')
     if next_continuation_token is not None:
         body += f'<NextContinuationToken>{next_continuation_token}</NextContinuationToken>'
+    for prefix in common_prefixes:
+        body += f'<CommonPrefixes><Prefix>{prefix}</Prefix></CommonPrefixes>'
     for key in keys:
         body += ('<Contents>'
                  f'<Key>{key}</Key>'
@@ -263,14 +274,18 @@ def list_objects_v2_response(keys, is_truncated=False, next_continuation_token=N
 
 
 def list_versions_response(versions=(), delete_markers=(), is_truncated=False,
-                           next_key_marker=None, next_version_id_marker=None):
+                           next_key_marker=None, next_version_id_marker=None,
+                           encoding_type='url'):
     """Build a ListObjectVersions response body.
 
     ``versions`` and ``delete_markers`` are iterables of ``(key, version_id)`` pairs.
+    ``encoding_type`` defaults to ``'url'`` -- see :func:`list_objects_v2_response`.
     """
     body = '<?xml version="1.0" encoding="UTF-8"?>'
     body += '<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
     body += '<Name>that-kerning</Name>'
+    if encoding_type is not None:
+        body += f'<EncodingType>{encoding_type}</EncodingType>'
     body += '<IsTruncated>{}</IsTruncated>'.format('true' if is_truncated else 'false')
     if next_key_marker is not None:
         body += f'<NextKeyMarker>{next_key_marker}</NextKeyMarker>'
@@ -374,6 +389,50 @@ async def register_presigned(provider, http_method, s3_method, path='', query_pa
         path, s3_method, query_parameters=query_parameters, default_params=default_params)
     aiohttpretty.register_uri(http_method, url, **response)
     return url
+
+
+def redirect_presigned_origin(provider, origin):
+    """Send the provider's presigned requests to ``origin`` instead of to S3.
+
+    T-1 / CX1-11: this is not a stand-in for the presigner.  The real
+    ``generate_generic_presigned_url`` runs and its output is kept whole -- path, query,
+    signature -- with only the scheme and host rewritten.  The endpoint the provider signs
+    against is hard-coded to ``s3[.<region>].amazonaws.com``, and a test cannot listen there;
+    redirecting the origin is the only way to put the presigner's own query on a real socket.
+    Nothing that uses this checks the signature, which the rewritten host would invalidate.
+    """
+    real = provider.generate_generic_presigned_url
+    prefix = parse.urlsplit(origin)[:2]
+
+    async def _redirected(path, method='head_object', query_parameters=None,
+                          default_params=True):
+        url = await real(path, method, query_parameters=query_parameters,
+                         default_params=default_params)
+        return parse.urlunsplit(prefix + parse.urlsplit(url)[2:])
+
+    provider.generate_generic_presigned_url = _redirected
+
+
+def record_request_urls(provider):
+    """Record the URL of every request ``provider`` makes, without changing any of them.
+
+    T-1 / CX1-11: this is a spy, not a stand-in.  The real ``make_request`` runs, so the request
+    still goes out over the session that ``aiohttpretty`` is standing in for; the wrapper only
+    keeps a copy of the URL the real presigner produced, which is the only way to read the query
+    that actually went on the wire byte for byte (``aiohttpretty`` hands back a ``furl`` whose
+    arguments are already decoded).
+
+    :return: the list of requested URLs, in order
+    """
+    requested = []
+    real_make_request = provider.make_request
+
+    async def _recording(method, url, *args, **kwargs):
+        requested.append(url)
+        return await real_make_request(method, url, *args, **kwargs)
+
+    provider.make_request = _recording
+    return requested
 
 
 class TestRegionDetection:
@@ -919,9 +978,12 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_chunked_upload_upload_part(self, provider, file_stream,
-                                              upload_parts_headers_list,
-                                              mock_time):
+    async def test_chunked_upload_upload_part(self, auth, credentials, settings, file_stream,
+                                              upload_parts_headers_list):
+        """T-1 / CX1-2: the part goes to the URL the real presigner signed, and to nothing
+        else.  ``PartNumber`` and ``UploadId`` are already in that URL, so the request must
+        not name them again."""
+        provider = raw_provider(auth, credentials, settings)
         assert file_stream.size == 6
         provider.CHUNK_SIZE = 2
 
@@ -929,21 +991,21 @@ class TestCRUD:
         chunk_number = 1
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        upload_part_url = f'https://that-kerning.s3.amazonaws.com/{path.path}'
         # aiohttp resp headers use upper case
         part_headers = json.loads(upload_parts_headers_list).get('headers_list')[0]
         part_headers = {k.upper(): v for k, v in part_headers.items()}
-        aiohttpretty.register_uri('PUT', upload_part_url, status=200, headers=part_headers,
-                                  params={'partNumber': str(chunk_number), 'uploadId': upload_id})
 
-        part_metadata = await provider._upload_part(file_stream, path, upload_id, chunk_number,
-                                                    provider.CHUNK_SIZE)
+        with frozen_signing_clock():
+            upload_part_url = await register_presigned(
+                provider, 'PUT', 'upload_part', path=path.path, default_params=True,
+                query_parameters={'ContentLength': provider.CHUNK_SIZE,
+                                  'PartNumber': chunk_number, 'UploadId': upload_id},
+                status=200, headers=part_headers)
+            part_metadata = await provider._upload_part(file_stream, path, upload_id,
+                                                        chunk_number, provider.CHUNK_SIZE)
 
-        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url,
-                                     params={'partNumber': str(chunk_number), 'uploadId': upload_id})
+        assert aiohttpretty.has_call(method='PUT', uri=upload_part_url)
         assert part_headers == part_metadata
-
-        provider.CHUNK_SIZE = pd_settings.CHUNK_SIZE
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -1824,12 +1886,15 @@ class TestFolderListingPaging:
         return params
 
     async def _register_page(self, provider, keys, is_truncated=False,
-                             next_continuation_token=None, **extra):
+                             next_continuation_token=None, common_prefixes=(),
+                             encoding_type='url', **extra):
         """Answer the ListObjectsV2 page selected by ``extra`` with a listing of ``keys``."""
         return await register_presigned(
             provider, 'GET', 'list_objects_v2', query_parameters=self._params(**extra),
             body=list_objects_v2_response(keys, is_truncated=is_truncated,
-                                          next_continuation_token=next_continuation_token),
+                                          next_continuation_token=next_continuation_token,
+                                          common_prefixes=common_prefixes,
+                                          encoding_type=encoding_type),
             headers={'Content-Type': 'application/xml'},
         )
 
@@ -1910,6 +1975,38 @@ class TestFolderListingPaging:
 
         assert [item.name for item in result] == ['a.txt', 'b.txt']
         assert not any(isinstance(item, str) for item in result)
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_encoded_names_are_decoded(self, auth, credentials, settings):
+        """CX1-3: keys and common prefixes are percent-encoded when the listing says so."""
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a%2Bb.txt', 'darp/x%20y.txt'],
+                                      common_prefixes=['darp%2Fsub%20dir%2F'], MaxKeys=1000)
+            result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert sorted(item.name for item in result) == ['a+b.txt', 'sub dir', 'x y.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_a_listing_that_is_not_encoded_is_read_verbatim(self, auth, credentials,
+                                                                  settings):
+        """CX1-3: ``key.replace('+', ' ')`` is the form-encoding rule, and S3 does not use it.
+
+        Under ``encoding-type=url`` a literal ``+`` arrives as ``%2B`` and a space as ``%20``,
+        so that replace can only ever fire on a name that was *not* encoded -- where it
+        renames the object.  A user who uploads ``a+b.txt`` then cannot download it.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_page(provider, ['darp/a+b.txt'], encoding_type=None,
+                                      MaxKeys=1000)
+            result = await provider.metadata(WaterButlerPath('/darp/'), next_token='')
+
+        assert [item.name for item in result] == ['a+b.txt']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
@@ -2626,11 +2723,20 @@ class TestObjectVersionsPaging:
     ListObjectVersions never returns a ``NextContinuationToken``; it continues with
     ``NextKeyMarker``/``NextVersionIdMarker``.  It also reports deleted objects in separate
     ``DeleteMarker`` elements, which the current collector ignores entirely.
+
+    T-1 / CX1-11: every request here is signed by the real presigner, which is also what puts
+    ``encoding-type=url`` on the listing.  The stand-in this class used to install did not,
+    so the encoding half of the contract was invisible to it (CX1-3).
     """
+
+    async def _register_versions(self, provider, body, **params):
+        params.setdefault('Bucket', 'that-kerning')
+        return await register_presigned(provider, 'GET', 'list_object_versions',
+                                        query_parameters=params, body=body, status=200)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_get_object_versions_pages_with_key_marker(self, provider, mock_time):
+    async def test_get_object_versions_pages_with_key_marker(self, auth, credentials, settings):
         """A truncated first page must be continued with KeyMarker/VersionIdMarker.
 
         The first page is registered as a two-element response list rather than as a single
@@ -2639,66 +2745,167 @@ class TestObjectVersionsPaging:
         this test would hang instead of fail.  With the cap, the third request raises
         aiohttpretty's "No responses left." and the test fails in bounded time.
         """
-        install_query_encoding_presigned_url(provider)
-
-        page_one_url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
-        page_two_url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg',
-                                    KeyMarker='my-image.jpg', VersionIdMarker='version-one')
-
+        provider = raw_provider(auth, credentials, settings)
         page_one_body = list_versions_response(versions=[('my-image.jpg', 'version-one')],
                                                is_truncated=True,
                                                next_key_marker='my-image.jpg',
                                                next_version_id_marker='version-one')
-        aiohttpretty.register_uri(
-            'GET', page_one_url,
-            responses=[{'body': page_one_body, 'status': 200},
-                       {'body': page_one_body, 'status': 200}],
-        )
-        aiohttpretty.register_uri(
-            'GET', page_two_url,
-            body=list_versions_response(versions=[('my-image.jpg', 'version-two')]),
-            status=200,
-        )
 
-        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+        with frozen_signing_clock():
+            page_one_url = await register_presigned(
+                provider, 'GET', 'list_object_versions',
+                query_parameters={'Bucket': 'that-kerning', 'Prefix': 'my-image.jpg'},
+                responses=[{'body': page_one_body, 'status': 200},
+                           {'body': page_one_body, 'status': 200}],
+            )
+            page_two_url = await self._register_versions(
+                provider,
+                list_versions_response(versions=[('my-image.jpg', 'version-two')]),
+                Prefix='my-image.jpg', KeyMarker='my-image.jpg',
+                VersionIdMarker='version-one')
 
+            versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+
+        assert page_one_url != page_two_url
         assert [item['VersionId'] for item in versions] == ['version-one', 'version-two']
         assert aiohttpretty.has_call(method='GET', uri=page_two_url)
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_get_object_versions_collects_delete_markers(self, provider, mock_time):
+    async def test_encoded_keys_and_markers_are_decoded(self, auth, credentials, settings):
+        """V-1 / V-2 / V-6 / CX1-3: read the key names by the rule the response declares.
+
+        botocore puts ``encoding-type=url`` on every listing it signs, so S3 percent-encodes
+        the key names and the markers that resume from them, and says so with
+        ``<EncodingType>url</EncodingType>``.
+
+        The marker is the sharp edge.  It goes back as a ``KeyMarker`` *parameter*, which the
+        signer percent-encodes on the way out; handing it the already-encoded form asks S3 for
+        a key literally named ``f%2Fa%2Bb``.  No such key exists, so the second page is a
+        listing of something else -- here, a URL nothing answers.
+
+        Equivalence with develop: develop signs with boto2, which sends no ``EncodingType``
+        and gets raw key names back.  The decoded set below, ``f/a+b`` and ``f/x y.txt``, is
+        exactly what develop's ``get_full_revision`` collects from the same bucket, which is
+        the contract this must not change.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('f%2Fa%2Bb', 'version-one')],
+                                       is_truncated=True, next_key_marker='f%2Fa%2Bb',
+                                       next_version_id_marker='version-one'),
+                Prefix='f/')
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('f%2Fx%20y.txt', 'version-two')]),
+                Prefix='f/', KeyMarker='f/a+b', VersionIdMarker='version-one')
+
+            versions = await provider.get_object_versions({'Prefix': 'f/'})
+
+        assert [item['Key'] for item in versions] == ['f/a+b', 'f/x y.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_version_id_marker_is_resumed_verbatim(self, auth, credentials, settings):
+        """CX2-1 / 決定-23: ``EncodingType=url`` covers the key names, not the version ids.
+
+        S3 percent-encodes what it derived from a key -- ``Key``, ``Prefix``, ``Delimiter``,
+        ``KeyMarker``/``NextKeyMarker`` -- because those are the values a key name can make
+        unreadable.  A version id is an opaque identifier that S3 minted itself, so it comes back
+        exactly as it must be sent again; decoding one asks to resume from a different version.
+        A ``%`` in it is the case that separates the two rules, and this pins both in a single
+        request: the key marker is decoded, the version id marker is not.
+
+        The pre-fix form of the second request is registered as well, so that decoding the
+        version id fails on the assertion below -- which names the value that was sent -- rather
+        than on ``aiohttpretty``'s "No URLs matching", which would say only that some URL
+        differed.
+        """
+        provider = raw_provider(auth, credentials, settings)
+        requested = record_request_urls(provider)
+        page_two_body = list_versions_response(versions=[('f%2Fb', 'version-two')])
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('f%2Fa', 'v%2Fid')], is_truncated=True,
+                                       next_key_marker='f%2Fa',
+                                       next_version_id_marker='v%2Fid'),
+                Prefix='f/')
+            await self._register_versions(provider, page_two_body, Prefix='f/',
+                                          KeyMarker='f/a', VersionIdMarker='v%2Fid')
+            await self._register_versions(provider, page_two_body, Prefix='f/',
+                                          KeyMarker='f/a', VersionIdMarker='v/id')
+
+            versions = await provider.get_object_versions({'Prefix': 'f/'})
+
+        assert [item['Key'] for item in versions] == ['f/a', 'f/b']
+        assert len(requested) == 2
+        query = parse.parse_qs(parse.urlsplit(requested[1]).query)
+        assert query['key-marker'] == ['f/a']
+        assert query['version-id-marker'] == ['v%2Fid']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_a_listing_that_is_not_encoded_is_read_verbatim(self, auth, credentials,
+                                                                  settings):
+        """CX1-3: decoding is the response's declaration, not an assumption.
+
+        A bucket listed without ``EncodingType`` answers with the key names as stored, and a
+        key may legitimately contain a percent sign.  Decoding one of those would rename the
+        object -- and a rename in a listing that drives a delete is how the wrong thing gets
+        deleted.
+        """
+        provider = raw_provider(auth, credentials, settings)
+
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('100%2Fdone.txt', 'version-one')],
+                                       encoding_type=None),
+                Prefix='100')
+
+            versions = await provider.get_object_versions({'Prefix': '100'})
+
+        assert [item['Key'] for item in versions] == ['100%2Fdone.txt']
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_get_object_versions_collects_delete_markers(self, auth, credentials,
+                                                               settings):
         """Delete markers are versions too and must be collectable for a full purge."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
 
-        url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
-        aiohttpretty.register_uri(
-            'GET', url,
-            body=list_versions_response(versions=[('my-image.jpg', 'version-one')],
-                                        delete_markers=[('my-image.jpg', 'marker-one')]),
-            status=200,
-        )
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                       delete_markers=[('my-image.jpg', 'marker-one')]),
+                Prefix='my-image.jpg')
 
-        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'},
-                                                      include_delete_markers=True)
+            versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'},
+                                                          include_delete_markers=True)
 
         assert sorted(item['VersionId'] for item in versions) == ['marker-one', 'version-one']
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_get_object_versions_omits_delete_markers_by_default(self, provider, mock_time):
+    async def test_get_object_versions_omits_delete_markers_by_default(self, auth, credentials,
+                                                                       settings):
         """revisions() must not grow delete markers as a side effect of the fix."""
-        install_query_encoding_presigned_url(provider)
+        provider = raw_provider(auth, credentials, settings)
 
-        url = versions_url(Bucket='that-kerning', Prefix='my-image.jpg')
-        aiohttpretty.register_uri(
-            'GET', url,
-            body=list_versions_response(versions=[('my-image.jpg', 'version-one')],
-                                        delete_markers=[('my-image.jpg', 'marker-one')]),
-            status=200,
-        )
+        with frozen_signing_clock():
+            await self._register_versions(
+                provider,
+                list_versions_response(versions=[('my-image.jpg', 'version-one')],
+                                       delete_markers=[('my-image.jpg', 'marker-one')]),
+                Prefix='my-image.jpg')
 
-        versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
+            versions = await provider.get_object_versions({'Prefix': 'my-image.jpg'})
 
         assert [item['VersionId'] for item in versions] == ['version-one']
 
@@ -2753,13 +2960,14 @@ def raw_provider(auth, credentials, settings):
     return prov
 
 
-class commit_server:
-    """An ``aiohttp.web`` server that accepts a single commit.
+class local_server:
+    """An ``aiohttp.web`` server bound to a loopback port, tied to ``provider``'s sessions.
 
     Ported from ``tests/providers/s3compatsigv4/test_provider.py`` (PR #98).
-    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so the redirect
-    following that happens *inside* that call cannot be reproduced with it, and pinning it
-    needs a real socket.
+    ``aiohttpretty`` injects responses *above* ``ClientSession._request``, so anything that
+    happens *inside* that call -- redirect following, and the merge of a URL's query with
+    ``make_request``'s ``params=`` -- cannot be observed with it.  Pinning those needs a
+    real socket.
 
     Startup and teardown are owned here.  With ``runner.setup()`` through URL assembly left
     outside the ``finally``, a failure after the server started would carry a listening
@@ -3281,6 +3489,74 @@ class TestCompleteMultipartUpload:
         assert 'The upload is aborted.' not in e.value.message
 
 
+class TestChunkedUploadWireQuery:
+    """R-6 / U-9 / CX1-2: what the part, abort and list-parts requests put on the wire.
+
+    A presigned URL already carries every parameter it was signed over.  Passing the same
+    parameters again as ``make_request(params=...)`` does not overwrite them: ``ClientRequest``
+    *extends* the URL's query, so the request goes out with each one twice.  S3 answers a
+    duplicated query parameter with ``SignatureDoesNotMatch`` -- the signature covers the
+    canonical query string, which no longer matches -- so every chunked upload of a file
+    larger than one part fails.
+
+    ``aiohttpretty`` cannot show this: it replaces ``ClientSession._request``, which is above
+    the merge.  These tests use a real socket and read the query the server received.
+    """
+
+    async def _capture(self, provider, method, path, call):
+        """Run ``call`` against a loopback server and return the query string it received."""
+        seen = {}
+
+        async def handler(request):
+            await request.read()
+            seen['query'] = request.query_string
+            return web.Response(status=200, headers={'ETag': '"d41d8cd98f00b204e9800998ecf8"'})
+
+        app = web.Application()
+        app.router.add_route(method, '/{tail:.*}', handler)
+        async with local_server(provider, app) as server:
+            redirect_presigned_origin(provider, server.url)
+            await call(path)
+
+        return parse.parse_qs(seen['query'], keep_blank_values=True)
+
+    @pytest.mark.asyncio
+    async def test_part_request_sends_each_parameter_once(self, auth, credentials, settings):
+        """CX1-2: ``partNumber`` and ``uploadId`` are in the signed URL, so ``_upload_part``
+        must not add them a second time.  On ``ca65500e`` both arrive twice."""
+        provider = raw_provider(auth, credentials, settings)
+        stream = streams.StringStream(b'abcdefghij')
+
+        async def upload(path):
+            await provider._upload_part(stream, path, 'SESSION', 1, 10)
+
+        query = await self._capture(provider, 'PUT', WaterButlerPath('/my-subfolder/f.txt'),
+                                    upload)
+
+        assert query['partNumber'] == ['1']
+        assert query['uploadId'] == ['SESSION']
+        # The signature is signed over the canonical query; a duplicate breaks it even when
+        # the two values agree, so the count is the thing to assert, not the value.
+        assert len(query['X-Amz-Signature']) == 1
+
+    @pytest.mark.asyncio
+    async def test_list_parts_request_sends_each_parameter_once(self, auth, credentials,
+                                                                settings):
+        """CL m-2: ``_list_uploaded_chunks`` passes ``params=headers`` -- an empty dict that
+        reads as a copy-paste of the headers argument.  It adds nothing today; the assertion
+        is that the request carries the signed query and only that."""
+        provider = raw_provider(auth, credentials, settings)
+
+        async def list_parts(path):
+            await provider._list_uploaded_chunks(path, 'SESSION')
+
+        query = await self._capture(provider, 'GET', WaterButlerPath('/my-subfolder/f.txt'),
+                                    list_parts)
+
+        assert query['uploadId'] == ['SESSION']
+        assert len(query['X-Amz-Signature']) == 1
+
+
 class TestCommitPreconditions:
     """K-5 / 決定-12: the commit has to be sent exactly once.
 
@@ -3325,7 +3601,7 @@ class TestCommitPreconditions:
         ``allow_redirects=True``, so two commit POSTs go out without spending any of core's
         retry budget.
 
-        ``aiohttpretty`` cannot pin this; see ``commit_server``."""
+        ``aiohttpretty`` cannot pin this; see ``local_server``."""
         calls = []
 
         async def first(request):
@@ -3352,7 +3628,7 @@ class TestCommitPreconditions:
         app.router.add_post('/second', second)
 
         provider = raw_provider(auth, credentials, settings)
-        async with commit_server(provider, app) as server:
+        async with local_server(provider, app) as server:
             provider.generate_generic_presigned_url = MockCoroutine(return_value=server.url)
             with pytest.raises(exceptions.UploadError):
                 await provider._complete_multipart_upload(
