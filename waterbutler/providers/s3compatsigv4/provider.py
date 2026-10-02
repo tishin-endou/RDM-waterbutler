@@ -28,6 +28,22 @@ from waterbutler.providers.s3compatsigv4.metadata import (
 
 logger = logging.getLogger(__name__)
 
+# Matches an ``<Error>`` element with or without a namespace prefix, so that
+# namespace-prefixed error documents are not rejected by the cheap pre-filter.
+ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
+
+
+def _local_name_lookup(mapping, local_name, default=None):
+    """Look up ``local_name`` in an ``xmltodict`` mapping, ignoring any XML
+    namespace prefix on the keys.  Returns ``default`` when absent.
+    """
+    if local_name in mapping:
+        return mapping[local_name]
+    for key, value in mapping.items():
+        if isinstance(key, str) and key.rsplit(':', 1)[-1] == local_name:
+            return value
+    return default
+
 
 def compute_md5(fp):
     """Compute MD5 hash for file-like object."""
@@ -91,6 +107,16 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
     CHUNK_SIZE = settings.CHUNK_SIZE
     CONTIGUOUS_UPLOAD_SIZE_LIMIT = settings.CONTIGUOUS_UPLOAD_SIZE_LIMIT
+
+    QUOTA_EXCEEDED_MESSAGE = (
+        'Upload failed because the quota or capacity of the cloud storage has been exceeded.  '
+        'Please free up storage space or contact the storage administrator.'
+    )
+    UNCLASSIFIED_STORAGE_ERROR_MESSAGE = (
+        'Upload failed because the cloud storage returned an error that could not be '
+        'interpreted.  Please retry the upload, and contact the storage administrator if the '
+        'problem persists.'
+    )
 
     def __init__(self, auth, credentials, settings, **kwargs):
         """
@@ -307,6 +333,123 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             raise exceptions.MetadataError('Cannot get content size and ETag')
         return size, etag
 
+    @staticmethod
+    def _raw_error_body(err):
+        """Return the storage's raw response body carried by ``err``, or ``None``.
+
+        ``exception_from_response`` stores an XML error body either as
+        ``err.data['response']`` (dict) or as ``err.message`` (str).
+        """
+        body = None
+        data = getattr(err, 'data', None)
+        if isinstance(data, dict):
+            body = data.get('response')
+        if body is None:
+            body = getattr(err, 'message', None)
+        return body if isinstance(body, str) else None
+
+    @classmethod
+    def _parse_s3_error_body(cls, err):
+        """Extract the S3 XML error ``Code`` and ``Message`` from an
+        :class:`waterbutler.core.exceptions.UploadError` raised by ``make_request``.
+
+        :param err: ( :class:`.UploadError` ) The error raised by ``make_request``
+        :rtype: tuple(str or None, str or None)
+        :return: ``(error_code, error_message)``, or ``(None, None)`` when the
+            response body is not a parsable S3 XML error
+        """
+        body = cls._raw_error_body(err)
+        if body is None or not ERROR_ELEMENT_RE.search(body):
+            return None, None
+        try:
+            parsed = xmltodict.parse(body)
+        except ExpatError:
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        error = _local_name_lookup(parsed, 'Error')
+        if not isinstance(error, dict):
+            # ``<Error>text</Error>`` parses to a plain string, and an empty
+            # document parses to ``None``.  Neither carries an error code.
+            return None, None
+        code = _local_name_lookup(error, 'Code')
+        message = _local_name_lookup(error, 'Message')
+        if not isinstance(code, str) or not code.strip():
+            # An empty ``<Code/>`` is ``None`` and ``<Code attr="..."/>`` is a
+            # dict; without a code there is nothing to translate.
+            return None, None
+        return code.strip(), message.strip() if isinstance(message, str) else None
+
+    @classmethod
+    def _is_quota_exhaustion(cls, err):
+        """Whether ``err`` is the storage reporting that it is out of space.
+
+        ``_translate_upload_error`` and the ``_chunked_upload`` entry log both
+        report the same failure, so they have to agree on this.  When only the
+        translator knew that quota exhaustion is an expected, user-resolvable
+        outcome, the entry log still went out at ERROR and paged oncall every
+        time somebody filled a bucket.
+
+        Because the list of vendor-specific quota codes cannot be exhaustive,
+        a response that already carries HTTP 507 counts whatever its code is.
+        """
+        if not isinstance(err, exceptions.UploadError):
+            return False
+        if err.code == HTTPStatus.INSUFFICIENT_STORAGE:
+            return True
+        error_code = cls._parse_s3_error_body(err)[0]
+        return error_code is not None and error_code in settings.QUOTA_EXCEEDED_ERROR_CODES
+
+    def _translate_upload_error(self, err, extra_message=''):
+        """Translate a raw :class:`.UploadError` from the storage backend into a
+        user-facing error.
+
+        Storage-side quota exhaustion (e.g. ``QuotaExceeded``) is mapped to HTTP
+        507 (Insufficient Storage) with an explicit message so that the user can
+        tell why and how the upload ended.  Other S3 XML errors are re-raised
+        with a readable message instead of the raw XML body.
+
+        Because the list of vendor-specific quota error codes cannot be
+        exhaustive, a response that already carries HTTP 507 is treated as a
+        quota failure whatever its error code is (or even without a parsable
+        body).
+
+        :param err: ( :class:`.UploadError` ) The original error
+        :param str extra_message: An optional message appended to the translated
+            error (e.g. a warning that the multipart-upload abort failed)
+        :rtype: :class:`.UploadError`
+        """
+        error_code, error_message = self._parse_s3_error_body(err)
+        is_quota_error = self._is_quota_exhaustion(err)
+
+        if is_quota_error:
+            code_note = '  (storage error code: {})'.format(error_code) \
+                if error_code is not None else ''
+            return exceptions.UploadError(
+                '{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note, extra_message),
+                code=HTTPStatus.INSUFFICIENT_STORAGE,
+                # Running out of storage is an expected, user-resolvable failure:
+                # keep it out of Sentry's error level and the 5xx alerting path.
+                is_user_error=True,
+            )
+        if error_code is not None:
+            return exceptions.UploadError(
+                'Upload failed because the cloud storage returned an error.  '
+                '(storage error code: {}, message: {}){}'.format(
+                    error_code, error_message, extra_message),
+                code=err.code,
+            )
+        # Nothing could be classified.  ``err`` must still not be handed back:
+        # ``BaseHandler.write_error`` writes ``exc.data`` verbatim as the
+        # response body when it is set, and falls back to ``exc.message``
+        # otherwise.  For a dict message that body is the storage's raw XML
+        # (Resource paths, RequestId); for the string message that
+        # ``exception_from_response`` builds when there is no body, it is the
+        # presigned URL including its signature.
+        return exceptions.UploadError(
+            '{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, extra_message),
+            code=err.code)
+
     async def upload(self, stream, path, conflict='replace', **kwargs):
         """Uploads the given stream to S3 Compatible Storage
 
@@ -347,23 +490,31 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
         query_parameters = {'Bucket': self.bucket_name, 'Key': path.full_path}
 
-        resp = await self.make_request(
-            'PUT',
-            functools.partial(
-                self.connection.generate_presigned_url,
-                'put_object',
-                Params=query_parameters,
-                HttpMethod='PUT',
-            ),
-            data=upload_stream,
-            skip_auto_headers={'CONTENT-TYPE'},
-            headers=headers,
-            expects=(
-                HTTPStatus.OK,
-                HTTPStatus.CREATED,
-            ),
-            throws=exceptions.UploadError,
-        )
+        try:
+            resp = await self.make_request(
+                'PUT',
+                functools.partial(
+                    self.connection.generate_presigned_url,
+                    'put_object',
+                    Params=query_parameters,
+                    HttpMethod='PUT',
+                ),
+                data=upload_stream,
+                skip_auto_headers={'CONTENT-TYPE'},
+                headers=headers,
+                expects=(
+                    HTTPStatus.OK,
+                    HTTPStatus.CREATED,
+                ),
+                throws=exceptions.UploadError,
+            )
+        except exceptions.UploadError as err:
+            # Translate storage-side errors (e.g. quota exceeded) into a
+            # user-facing error instead of returning the raw XML body.
+            # ``from None``: the untranslated error is what carries the raw
+            # body, and a chained ``__context__`` puts it straight back into
+            # the rendered traceback.
+            raise self._translate_upload_error(err) from None
 
         # S3-compatible server automatically validates Content-MD5
         # If MD5 doesn't match, server returns 400 UploadError before writing data
@@ -374,7 +525,15 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         """Uploads the given stream to S3 over multiple chunks"""
 
         # Step 1. Create a multi-part upload session
-        session_upload_id = await self._create_upload_session(path)
+        try:
+            session_upload_id = await self._create_upload_session(path)
+        except exceptions.UploadError as err:
+            # The session has not been created, so there is nothing to abort.
+            # Storage-side quota errors can occur at session creation too.
+            # ``from None``: the untranslated error is what carries the raw
+            # body, and a chained ``__context__`` puts it straight back into
+            # the rendered traceback.
+            raise self._translate_upload_error(err) from None
 
         try:
             # Step 2. Break stream into chunks and upload them one by one
@@ -385,12 +544,19 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             msg = 'An unexpected error has occurred during the multi-part upload.'
             logger.error('{} upload_id={} error={!r}'.format(msg, session_upload_id, err))
             aborted = await self._abort_chunked_upload(path, session_upload_id)
+            abort_message = ''
             if not aborted:
                 # NOTE: this warning must be appended only when the abort has
                 # FAILED.  (An earlier revision appended it on success.)
-                msg += '  The abort action failed to clean up the temporary file parts generated ' \
-                       'during the upload process.  Please manually remove them.'
-            raise exceptions.UploadError(msg)
+                abort_message = '  The abort action failed to clean up the temporary file ' \
+                                'parts generated during the upload process.  Please manually ' \
+                                'remove them.'
+            if isinstance(err, exceptions.UploadError):
+                # Preserve the original storage error (status code and body) and
+                # translate quota-exhaustion responses into a user-facing error.
+                raise self._translate_upload_error(
+                    err, extra_message=abort_message) from None
+            raise exceptions.UploadError('{}{}'.format(msg, abort_message))
 
     async def _create_upload_session(self, path):
         """This operation initiates a multipart upload and returns an upload ID. This upload ID is
