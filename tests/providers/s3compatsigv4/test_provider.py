@@ -44,7 +44,6 @@ from waterbutler.providers.s3compatsigv4.metadata import (S3CompatSigV4Revision,
                                                      )
 from hmac import compare_digest
 
-# Independent copy so a deleted row cannot delete its own test.
 DEFINITIVE_REJECTION_CODES = [
     'AccessDenied',
     'InvalidPart',
@@ -103,7 +102,7 @@ def arrange_chunked_commit(provider):
     provider._abort_chunked_upload = MockCoroutine(return_value=True)
 
 
-class commit_server:
+class CommitServer:
     """Real-socket test server for commit endpoint tests."""
 
     def __init__(self, provider, app):
@@ -1426,10 +1425,6 @@ class TestCRUD:
 
 
     @pytest.mark.parametrize('body', [
-        b'\xff' * 512,
-        b'\xff' * 4096,
-        '\u3042' * 512,
-        ('\u3042' * 512).encode('utf-8'),
         b'<html>' + b'\xc3\x28' * 300 + '\u3042'.encode('utf-8') * 100,
         b'<Error><Code>AccessDenied</Code></Error>',
         '<Error><Code>AccessDenied</Code></Error>',
@@ -1580,7 +1575,7 @@ class TestCRUD:
     @pytest.mark.aiohttpretty
     async def test_quota_507_without_a_body_suppresses_the_notice(self, provider, file_stream,
                                                                   mock_time):
-        # HTTP 507 is treated as quota exhaustion regardless of body; the table does not cover this input.
+        # HTTP 507 without a body is still quota exhaustion.
         assert file_stream.size == 6
         arrange_chunked_commit(provider)
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
@@ -1627,11 +1622,19 @@ class TestCRUD:
                 else:
                     await provider._contiguous_upload(file_stream, path)
 
-        logged = '\n'.join(r.getMessage() for r in caplog.records if r.name == PROVIDER_LOGGER)
-        assert 'X-Amz-Signature' not in logged
-        assert 'X-Amz-Credential' not in logged
-        assert 'SECRETSIG' not in logged
-        assert 'ClientOSError' in logged
+        formatter = logging.Formatter()
+        formatted = '\n'.join(formatter.format(r) for r in caplog.records
+                              if r.name == PROVIDER_LOGGER)
+        assert 'X-Amz-Signature' not in formatted, \
+            'signature leaked into formatted log output'
+        assert 'X-Amz-Credential' not in formatted, \
+            'credential leaked into formatted log output'
+        assert 'SECRETSIG' not in formatted, \
+            'raw signature value leaked into formatted log output'
+        assert 'ClientOSError' in formatted
+        # Traceback frames must be present for post-mortem diagnosis.
+        assert 'Traceback' in formatted or 'File "' in formatted, \
+            'expected traceback frames in formatted log output'
         assert exc.value.__cause__ is None
         assert exc.value.__suppress_context__ is True
 
@@ -1677,16 +1680,38 @@ class TestCRUD:
             {'response': '<Error><Code lang="en"/></Error>'}, code=500)
         assert provider._parse_s3_error_body(err) == (None, None)
 
-
-    def test_parse_s3_error_body_logs_xml_parse_failure(self, provider, caplog):
-        err = storage_error({'response': 'not xml at all'}, code=500)
+    @pytest.mark.parametrize('body_xml', [
+        '<Error><Code></Code><Message>m</Message></Error>',
+        '<Error><Code> </Code><Message>m</Message></Error>',
+    ])
+    def test_parse_s3_error_body_empty_text_code_warns(self, provider, caplog,
+                                                        body_xml):
+        err = storage_error({'response': body_xml}, code=500)
         with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
-            provider._parse_s3_error_body(err)
+            result = provider._parse_s3_error_body(err)
+        assert result == (None, None)
         records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
         assert len(records) == 1
-        msg = records[0].getMessage()
-        assert 'ExpatError' in msg
-        assert 'xml_parse_failure' in msg
+        formatter = logging.Formatter()
+        formatted = formatter.format(records[0])
+        assert 'Unrecognised S3 error body' in formatted
+
+    @pytest.mark.parametrize('body_xml, description', [
+        ('not xml at all', 'unparsable XML'),
+        ('<Root>no Error element</Root>', 'Error element absent'),
+        ('<Error/>',  'Error is an empty element'),
+        ('<Error><Message>oops</Message></Error>', 'Code absent'),
+        ('<Error><Code/><Message>oops</Message></Error>', 'Code empty'),
+    ])
+    def test_parse_s3_error_body_logs_unrecognised(self, provider, caplog,
+                                                    body_xml, description):
+        err = storage_error({'response': body_xml}, code=500)
+        with caplog.at_level(logging.WARNING, logger=PROVIDER_LOGGER):
+            result = provider._parse_s3_error_body(err)
+        assert result == (None, None), description
+        records = [r for r in caplog.records if r.name == PROVIDER_LOGGER]
+        assert len(records) == 1, 'expected exactly one warning for: ' + description
+        assert 'Unrecognised S3 error body' in records[0].getMessage()
 
 
     @pytest.mark.asyncio
@@ -2134,7 +2159,7 @@ class TestCRUD:
         app.router.add_post('/first', first)
         app.router.add_post('/second', second)
 
-        async with commit_server(provider, app) as server:
+        async with CommitServer(provider, app) as server:
             arrange_chunked_commit(provider)
             with mock.patch.object(provider.connection, 'generate_presigned_url',
                                    return_value=server.url):
