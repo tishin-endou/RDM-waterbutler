@@ -10,6 +10,7 @@ from xml.parsers.expat import ExpatError
 from io import BytesIO
 import base64
 
+import aiohttp
 import xmltodict
 import boto3
 from botocore.config import Config
@@ -28,9 +29,73 @@ from waterbutler.providers.s3compatsigv4.metadata import (
 
 logger = logging.getLogger(__name__)
 
-# Matches an ``<Error>`` element with or without a namespace prefix, so that
-# namespace-prefixed error documents are not rejected by the cheap pre-filter.
-ERROR_ELEMENT_RE = re.compile(r'<(?:[^\s:>/]+:)?Error[\s>/]')
+CONNECTION_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
+
+# Error codes that prove CompleteMultipartUpload was declined *before*
+# assembling anything.  Everything outside this set is treated as UNKNOWN
+# (fail-safe: unnecessary notice > missing notice).  Hardcoded rather than
+# configurable so it cannot drift with the operator-extensible quota list.
+DEFINITIVE_REJECTION_CODES = frozenset({
+    'AccessDenied',
+    'InvalidPart',
+    'InvalidPartOrder',
+    'EntityTooSmall',
+    'EntityTooLarge',
+    'MalformedXML',
+    'SignatureDoesNotMatch',
+    'InvalidAccessKeyId',
+    'NoSuchBucket',
+})
+
+# Upper bound, in bytes, on how much of a raw error body is logged.
+ERROR_BODY_LOG_LIMIT = 512
+
+
+def _bounded_body(body):
+    """The leading :data:`ERROR_BODY_LOG_LIMIT` bytes of *body*, as text.
+
+    Accepts both ``bytes`` and ``str``.  The result is re-measured after
+    decoding to keep the byte bound even when ``replace`` expands invalid bytes.
+    """
+    if body is None:
+        return None
+    if isinstance(body, str):
+        body = body.encode('utf-8', 'replace')
+    head = body[:ERROR_BODY_LOG_LIMIT].decode('utf-8', 'replace')
+    return head.encode('utf-8')[:ERROR_BODY_LOG_LIMIT].decode('utf-8', 'ignore')
+
+
+# Sentinel: distinguishes "key absent" from "key present but value empty".
+_MISSING = object()
+
+
+# Explicit flag: only errors carrying a raw storage response body should be
+# parsed for S3 error codes.  WaterButler-authored UploadErrors must not be
+# re-interpreted (they share the same exception type but carry prose, not XML).
+_STORAGE_RESPONSE_FLAG = '_wb_storage_response'
+
+# The failure was observed while committing a multipart upload, so the object
+# may exist on the storage even though the request is reported as failed.
+_COMMIT_OUTCOME_UNKNOWN_FLAG = '_wb_commit_outcome_unknown'
+
+
+def _mark_storage_response(err):
+    """Tag ``err`` as carrying a raw storage response body."""
+    setattr(err, _STORAGE_RESPONSE_FLAG, True)
+    return err
+
+
+def _is_storage_response(err):
+    return getattr(err, _STORAGE_RESPONSE_FLAG, False)
+
+
+def _mark_commit_outcome_unknown(err):
+    setattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, True)
+    return err
+
+
+def _is_commit_outcome_unknown(err):
+    return getattr(err, _COMMIT_OUTCOME_UNKNOWN_FLAG, False)
 
 
 def _local_name_lookup(mapping, local_name, default=None):
@@ -117,6 +182,29 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         'interpreted.  Please retry the upload, and contact the storage administrator if the '
         'problem persists.'
     )
+    # A dropped connection is evidence of exhaustion only when the storage
+    # received enough data; otherwise it is a generic transport failure.
+    CONNECTION_INTERRUPTED_MESSAGE = (
+        'Upload failed because the connection to the cloud storage was interrupted.  This may '
+        'indicate that the storage is full, that its quota has been exceeded, or that there '
+        'was a network problem.  Please retry the upload, and contact the storage '
+        'administrator if the problem persists.'
+    )
+    # The commit is still reported as failed (fail-closed), but an unreadable
+    # answer is not proof that nothing was written.  Saying only "the upload
+    # failed" invites a duplicate upload.
+    UPLOAD_MAY_HAVE_COMPLETED_MESSAGE = (
+        '  The upload may in fact have completed; please check the file list before '
+        'uploading the file again.'
+    )
+
+    async def _make_upload_request(self, *args, **kwargs):
+        """``make_request`` wrapper that tags storage-origin UploadErrors."""
+        try:
+            return await self.make_request(*args, **kwargs)
+        except exceptions.UploadError as err:
+            _mark_storage_response(err)
+            raise
 
     def __init__(self, auth, credentials, settings, **kwargs):
         """
@@ -219,29 +307,40 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         s3_api_name='S3 API',
         exception_type=exceptions.UnhandledProviderError,
     ):
-        """check an S3 API result with http status is 200 OK.
+        """Check an S3 API response for a 200+Error body and raise if found.
 
-        try to parse response body as a xml.
-        if the xml has an 'Error' element then raise an exception.
+        Fail-closed: once an ``Error`` element is seen, the operation has
+        failed regardless of whether the code can be classified.
 
         :param str response_body: API response body.
         :param str s3_api_name: S3 API name for logging.
         :param type exception_type: raise Exception type
         """
+        body = response_body.decode('utf-8', 'replace') \
+            if isinstance(response_body, bytes) else response_body
+
         try:
-            # memo: If no element, the parser will raise an ExpatError.
             result = xmltodict.parse(response_body)
         except ExpatError:
+            # Unintelligible response is an upstream fault.
             logger.warning('Couldn\'t parse %s result', s3_api_name)
-            raise
+            raise _mark_storage_response(
+                exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
-        if 'Error' in result:
-            error_code = result['Error'].get('Code', 'Unknown')
-            logger.warning('%s returned with an error: %s', s3_api_name, error_code)
-            raise exception_type(
-                f'{s3_api_name} returned with an error.',
-                code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
+        error = _local_name_lookup(result, 'Error', _MISSING) \
+            if isinstance(result, dict) else _MISSING
+        if error is _MISSING:
+            return
+
+        error_code = None
+        if isinstance(error, dict):
+            code = _local_name_lookup(error, 'Code')
+            if isinstance(code, str) and code.strip():
+                error_code = code.strip()
+        logger.warning('%s returned with an error: %s', s3_api_name, error_code or 'Unknown')
+
+        raise _mark_storage_response(
+            exception_type({'response': body}, code=HTTPStatus.BAD_GATEWAY))
 
     async def download(self, path, accept_url=False, revision=None, range=None, **kwargs):
         r"""Returns a ResponseWrapper (Stream) for the specified path
@@ -350,33 +449,34 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
     @classmethod
     def _parse_s3_error_body(cls, err):
-        """Extract the S3 XML error ``Code`` and ``Message`` from an
-        :class:`waterbutler.core.exceptions.UploadError` raised by ``make_request``.
+        """Extract the S3 XML error ``Code`` and ``Message`` from *err*.
 
-        :param err: ( :class:`.UploadError` ) The error raised by ``make_request``
         :rtype: tuple(str or None, str or None)
         :return: ``(error_code, error_message)``, or ``(None, None)`` when the
-            response body is not a parsable S3 XML error
+            response body is not a parsable S3 XML error.
         """
         body = cls._raw_error_body(err)
-        if body is None or not ERROR_ELEMENT_RE.search(body):
+        if body is None:
             return None, None
         try:
             parsed = xmltodict.parse(body)
-        except ExpatError:
+        except ExpatError as exc:
+            logger.warning('_parse_s3_error_body: kind=xml_parse_failure '
+                           'exception=%s body=%s',
+                           type(exc).__name__, _bounded_body(body))
             return None, None
         if not isinstance(parsed, dict):
             return None, None
         error = _local_name_lookup(parsed, 'Error')
         if not isinstance(error, dict):
-            # ``<Error>text</Error>`` parses to a plain string, and an empty
-            # document parses to ``None``.  Neither carries an error code.
+            logger.warning('_parse_s3_error_body: kind=error_not_dict '
+                           'body=%s', _bounded_body(body))
             return None, None
         code = _local_name_lookup(error, 'Code')
         message = _local_name_lookup(error, 'Message')
         if not isinstance(code, str) or not code.strip():
-            # An empty ``<Code/>`` is ``None`` and ``<Code attr="..."/>`` is a
-            # dict; without a code there is nothing to translate.
+            logger.warning('_parse_s3_error_body: kind=code_missing '
+                           'body=%s', _bounded_body(body))
             return None, None
         return code.strip(), message.strip() if isinstance(message, str) else None
 
@@ -384,70 +484,109 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     def _is_quota_exhaustion(cls, err):
         """Whether ``err`` is the storage reporting that it is out of space.
 
-        ``_translate_upload_error`` and the ``_chunked_upload`` entry log both
-        report the same failure, so they have to agree on this.  When only the
-        translator knew that quota exhaustion is an expected, user-resolvable
-        outcome, the entry log still went out at ERROR and paged oncall every
-        time somebody filled a bucket.
-
         Because the list of vendor-specific quota codes cannot be exhaustive,
         a response that already carries HTTP 507 counts whatever its code is.
         """
-        if not isinstance(err, exceptions.UploadError):
+        if not isinstance(err, exceptions.UploadError) or not _is_storage_response(err):
             return False
         if err.code == HTTPStatus.INSUFFICIENT_STORAGE:
             return True
         error_code = cls._parse_s3_error_body(err)[0]
         return error_code is not None and error_code in settings.QUOTA_EXCEEDED_ERROR_CODES
 
+    @classmethod
+    def _observed_error_code(cls, err):
+        """The S3 error code from ``err``'s body, gated on the storage-response
+        flag so that connection errors are never misclassified.  Returns
+        ``None`` when the flag is absent or parsing fails.
+        """
+        if not _is_storage_response(err):
+            return None
+        return cls._parse_s3_error_body(err)[0]
+
+    @classmethod
+    def _commit_outcome(cls, error_code):
+        """Whether ``error_code`` proves the commit did not happen.
+
+        Returns ``True`` (NOT_COMMITTED) when the code is in
+        :data:`DEFINITIVE_REJECTION_CODES`, ``False`` (UNKNOWN) otherwise.
+        """
+        return error_code is not None and error_code in DEFINITIVE_REJECTION_CODES
+
+    @classmethod
+    def _commit_outcome_note(cls, err):
+        """The notice to append when the commit's outcome is genuinely unknown.
+
+        Decision order:
+
+        1. Quota exhaustion suppresses the notice (checked first, because the
+           quota code list and the rejection code list cannot be kept in step).
+        2. Otherwise :data:`DEFINITIVE_REJECTION_CODES` decides; anything
+           outside is UNKNOWN.
+        3. UNKNOWN returns the "may have completed" notice.
+        """
+        if not _is_commit_outcome_unknown(err):
+            return ''
+        if cls._is_quota_exhaustion(err):
+            return ''
+        if cls._commit_outcome(cls._observed_error_code(err)):
+            return ''
+        return cls.UPLOAD_MAY_HAVE_COMPLETED_MESSAGE
+
     def _translate_upload_error(self, err, extra_message=''):
-        """Translate a raw :class:`.UploadError` from the storage backend into a
-        user-facing error.
+        """Translate a raw :class:`.UploadError` into a user-facing error.
 
-        Storage-side quota exhaustion (e.g. ``QuotaExceeded``) is mapped to HTTP
-        507 (Insufficient Storage) with an explicit message so that the user can
-        tell why and how the upload ended.  Other S3 XML errors are re-raised
-        with a readable message instead of the raw XML body.
-
-        Because the list of vendor-specific quota error codes cannot be
-        exhaustive, a response that already carries HTTP 507 is treated as a
-        quota failure whatever its error code is (or even without a parsable
-        body).
+        Quota exhaustion is mapped to HTTP 507.  Unclassifiable errors get a
+        readable message instead of the raw XML body.
 
         :param err: ( :class:`.UploadError` ) The original error
         :param str extra_message: An optional message appended to the translated
             error (e.g. a warning that the multipart-upload abort failed)
         :rtype: :class:`.UploadError`
         """
+        if not _is_storage_response(err):
+            # WaterButler-authored; no storage body to parse.  Pass through.
+            logger.debug('Passing through an untagged upload error unmodified: '
+                         'type=%s status=%s', type(err).__name__, err.code)
+            if not extra_message:
+                return err
+            return exceptions.UploadError(
+                '{}{}'.format(err.message, extra_message),
+                code=err.code,
+                # Preserve is_user_error to avoid re-classifying the Sentry level.
+                is_user_error=err.is_user_error,
+            )
+
         error_code, error_message = self._parse_s3_error_body(err)
         is_quota_error = self._is_quota_exhaustion(err)
+        outcome_note = self._commit_outcome_note(err)
+
+        # Log the raw diagnostics; the translated error carries only a summary.
+        raw_body = self._raw_error_body(err)
+        status = int(err.code) if isinstance(err.code, int) else err.code
+        log = logger.warning if is_quota_error else logger.error
+        log('Storage rejected the upload: status=%s code=%s body=%s',
+            status, error_code, _bounded_body(raw_body))
 
         if is_quota_error:
             code_note = '  (storage error code: {})'.format(error_code) \
                 if error_code is not None else ''
             return exceptions.UploadError(
-                '{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note, extra_message),
+                '{}{}{}{}'.format(self.QUOTA_EXCEEDED_MESSAGE, code_note,
+                                  outcome_note, extra_message),
                 code=HTTPStatus.INSUFFICIENT_STORAGE,
-                # Running out of storage is an expected, user-resolvable failure:
-                # keep it out of Sentry's error level and the 5xx alerting path.
                 is_user_error=True,
             )
         if error_code is not None:
             return exceptions.UploadError(
                 'Upload failed because the cloud storage returned an error.  '
-                '(storage error code: {}, message: {}){}'.format(
-                    error_code, error_message, extra_message),
+                '(storage error code: {}, message: {}){}{}'.format(
+                    error_code, error_message, outcome_note, extra_message),
                 code=err.code,
             )
-        # Nothing could be classified.  ``err`` must still not be handed back:
-        # ``BaseHandler.write_error`` writes ``exc.data`` verbatim as the
-        # response body when it is set, and falls back to ``exc.message``
-        # otherwise.  For a dict message that body is the storage's raw XML
-        # (Resource paths, RequestId); for the string message that
-        # ``exception_from_response`` builds when there is no body, it is the
-        # presigned URL including its signature.
         return exceptions.UploadError(
-            '{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, extra_message),
+            '{}{}{}'.format(self.UNCLASSIFIED_STORAGE_ERROR_MESSAGE, outcome_note,
+                            extra_message),
             code=err.code)
 
     async def upload(self, stream, path, conflict='replace', **kwargs):
@@ -470,12 +609,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     async def _contiguous_upload(self, stream, path):
         """Uploads the given stream in one request."""
 
-        # Read the entire stream to compute MD5
         stream_data = await stream.read()
         md5_digest = hashlib.md5(stream_data).digest()
         md5_base64 = base64.b64encode(md5_digest).decode('utf-8')
 
-        # Create a new stream from the data
         upload_stream = streams.StringStream(stream_data)
 
         headers = {
@@ -491,7 +628,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         query_parameters = {'Bucket': self.bucket_name, 'Key': path.full_path}
 
         try:
-            resp = await self.make_request(
+            resp = await self._make_upload_request(
                 'PUT',
                 functools.partial(
                     self.connection.generate_presigned_url,
@@ -509,12 +646,15 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 throws=exceptions.UploadError,
             )
         except exceptions.UploadError as err:
-            # Translate storage-side errors (e.g. quota exceeded) into a
-            # user-facing error instead of returning the raw XML body.
-            # ``from None``: the untranslated error is what carries the raw
-            # body, and a chained ``__context__`` puts it straight back into
-            # the rendered traceback.
+            # from None: keep the raw body out of the traceback.
             raise self._translate_upload_error(err) from None
+        except CONNECTION_ERRORS as err:
+            # Storage may close the connection on quota exhaustion.  Log the
+            # error type only (no repr: URLs may contain signatures).
+            logger.error('Connection error during contiguous upload: error_type=%s',
+                         type(err).__name__)
+            raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
+                                         code=HTTPStatus.BAD_GATEWAY) from None
 
         # S3-compatible server automatically validates Content-MD5
         # If MD5 doesn't match, server returns 400 UploadError before writing data
@@ -524,39 +664,47 @@ class S3CompatSigV4Provider(provider.BaseProvider):
     async def _chunked_upload(self, stream, path):
         """Uploads the given stream to S3 over multiple chunks"""
 
-        # Step 1. Create a multi-part upload session
         try:
             session_upload_id = await self._create_upload_session(path)
         except exceptions.UploadError as err:
-            # The session has not been created, so there is nothing to abort.
-            # Storage-side quota errors can occur at session creation too.
-            # ``from None``: the untranslated error is what carries the raw
-            # body, and a chained ``__context__`` puts it straight back into
-            # the rendered traceback.
+            # Nothing to abort; translate and propagate.
             raise self._translate_upload_error(err) from None
+        except CONNECTION_ERRORS as err:
+            logger.error('Connection error during multipart session creation: error_type=%s',
+                         type(err).__name__)
+            raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
+                                         code=HTTPStatus.BAD_GATEWAY) from None
 
         try:
-            # Step 2. Break stream into chunks and upload them one by one
             parts_metadata = await self._upload_parts(stream, path, session_upload_id)
-            # Step 3. Commit the parts and end the upload session
             await self._complete_multipart_upload(path, session_upload_id, parts_metadata)
         except Exception as err:
             msg = 'An unexpected error has occurred during the multi-part upload.'
-            logger.error('{} upload_id={} error={!r}'.format(msg, session_upload_id, err))
+            err_code = getattr(err, 'code', None)
+            # Quota exhaustion is user-resolvable; log as warning, not error.
+            log = logger.warning if self._is_quota_exhaustion(err) else logger.error
+            log('%s upload_id=%s error_type=%s error_code=%s', msg, session_upload_id,
+                type(err).__name__,
+                int(err_code) if isinstance(err_code, int) else err_code)
             aborted = await self._abort_chunked_upload(path, session_upload_id)
             abort_message = ''
             if not aborted:
-                # NOTE: this warning must be appended only when the abort has
-                # FAILED.  (An earlier revision appended it on success.)
                 abort_message = '  The abort action failed to clean up the temporary file ' \
                                 'parts generated during the upload process.  Please manually ' \
                                 'remove them.'
             if isinstance(err, exceptions.UploadError):
-                # Preserve the original storage error (status code and body) and
-                # translate quota-exhaustion responses into a user-facing error.
                 raise self._translate_upload_error(
                     err, extra_message=abort_message) from None
-            raise exceptions.UploadError('{}{}'.format(msg, abort_message))
+            if isinstance(err, CONNECTION_ERRORS):
+                raise exceptions.UploadError(
+                    '{}{}{}'.format(self.CONNECTION_INTERRUPTED_MESSAGE,
+                                    self._commit_outcome_note(err), abort_message),
+                    code=HTTPStatus.BAD_GATEWAY,
+                ) from None
+            # Unrecognised error; default 500, not 502 (not proven to be upstream).
+            raise exceptions.UploadError(
+                '{}{}{}'.format(msg, self._commit_outcome_note(err),
+                                abort_message)) from None
 
     async def _create_upload_session(self, path):
         """This operation initiates a multipart upload and returns an upload ID. This upload ID is
@@ -574,7 +722,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
         query_parameters = {'Bucket': self.bucket_name, 'Key': path.full_path}
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'POST',
             functools.partial(
                 self.connection.generate_presigned_url,
@@ -591,10 +739,32 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             ),
             throws=exceptions.UploadError,
         )
-        upload_session_metadata = await resp.read()
-        session_data = xmltodict.parse(upload_session_metadata, strip_whitespace=False)
-        # Session upload id is the only info we need
-        return session_data['InitiateMultipartUploadResult']['UploadId']
+        try:
+            upload_session_metadata = await resp.read()
+        finally:
+            await resp.release()
+        try:
+            session_data = xmltodict.parse(upload_session_metadata, strip_whitespace=False)
+            session_upload_id = session_data['InitiateMultipartUploadResult']['UploadId']
+            if not isinstance(session_upload_id, str) or not session_upload_id.strip():
+                # An empty ``<UploadId/>`` parses to ``None`` and an attribute-only
+                # element to a dict.  Returning either would make every following
+                # request use a bogus upload id.
+                raise ValueError('UploadId is missing or blank')
+            # strip_whitespace=False: the UploadId must not contain surrounding whitespace.
+            return session_upload_id.strip()
+        except (ExpatError, KeyError, TypeError, ValueError) as err:
+            # Body was not the expected XML.  The session may exist but its
+            # UploadId is unknown, so it cannot be aborted.
+            logger.error('Failed to parse the CreateMultipartUpload response: key=%s '
+                         'error_type=%s body=%s', path.full_path, type(err).__name__,
+                         _bounded_body(upload_session_metadata))
+            raise exceptions.UploadError(
+                'Failed to create a multipart upload session: the cloud storage returned an '
+                'unexpected response.  A stale multipart upload session may remain on the '
+                'storage; please ask the storage administrator to check for and remove it.',
+                code=HTTPStatus.BAD_GATEWAY,
+            )
 
     async def _upload_parts(self, stream, path, session_upload_id):
         """Uploads all parts/chunks of the given stream to S3 one by one."""
@@ -603,9 +773,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         parts = [self.CHUNK_SIZE for i in range(0, stream.size // self.CHUNK_SIZE)]
         if stream.size % self.CHUNK_SIZE:
             parts.append(stream.size - (len(parts) * self.CHUNK_SIZE))
-        logger.debug('Multipart upload segment sizes: {}'.format(parts))
+        logger.debug('Multipart upload segment sizes: %s', parts)
         for chunk_number, chunk_size in enumerate(parts):
-            logger.debug('  uploading part {} with size {}'.format(chunk_number + 1, chunk_size))
+            logger.debug('  uploading part %s with size %s', chunk_number + 1, chunk_size)
             metadata.append(await self._upload_part(stream, path, session_upload_id,
                                                     chunk_number + 1, chunk_size))
         return metadata
@@ -626,7 +796,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id,
         }
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'PUT',
             functools.partial(
                 self.connection.generate_presigned_url,
@@ -647,23 +817,52 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         await resp.release()
         return resp.headers
 
+    @staticmethod
+    def _log_abort_failure(err, session_upload_id, s3_error_code=None):
+        """Log an abort attempt that failed, by kind rather than by content.
+
+        Avoids repr(err): err.message may contain presigned URLs.
+        """
+        status = getattr(err, 'code', None)
+        logger.error('An unexpected error has occurred during the aborting a multipart '
+                     'upload. upload_id=%s error_type=%s status=%s error_code=%s',
+                     session_upload_id, type(err).__name__,
+                     int(status) if isinstance(status, int) else status, s3_error_code)
+
+    @staticmethod
+    def _no_parts_left(resp_xml):
+        """Whether a LIST PARTS body reports an empty parts list."""
+        # An element with no children parses to ``None``, not to an empty dict.
+        result = xmltodict.parse(resp_xml, strip_whitespace=False)['ListPartsResult'] or {}
+        # ``IsTruncated`` means this is one page of a longer listing, so the
+        # absence of ``Part`` *here* says nothing about the pages after it.
+        # This answer is what suppresses the "please remove the parts manually"
+        # warning, so an incomplete listing must not be read as "nothing left".
+        if str(result.get('IsTruncated', '')).strip().lower() == 'true':
+            return False
+        return len(result.get('Part', [])) == 0
+
+    async def _abort_confirmed_by_list_parts(self, path, session_upload_id):
+        """Ask LIST PARTS whether an abort that reported ``NoSuchUpload`` took effect.
+
+        A failure to obtain the answer returns ``False``, keeping the "please
+        remove the parts manually" warning active rather than suppressing it
+        on an unconfirmed claim.
+        """
+        try:
+            resp_xml, session_deleted = await self._list_uploaded_chunks(
+                path, session_upload_id, retry=0)
+            return session_deleted or self._no_parts_left(resp_xml)
+        except Exception as err:
+            logger.warning('Could not confirm a NoSuchUpload abort via ListParts. '
+                           'upload_id=%s error_type=%s', session_upload_id, type(err).__name__)
+            return False
+
     async def _abort_chunked_upload(self, path, session_upload_id):
-        """This operation aborts a multipart upload. After a multipart upload is aborted, no
-        additional parts can be uploaded using that upload ID. The storage consumed by any
-        previously uploaded parts will be freed. However, if any part uploads are currently in
-        progress, those part uploads might or might not succeed. As a result, it might be necessary
-        to abort a given multipart upload multiple times in order to completely free all storage
-        consumed by all parts. To verify that all parts have been removed, so you don't get charged
-        for the part storage, you should call the List Parts operation and ensure the parts list is
-        empty.
+        """Abort a multipart upload with DELETE + retry, then confirm via LIST PARTS.
 
-        Docs: https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadAbort.html
-
-        Quirks:
-
-        If the ABORT request is successful, the session may be deleted when the LIST PARTS request
-        is made.  The criteria for successful abort thus is ether LIST PARTS request returns 404 or
-        returns 200 with an empty parts list.
+        Success means LIST PARTS returns 404 or 200 with an empty parts list.
+        Returns ``True`` on confirmed abort, ``False`` otherwise.
         """
 
         headers = {}
@@ -677,8 +876,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         is_aborted = False
         while iteration_count < settings.CHUNKED_UPLOAD_MAX_ABORT_RETRIES:
             try:
-                # ABORT
-                resp = await self.make_request(
+                resp = await self._make_upload_request(
                     'DELETE',
                     functools.partial(
                         self.connection.generate_presigned_url,
@@ -693,37 +891,40 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 )
                 await resp.release()
 
-                # LIST PARTS
                 resp_xml, session_deleted = await self._list_uploaded_chunks(path, session_upload_id)
 
-                if session_deleted:
-                    # Abort is successful if the session has been deleted
+                if session_deleted or self._no_parts_left(resp_xml):
                     is_aborted = True
                     break
-
-                uploaded_chunks_list = xmltodict.parse(resp_xml, strip_whitespace=False)
-                parsed_parts_list = uploaded_chunks_list['ListPartsResult'].get('Part', [])
-                if len(parsed_parts_list) == 0:
-                    # Abort is successful when there is no part left
+            except exceptions.UploadError as err:
+                # NoSuchUpload means the session is gone -- confirm via LIST
+                # PARTS before treating as success.  Only on the first
+                # iteration (retries use DELETE again).
+                s3_error_code = self._parse_s3_error_body(err)[0]
+                if s3_error_code == 'NoSuchUpload' and iteration_count == 0 and \
+                        await self._abort_confirmed_by_list_parts(path, session_upload_id):
                     is_aborted = True
                     break
+                self._log_abort_failure(err, session_upload_id, s3_error_code)
             except Exception as err:
-                msg = 'An unexpected error has occurred during the aborting a multipart upload.'
-                logger.error('{} upload_id={} error={!r}'.format(msg, session_upload_id, err))
+                self._log_abort_failure(err, session_upload_id)
 
             iteration_count += 1
 
         if is_aborted:
-            logger.debug('Multi-part upload has been successfully aborted: retries={} '
-                         'upload_id={}'.format(iteration_count, session_upload_id))
+            logger.debug('Multi-part upload has been successfully aborted: retries=%s '
+                         'upload_id=%s', iteration_count, session_upload_id)
             return True
 
-        logger.error('Multi-part upload has failed to abort: retries={} '
-                     'upload_id={}'.format(iteration_count, session_upload_id))
+        logger.error('Multi-part upload has failed to abort: retries=%s '
+                     'upload_id=%s', iteration_count, session_upload_id)
         return False
 
-    async def _list_uploaded_chunks(self, path, session_upload_id):
+    async def _list_uploaded_chunks(self, path, session_upload_id, **request_kwargs):
         """This operation lists the parts that have been uploaded for a specific multipart upload.
+
+        ``request_kwargs`` is passed through to ``make_request`` so a caller can
+        override its retry budget; without one the core default applies.
 
         Docs: https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadListParts.html
         """
@@ -735,7 +936,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id,
         }
 
-        resp = await self.make_request(
+        resp = await self._make_upload_request(
             'GET',
             functools.partial(
                 self.connection.generate_presigned_url,
@@ -751,9 +952,13 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 HTTPStatus.NOT_FOUND,
             ),
             throws=exceptions.UploadError,
+            **request_kwargs
         )
         session_deleted = resp.status == HTTPStatus.NOT_FOUND
-        resp_xml = await resp.read()
+        try:
+            resp_xml = await resp.read()
+        finally:
+            await resp.release()
 
         return resp_xml, session_deleted
 
@@ -784,28 +989,44 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             'UploadId': session_upload_id
         }
 
-        resp = await self.make_request(
-            'POST',
-            functools.partial(
-                self.connection.generate_presigned_url,
-                'complete_multipart_upload',
-                Params=query_parameters,
-                ExpiresIn=200,
-                HttpMethod='POST',
-            ),
-            data=payload,
-            headers=headers,
-            expects=(
-                HTTPStatus.OK,
-                HTTPStatus.CREATED,
-            ),
-            throws=exceptions.UploadError,
-        )
+        # From here on, parts are stored; failures leave the outcome unknown.
+        try:
+            resp = await self._make_upload_request(
+                'POST',
+                functools.partial(
+                    self.connection.generate_presigned_url,
+                    'complete_multipart_upload',
+                    Params=query_parameters,
+                    ExpiresIn=200,
+                    HttpMethod='POST',
+                ),
+                data=payload,
+                headers=headers,
+                expects=(
+                    HTTPStatus.OK,
+                    HTTPStatus.CREATED,
+                ),
+                throws=exceptions.UploadError,
+                retry=0,  # resend consumes the UploadId
+                allow_redirects=False,  # prevent aiohttp from re-sending the POST
+            )
+        except Exception as err:
+            _mark_commit_outcome_unknown(err)
+            raise
 
-        response_body = await resp.read()
-        self._check_for_200_error(response_body, "CompleteMultipartUpload", exceptions.UploadError)
-
-        await resp.release()
+        try:
+            # read() must be inside this try so a mid-body disconnect is
+            # also marked outcome-unknown.
+            response_body = await resp.read()
+            # 2xx is not proof of success here; inspect the body.
+            self._check_for_200_error(response_body, "CompleteMultipartUpload",
+                                      exceptions.UploadError)
+        except Exception as err:
+            # Any failure after send is outcome-unknown.
+            _mark_commit_outcome_unknown(err)
+            raise
+        finally:
+            await resp.release()
 
     async def move(self, dest_provider, src_path, dest_path,
                   rename=None, conflict='replace', handle_naming=True):
@@ -839,7 +1060,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 )
         logger.debug('Deleting path: %s', path.full_path)
         if path.is_file:
-            # Retrieve and delete all versions (batched) similar to S3 provider
             try:
                 prefix = path.full_path.lstrip('/')
                 query_params = {
@@ -865,7 +1085,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                         delete_list = [
                             {'Key': path.full_path, 'VersionId': vid} for vid in batch
                         ]
-                        # Run synchronous boto3 call in executor to avoid blocking
                         loop = asyncio.get_event_loop()
                         response = await loop.run_in_executor(
                             None,
@@ -873,7 +1092,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                                 Delete={'Objects': d, 'Quiet': False}
                             ),
                         )
-                        # Check for errors in response
                         if 'Errors' in response and response['Errors']:
                             error_count = len(response['Errors'])
                             error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
@@ -886,7 +1104,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                         deleted_count = len(response.get('Deleted', []))
                         logger.debug('Batch deleted %d versions', deleted_count)
                 else:
-                    # No versions -> delete current object directly
                     query_parameters = {
                         'Bucket': self.bucket_name,
                         'Key': path.full_path,
@@ -980,20 +1197,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         return False
 
     async def _delete_folder(self, path, **kwargs):
-        """Query for recursive contents of folder and delete in batches of 1000
-
-        Called from: func: delete if not path.is_file
-
-        Calls: func: self.make_request
-               func: self.connection.generate_presigned_url
+        """Query for recursive contents of folder and delete in batches of 1000.
 
         :param *ProviderPath path: Path to be deleted
-
-        On S3, folders are not first-class objects, but are instead inferred
-        from the names of their children.  A regular DELETE request issued
-        against a folder will not work unless that folder is completely empty.
-        To fully delete an occupied folder, we must delete all of the comprising
-        objects.  Amazon provides a bulk delete operation to simplify this.
         """
         if not path.full_path.endswith('/'):
             raise exceptions.InvalidParameters('not a folder: {}'.format(str(path)))
@@ -1057,7 +1263,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                         raise exceptions.DeleteError(
                             'Failed to delete some objects: {} error(s)'.format(error_count)
                         )
-            # Also clean up folder prefix
             try:
                 await self._delete_folder_prefix(prefix)
             except exceptions.DeleteError:
@@ -1083,10 +1288,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         all_objects = [
             {'Key': k, 'VersionId': v} for k, vids in version_map.items() for v in vids
         ] + keys_without_version
-        # AWS allows max 1000 objects per delete_objects call
         for i in range(0, len(all_objects), 1000):
             batch = all_objects[i: i + 1000]
-            # Run synchronous boto3 call in executor to avoid blocking
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
@@ -1094,7 +1297,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     Delete={'Objects': b, 'Quiet': False}
                 ),
             )
-            # Check for errors in response
             if 'Errors' in response and response['Errors']:
                 error_count = len(response['Errors'])
                 error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
@@ -1139,7 +1341,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             response_body = await resp.read()
             parsed = xmltodict.parse(response_body.decode('utf-8'), strip_whitespace=False)['ListVersionsResult']
 
-            # Append current page's versions and delete markers
             current_versions = parsed.get('Version', [])
             current_delete_markers = parsed.get('DeleteMarker', [])
 
@@ -1163,7 +1364,6 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             versions.extend(current_versions)
             delete_markers.extend(current_delete_markers)
 
-            # Check if more pages are available
             more_to_come = parsed.get('IsTruncated') == 'true'
             if more_to_come:
                 query_params['KeyMarker'] = parsed.get('NextKeyMarker')
