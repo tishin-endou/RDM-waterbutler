@@ -385,7 +385,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             msg = 'An unexpected error has occurred during the multi-part upload.'
             logger.error('{} upload_id={} error={!r}'.format(msg, session_upload_id, err))
             aborted = await self._abort_chunked_upload(path, session_upload_id)
-            if aborted:
+            if not aborted:
+                # NOTE: this warning must be appended only when the abort has
+                # FAILED.  (An earlier revision appended it on success.)
                 msg += '  The abort action failed to clean up the temporary file parts generated ' \
                        'during the upload process.  Please manually remove them.'
             raise exceptions.UploadError(msg)

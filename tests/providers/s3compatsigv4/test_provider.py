@@ -1165,7 +1165,7 @@ class TestCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
-    async def test_chunked_upload_aborted_success(self, provider, upload_parts_headers_list, file_stream, mock_time):
+    async def test_chunked_upload_aborted_success(self, provider, file_stream, mock_time):
         assert file_stream.size == 6
         provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
         provider.CHUNK_SIZE = 2
@@ -1173,28 +1173,62 @@ class TestCRUD:
         path = WaterButlerPath('/foobah', prepend=provider.prefix)
         upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
                     '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
-        headers_list = json.loads(upload_parts_headers_list).get('headers_list')
-        headers_list = [{k.upper(): v for k, v in headers.items()} for headers in headers_list]
 
-        provider.metadata = MockCoroutine()
         provider._create_upload_session = MockCoroutine()
         provider._create_upload_session.return_value = upload_id
+        # NOTE: the failure must be injected into ``_upload_parts``, not
+        # ``_upload_part``.  ``_chunked_upload`` only ever calls the former, so
+        # a ``side_effect`` on the latter never fires.  (An earlier revision did
+        # exactly that and the test passed only because the unmocked
+        # ``_complete_multipart_upload`` hit aiohttpretty's "No URLs matching
+        # POST ..." error -- i.e. it asserted nothing about the abort path.)
         provider._upload_parts = MockCoroutine()
-        provider._upload_parts.return_value = headers_list
-        provider._upload_part = MockCoroutine()
-        provider._upload_part.side_effect = Exception('error')
+        provider._upload_parts.side_effect = Exception('error')
+        provider._complete_multipart_upload = MockCoroutine()
         provider._abort_chunked_upload = MockCoroutine()
         provider._abort_chunked_upload.return_value = True
 
         with pytest.raises(exceptions.UploadError) as exc:
             await provider._chunked_upload(file_stream, path)
+        # The abort has SUCCEEDED (return value True), so the "manual clean-up"
+        # warning must NOT be appended to the error message.
+        msg = 'An unexpected error has occurred during the multi-part upload.'
+        assert str(exc.value) == ', '.join(['500', msg])
+
+        provider._create_upload_session.assert_called_with(path)
+        provider._upload_parts.assert_called_with(file_stream, path, upload_id)
+        provider._abort_chunked_upload.assert_called_with(path, upload_id)
+        # The parts upload failed, so the commit step must never be attempted.
+        provider._complete_multipart_upload.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.aiohttpretty
+    async def test_chunked_upload_abort_failure_appends_warning(self, provider, file_stream,
+                                                                mock_time):
+        assert file_stream.size == 6
+        provider.CONTIGUOUS_UPLOAD_SIZE_LIMIT = 5
+        provider.CHUNK_SIZE = 2
+
+        path = WaterButlerPath('/foobah', prepend=provider.prefix)
+        upload_id = 'EXAMPLEJZ6e0YupT2h66iePQCc9IEbYbDUy4RTpMeoSMLPRp8Z5o1u' \
+                    '8feSRonpvnWsKKG35tI2LB9VDPiCgTy.Gq2VxQLYjrue4Nq.NBdqI-'
+
+        provider._create_upload_session = MockCoroutine()
+        provider._create_upload_session.return_value = upload_id
+        provider._upload_parts = MockCoroutine()
+        provider._upload_parts.side_effect = Exception('error')
+        provider._abort_chunked_upload = MockCoroutine()
+        provider._abort_chunked_upload.return_value = False
+
+        with pytest.raises(exceptions.UploadError) as exc:
+            await provider._chunked_upload(file_stream, path)
+        # The abort has FAILED (return value False), so the "manual clean-up"
+        # warning must be appended to the error message.
         msg = 'An unexpected error has occurred during the multi-part upload.'
         msg += '  The abort action failed to clean up the temporary file parts generated ' \
                'during the upload process.  Please manually remove them.'
         assert str(exc.value) == ', '.join(['500', msg])
 
-        provider._create_upload_session.assert_called_with(path)
-        provider._upload_parts.assert_called_with(file_stream, path, upload_id)
         provider._abort_chunked_upload.assert_called_with(path, upload_id)
 
     @pytest.mark.asyncio
