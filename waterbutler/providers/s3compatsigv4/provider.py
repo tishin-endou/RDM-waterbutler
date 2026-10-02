@@ -66,6 +66,24 @@ def _bounded_body(body):
     return head.encode('utf-8')[:ERROR_BODY_LOG_LIMIT].decode('utf-8', 'ignore')
 
 
+_QUERY_RE = re.compile(r'\?.*')
+
+
+def _log_exception(level, message, exc, *args, **kwargs):
+    """Log *message* at *level* with the traceback attached.
+
+    ``str(exc)`` may contain presigned URLs; query strings are redacted.
+    The formatted message is bounded by :data:`ERROR_BODY_LOG_LIMIT`.
+    """
+    safe_str = _QUERY_RE.sub('?<redacted>', str(exc))
+    if len(safe_str) > ERROR_BODY_LOG_LIMIT:
+        safe_str = safe_str[:ERROR_BODY_LOG_LIMIT] + '...'
+    errno = getattr(exc, 'errno', None)
+    suffix = ' errno={}'.format(errno) if errno is not None else ''
+    logger.log(level, message + ' (%s: %s%s)', *(args + (
+        type(exc).__name__, safe_str, suffix)), exc_info=exc, **kwargs)
+
+
 # Sentinel: distinguishes "key absent" from "key present but value empty".
 _MISSING = object()
 
@@ -473,8 +491,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             message = _local_name_lookup(error, 'Message', None)
         except (ExpatError, KeyError, TypeError,
                 AttributeError, ValueError) as exc:
-            logger.warning('Unrecognised S3 error body (%s: %s): %s',
-                           type(exc).__name__, exc, _bounded_body(body))
+            _log_exception(logging.WARNING, 'Unrecognised S3 error body: %s',
+                           exc, _bounded_body(body))
             return None, None
         return code, message.strip() if isinstance(message, str) else None
 
@@ -647,10 +665,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # from None: keep the raw body out of the traceback.
             raise self._translate_upload_error(err) from None
         except CONNECTION_ERRORS as err:
-            # Storage may close the connection on quota exhaustion.  Log the
-            # error type only (no repr: URLs may contain signatures).
-            logger.error('Connection error during contiguous upload: error_type=%s',
-                         type(err).__name__)
+            _log_exception(logging.ERROR,
+                           'Connection error during contiguous upload', err)
             raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
                                          code=HTTPStatus.BAD_GATEWAY) from None
 
@@ -668,8 +684,8 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             # Nothing to abort; translate and propagate.
             raise self._translate_upload_error(err) from None
         except CONNECTION_ERRORS as err:
-            logger.error('Connection error during multipart session creation: error_type=%s',
-                         type(err).__name__)
+            _log_exception(logging.ERROR,
+                           'Connection error during multipart session creation', err)
             raise exceptions.UploadError(self.CONNECTION_INTERRUPTED_MESSAGE,
                                          code=HTTPStatus.BAD_GATEWAY) from None
 
@@ -680,10 +696,11 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             msg = 'An unexpected error has occurred during the multi-part upload.'
             err_code = getattr(err, 'code', None)
             # Quota exhaustion is user-resolvable; log as warning, not error.
-            log = logger.warning if self._is_quota_exhaustion(err) else logger.error
-            log('%s upload_id=%s error_type=%s error_code=%s', msg, session_upload_id,
-                type(err).__name__,
-                int(err_code) if isinstance(err_code, int) else err_code)
+            level = logging.WARNING if self._is_quota_exhaustion(err) else logging.ERROR
+            _log_exception(level,
+                           '%s upload_id=%s error_code=%s', err,
+                           msg, session_upload_id,
+                           int(err_code) if isinstance(err_code, int) else err_code)
             aborted = await self._abort_chunked_upload(path, session_upload_id)
             abort_message = ''
             if not aborted:
@@ -754,9 +771,10 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         except (ExpatError, KeyError, TypeError, ValueError) as err:
             # Body was not the expected XML.  The session may exist but its
             # UploadId is unknown, so it cannot be aborted.
-            logger.error('Failed to parse the CreateMultipartUpload response: key=%s '
-                         'error_type=%s body=%s', path.full_path, type(err).__name__,
-                         _bounded_body(upload_session_metadata))
+            _log_exception(logging.ERROR,
+                           'Failed to parse the CreateMultipartUpload response: '
+                           'key=%s body=%s', err, path.full_path,
+                           _bounded_body(upload_session_metadata))
             raise exceptions.UploadError(
                 'Failed to create a multipart upload session: the cloud storage returned an '
                 'unexpected response.  A stale multipart upload session may remain on the '
@@ -817,15 +835,13 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
     @staticmethod
     def _log_abort_failure(err, session_upload_id, s3_error_code=None):
-        """Log an abort attempt that failed, by kind rather than by content.
-
-        Avoids repr(err): err.message may contain presigned URLs.
-        """
+        """Log an abort attempt that failed, by kind rather than by content."""
         status = getattr(err, 'code', None)
-        logger.error('An unexpected error has occurred during the aborting a multipart '
-                     'upload. upload_id=%s error_type=%s status=%s error_code=%s',
-                     session_upload_id, type(err).__name__,
-                     int(status) if isinstance(status, int) else status, s3_error_code)
+        _log_exception(logging.ERROR,
+                       'An unexpected error has occurred during the aborting a multipart '
+                       'upload. upload_id=%s status=%s error_code=%s',
+                       err, session_upload_id,
+                       int(status) if isinstance(status, int) else status, s3_error_code)
 
     @staticmethod
     def _no_parts_left(resp_xml):
@@ -852,8 +868,9 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                 path, session_upload_id, retry=0)
             return session_deleted or self._no_parts_left(resp_xml)
         except Exception as err:
-            logger.warning('Could not confirm a NoSuchUpload abort via ListParts. '
-                           'upload_id=%s error_type=%s', session_upload_id, type(err).__name__)
+            _log_exception(logging.WARNING,
+                           'Could not confirm a NoSuchUpload abort via ListParts. '
+                           'upload_id=%s', err, session_upload_id)
             return False
 
     async def _abort_chunked_upload(self, path, session_upload_id):
@@ -1058,7 +1075,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             code = ''
             if isinstance(exc, BotoClientError):
                 code = exc.response.get('Error', {}).get('Code', '')
-            logger.error('DeleteObjects botocore error (%s): %s', context, exc)
+            _log_exception(logging.ERROR, 'DeleteObjects botocore error (%s)', exc, context)
             raise exceptions.DeleteError(
                 'DeleteObjects failed: {}{}'.format(
                     type(exc).__name__,

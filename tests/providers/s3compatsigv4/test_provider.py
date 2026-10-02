@@ -1634,6 +1634,11 @@ class TestCRUD:
         assert 'ClientOSError' in logged
         assert exc.value.__cause__ is None
         assert exc.value.__suppress_context__ is True
+        # Traceback must be present for post-mortem diagnosis.
+        error_records = [r for r in caplog.records
+                         if r.name == PROVIDER_LOGGER and r.levelno >= logging.ERROR]
+        assert any(r.exc_info for r in error_records), \
+            'expected exc_info on at least one ERROR record'
 
     @pytest.mark.asyncio
     @pytest.mark.aiohttpretty
