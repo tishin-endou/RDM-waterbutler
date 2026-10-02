@@ -14,6 +14,7 @@ import aiohttp
 import xmltodict
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError as BotoClientError, BotoCoreError
 
 from waterbutler.core import streams, provider, exceptions
 from waterbutler.core.path import WaterButlerPath
@@ -1046,6 +1047,40 @@ class S3CompatSigV4Provider(provider.BaseProvider):
 
         return result
 
+    async def _delete_objects_batch(self, objects, context):
+        """Run one DeleteObjects call, logging partial failures and wrapping botocore errors."""
+        loop = asyncio.get_event_loop()
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.bucket.delete_objects(
+                    Delete={'Objects': objects, 'Quiet': False}
+                ),
+            )
+        except (BotoClientError, BotoCoreError) as exc:
+            code = ''
+            if isinstance(exc, BotoClientError):
+                code = exc.response.get('Error', {}).get('Code', '')
+            logger.error('DeleteObjects botocore error (%s): %s', context, exc)
+            raise exceptions.DeleteError(
+                'DeleteObjects failed: {}{}'.format(
+                    type(exc).__name__,
+                    ' ({})'.format(code) if code else '')
+            ) from None
+        errors = response.get('Errors') or []
+        if errors:
+            total = len(objects)
+            failed = len(errors)
+            failed_keys = [e.get('Key', '?') for e in errors[:5]]
+            codes = list({e.get('Code', 'Unknown') for e in errors})
+            logger.error(
+                'DeleteObjects partial failure (%s): total=%d failed=%d keys=%s codes=%s',
+                context, total, failed, failed_keys, codes)
+            raise exceptions.DeleteError(
+                'Failed to delete some objects: {} of {} failed'.format(failed, total))
+        logger.debug('DeleteObjects success (%s): deleted=%d', context, len(response.get('Deleted', [])))
+        return response
+
     async def delete(self, path, confirm_delete=0, **kwargs):
         """Delete the key and all its versions at the specified path
 
@@ -1079,30 +1114,12 @@ class S3CompatSigV4Provider(provider.BaseProvider):
                     }
 
                     version_ids = version_dict[path.full_path]
-                    # AWS allows max 1000 objects per delete_objects call
                     for i in range(0, len(version_ids), 1000):
                         batch = version_ids[i: i + 1000]
                         delete_list = [
                             {'Key': path.full_path, 'VersionId': vid} for vid in batch
                         ]
-                        loop = asyncio.get_event_loop()
-                        response = await loop.run_in_executor(
-                            None,
-                            lambda d=delete_list: self.bucket.delete_objects(
-                                Delete={'Objects': d, 'Quiet': False}
-                            ),
-                        )
-                        if 'Errors' in response and response['Errors']:
-                            error_count = len(response['Errors'])
-                            error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
-                            logger.error(
-                                'Errors deleting objects: count=%d, codes=%s', error_count, error_codes
-                            )
-                            raise exceptions.DeleteError(
-                                'Failed to delete some objects: {} error(s)'.format(error_count)
-                            )
-                        deleted_count = len(response.get('Deleted', []))
-                        logger.debug('Batch deleted %d versions', deleted_count)
+                        await self._delete_objects_batch(delete_list, 'delete')
                 else:
                     query_parameters = {
                         'Bucket': self.bucket_name,
@@ -1249,20 +1266,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
             if all_objects:
                 for i in range(0, len(all_objects), 1000):
                     batch = all_objects[i:i + 1000]
-                    loop = asyncio.get_event_loop()
-                    response = await loop.run_in_executor(
-                        None,
-                        lambda d=batch: self.bucket.delete_objects(
-                            Delete={'Objects': d, 'Quiet': False}
-                        ),
-                    )
-                    if response.get('Errors'):
-                        error_count = len(response['Errors'])
-                        error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
-                        logger.error('_delete_folder fallback: %d delete error(s), codes=%s', error_count, error_codes)
-                        raise exceptions.DeleteError(
-                            'Failed to delete some objects: {} error(s)'.format(error_count)
-                        )
+                    await self._delete_objects_batch(batch, 'delete_folder_fallback')
             try:
                 await self._delete_folder_prefix(prefix)
             except exceptions.DeleteError:
@@ -1290,24 +1294,7 @@ class S3CompatSigV4Provider(provider.BaseProvider):
         ] + keys_without_version
         for i in range(0, len(all_objects), 1000):
             batch = all_objects[i: i + 1000]
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda b=batch: self.bucket.delete_objects(
-                    Delete={'Objects': b, 'Quiet': False}
-                ),
-            )
-            if 'Errors' in response and response['Errors']:
-                error_count = len(response['Errors'])
-                error_codes = [e.get('Code', 'Unknown') for e in response['Errors']]
-                logger.error(
-                    'Errors deleting folder objects: count=%d, codes=%s', error_count, error_codes
-                )
-                raise exceptions.DeleteError(
-                    'Failed to delete some objects: {} error(s)'.format(error_count)
-                )
-            deleted_count = len(response.get('Deleted', []))
-            logger.debug('Batch deleted %d objects from folder', deleted_count)
+            await self._delete_objects_batch(batch, 'delete_folder')
 
         # Clean up folder prefix object if it still exists
         if await self._folder_prefix_exists(prefix):
